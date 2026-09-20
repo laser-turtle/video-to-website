@@ -16,11 +16,12 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from .util import VIDEO_SUFFIXES, log, natural_key, slugify, warn
+from .util import VIDEO_SUFFIXES, file_lock, log, natural_key, slugify, warn
 
 API_PREFIX = "/api/"
 CHUNK = 1 << 20
@@ -57,6 +58,14 @@ def safe_component(name: str) -> str | None:
     if not name or name in (".", ".."):
         return None
     return name[:120]
+
+
+def existing_component(name: str) -> str | None:
+    """Decode a lookup without rewriting the name of an existing source."""
+    name = unquote(name)
+    if not name or name.startswith(".") or any(c in name for c in ("/", "\\", "\x00")):
+        return None
+    return name
 
 
 def course_videos(course_dir: Path) -> list[Path]:
@@ -110,6 +119,21 @@ class IngestMixin:
     def library(self) -> Path | None:
         return getattr(self.server, "library", None)
 
+    @property
+    def catalog(self):
+        return getattr(self.server, "catalog", None)
+
+    def _library_lock(self):
+        if self.catalog is not None:
+            return self.catalog.lock()
+        return file_lock(self.library / ".management.lock")
+
+    def _contained(self, target: Path) -> bool:
+        if not target.resolve().is_relative_to(self.library.resolve()):
+            self._json(400, {"error": "path is outside the library"}, close=True)
+            return False
+        return True
+
     def log_message(self, fmt, *args):
         """Quiet: an upload logs itself, and journald does not need the rest."""
         return
@@ -133,6 +157,7 @@ class IngestMixin:
         body = json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         # An error answered mid-upload leaves the client still sending, and
         # there is no way to resynchronise a kept-alive connection from here.
@@ -155,6 +180,8 @@ class IngestMixin:
             self._json(200, {"courses": course_names(self.library)})
         elif path == "/api/library":
             self._json(200, {"courses": library_listing(self.library)})
+        elif path == "/api/jobs" and self.catalog:
+            self._json(200, self.catalog.status())
         else:
             self._json(404, {"error": "no such endpoint"})
         return True
@@ -173,13 +200,21 @@ class IngestMixin:
         if len(parts) != 3 or parts[0] != "library":
             self._json(404, {"error": "no such endpoint"}, close=True)
             return None
-        course, name = safe_component(parts[1]), safe_component(parts[2])
+        course, name = existing_component(parts[1]), existing_component(parts[2])
         if not course or not name:
             self._json(400, {"error": "unusable course or file name"}, close=True)
             return None
-        return self.library / course / name, course, name
+        target = self.library / course / name
+        return (target, course, name) if self._contained(target) else None
 
     def do_DELETE(self):
+        if self.library is None:
+            self._json(503, {"error": "uploads are not enabled here"}, close=True)
+            return
+        with self._library_lock():
+            self._delete()
+
+    def _delete(self):
         found = self._target()
         if found is None:
             return
@@ -203,9 +238,36 @@ class IngestMixin:
         # The stage cache is deliberately left alone: putting the same file
         # back should not mean transcribing it again.
         log(f"deleted {course}/{name}")
+        if self.catalog:
+            with self.catalog.connect() as db:
+                relative = str(target.relative_to(self.library))
+                db.execute("UPDATE builds SET state='superseded' WHERE id=(SELECT desired_build FROM lessons WHERE path=?) AND state IN ('queued','running')", (relative,))
+                db.execute("UPDATE lessons SET deleted=1,desired_build=NULL WHERE path=?", (relative,))
         self._json(200, {"deleted": f"{course}/{name}"})
 
     def do_POST(self):
+        parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "lessons"] and self.catalog:
+            try:
+                if parts[3] == "retry":
+                    result = {"build_id": self.catalog.retry(parts[2])}
+                elif parts[3] == "cancel":
+                    self.catalog.cancel(parts[2])
+                    result = {"cancelled": parts[2]}
+                else:
+                    self._json(404, {"error": "no such action"}, close=True)
+                    return
+                self._json(200, result, close=True)
+            except KeyError:
+                self._json(404, {"error": "lesson not found"}, close=True)
+            return
+        if self.library is None:
+            self._json(503, {"error": "uploads are not enabled here"}, close=True)
+            return
+        with self._library_lock():
+            self._rename()
+
+    def _rename(self):
         found = self._target()
         if found is None:
             return
@@ -215,13 +277,17 @@ class IngestMixin:
             return
         try:
             size = int(self.headers.get("Content-Length", "0"))
+            if size < 0 or size > 16384:
+                raise ValueError("body too large")
             body = json.loads(self.rfile.read(size) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("expected object")
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"error": "expected a JSON body"}, close=True)
             return
 
-        to_course = safe_component(str(body.get("to_course") or course))
-        to_name = safe_component(str(body.get("to_name") or name))
+        to_course = safe_component(str(body["to_course"])) if body.get("to_course") else course
+        to_name = safe_component(str(body["to_name"])) if body.get("to_name") else name
         if not to_course or not to_name:
             self._json(400, {"error": "unusable course or file name"}, close=True)
             return
@@ -229,6 +295,8 @@ class IngestMixin:
             self._json(415, {"error": f"{Path(to_name).suffix or 'that'} is not a video file"}, close=True)
             return
         target = self.library / to_course / to_name
+        if not self._contained(target):
+            return
         if target == source:
             self._json(200, {"course": course, "name": name})
             return
@@ -249,7 +317,14 @@ class IngestMixin:
             self._json(500, {"error": str(exc)}, close=True)
             return
 
-        self._move_cache(course, name, to_course, to_name)
+        if self.catalog:
+            # Reconciliation resolves the new course; updating the path here
+            # also preserves IDs when duplicate content makes a move ambiguous.
+            with self.catalog.connect() as db:
+                db.execute("UPDATE lessons SET path=? WHERE path=?",
+                           (str(target.relative_to(self.library)), str(source.relative_to(self.library))))
+        else:
+            self._move_cache(course, name, to_course, to_name)
         log(f"renamed {course}/{name} to {to_course}/{to_name}")
         self._json(200, {"course": to_course, "name": to_name})
 
@@ -269,6 +344,8 @@ class IngestMixin:
         try:
             new.parent.mkdir(parents=True, exist_ok=True)
             old.replace(new)
+            # Asset references contain the previous slug.
+            (new / "assets.json").unlink(missing_ok=True)
             log(f"  carried the cache across to {new.parent.name}/{new.name}")
         except OSError as exc:
             warn(f"  could not carry the cache across, it will rebuild: {exc}")
@@ -290,7 +367,9 @@ class IngestMixin:
     # -- the upload itself --------------------------------------------------
 
     def _store(self, raw_course: str, raw_name: str) -> None:
-        course = safe_component(raw_course)
+        existing_course = existing_component(raw_course)
+        course = (existing_course if existing_course and (self.library / existing_course).is_dir()
+                  else safe_component(raw_course))
         name = safe_component(raw_name)
         if not course or not name:
             self._json(400, {"error": "unusable course or file name"}, close=True)
@@ -310,7 +389,10 @@ class IngestMixin:
 
         library = self.library
         target = library / course / name
-        if target.exists() and "overwrite" not in urlparse(self.path).query:
+        if not self._contained(target):
+            return
+        overwrite = parse_qs(urlparse(self.path).query).get("overwrite") == ["1"]
+        if target.exists() and not overwrite:
             self._json(409, {"error": f"{course}/{name} is already there"}, close=True)
             return
 
@@ -329,24 +411,44 @@ class IngestMixin:
 
         # Hidden while it is arriving: find_videos skips dotfiles, so a partial
         # upload cannot start a build of itself.
-        partial = target.parent / f".incoming-{name}"
+        partial = None
         received = 0
         try:
-            with partial.open("wb") as out:
+            fd, temporary = tempfile.mkstemp(prefix=".incoming-", dir=target.parent)
+            partial = Path(temporary)
+            with os.fdopen(fd, "wb") as out:
+                os.fchmod(out.fileno(), 0o644)
                 while received < length:
                     chunk = self.rfile.read(min(CHUNK, length - received))
                     if not chunk:
                         raise OSError("the connection closed before the file finished")
                     out.write(chunk)
                     received += len(chunk)
-            partial.replace(target)
+                out.flush()
+                os.fsync(out.fileno())
+            with self._library_lock():
+                if not self._contained(target):
+                    partial.unlink(missing_ok=True)
+                    return
+                if target.exists() and not overwrite:
+                    partial.unlink(missing_ok=True)
+                    self._json(409, {"error": f"{course}/{name} is already there"}, close=True)
+                    return
+                partial.replace(target)
+                if self.catalog:
+                    with self.catalog.connect() as db:
+                        relative = str(target.relative_to(self.library))
+                        db.execute("UPDATE builds SET state='superseded' WHERE id=(SELECT desired_build FROM lessons WHERE path=?) AND state IN ('queued','running')", (relative,))
+                        db.execute("UPDATE lessons SET desired_build=NULL WHERE path=?", (relative,))
         except PermissionError:
-            partial.unlink(missing_ok=True)
+            if partial:
+                partial.unlink(missing_ok=True)
             warn(f"upload of {course}/{name} refused: {target.parent} is not writable by {service_user()}")
             self._json(403, {"error": self._denied(target.parent)}, close=True)
             return
         except OSError as exc:
-            partial.unlink(missing_ok=True)
+            if partial:
+                partial.unlink(missing_ok=True)
             warn(f"upload of {course}/{name} failed after {received} bytes: {exc}")
             self._json(500, {"error": str(exc)}, close=True)
             return

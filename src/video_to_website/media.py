@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from pathlib import Path
 
 from .util import run, which_or_die
@@ -220,7 +219,7 @@ def frame_hash(video: Path, timestamp: float) -> int | None:
     thumbnail, so the hash tracks structure and ignores small colour shifts.
     """
     width = HASH_GRID + 1
-    proc = subprocess.run(
+    proc = run(
         [
             ffmpeg_bin(),
             "-nostdin",
@@ -239,9 +238,8 @@ def frame_hash(video: Path, timestamp: float) -> int | None:
             "rawvideo",
             "-",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
+        text=False,
+        check=False,
     )
     data = proc.stdout
     if proc.returncode != 0 or len(data) < width * HASH_GRID:

@@ -10,6 +10,13 @@ uploaded except the transcript text, and even that is optional.
 [ROADMAP.md](ROADMAP.md) has what is not built yet, and the decisions behind
 what is.
 
+The service now runs a **Python + SQLite + DBOS** application: a catalog keeps
+stable lesson identities, a worker checkpoints processing stages, and immutable
+media revisions protect published lessons. The upload API and worker run as
+separate NixOS services. [ARCHITECTURE.md](ARCHITECTURE.md) describes commands,
+migration, recovery, storage retention, and the remaining management features.
+The standalone `v2w build` command remains available for one-off static exports.
+
 ## What it produces
 
 For every video, one page containing:
@@ -104,10 +111,10 @@ scores inside the step: the final state is always captured, and the rest are the
 highest-scoring changes spaced at least a few seconds apart. Longer steps earn more
 shots, short ones stay at a single image.
 
-Two scene changes often show the same screen, so each candidate is reduced to a 64-bit
+Two scene changes often show the same screen, so each candidate is reduced to a 256-bit
 perceptual hash and dropped when it is within `--frame-dedup-distance` of one already
 chosen. On real Blender footage, genuinely different screens sit 11 bits apart or more,
-while frames under a second apart sit at 0 to 6, so the default of 8 falls in the gap.
+while frames under a second apart sit at 0 to 6, the current default deduplication distance is 16.
 
 Every screenshot is clickable and seeks the player to its own timestamp, not the step's
 start. Reading the small print in one is a different intent, so it does not compete for
@@ -439,10 +446,21 @@ you want it.
 
 ### Uploading from a browser
 
+The **Task queue** link on the home and management pages opens `queue.html`.
+It lists every running and waiting lesson, with its course, filename, queue
+position, and current processing stage. Search by course or filename, or filter
+to failed, cancelled, ready, or all lessons. Cancel keeps the source video;
+Retry starts a new attempt. Ready lessons link to their page, and a failed
+replacement can still link to its previously published version.
+
+The queue updates in place, so completed lessons do not reset the current search
+or filter. If the API is unavailable, it displays the last published status as a
+read-only view and explains why controls are unavailable.
+
 *Add videos* on the home page takes a course name and however many files, and
 PUTs them into the library one at a time with a progress bar each. They land as
-ordinary files, so the watcher picks them up exactly as it would an `scp` --
-there is no separate queue, and nothing to go wrong between the two.
+ordinary files, so the scanner picks them up exactly as it would an `scp`.
+The durable catalog reconciles completed imports into per-lesson workflows.
 
 A file is written under a leading dot while it arrives and renamed into place
 when it finishes, so a half-uploaded video can never start a build of itself. An
@@ -455,22 +473,19 @@ spool first.
 
 ### Renaming, reordering and deleting
 
-The same page lists the library underneath. Each course shows its lessons **in
+The same page lists the library underneath. Each course shows its direct-child lessons **in
 the order the builder will take them**, numbered, which is usually enough to
 spot why a course came out in the wrong order -- `4.02 - Reference Board.mp4`
 sorts after `10 - ...` but before `5 - ...` only once you read it as a number.
 
-*Rename* edits the filename in place, which is how the order gets fixed; the
-title on the site follows from it. **A rename carries the stage cache with it**,
-so reordering a course costs nothing -- without that, renaming a file orphans
-its transcript and the lesson is transcribed again from scratch. It is
-best-effort: the builder numbers slugs that collide within a course and this
-cannot know about that, so the worst case is one re-transcription.
+*Rename* edits the filename in place, which currently controls lesson order.
+The generated title remains the model-authored title. The durable service keeps
+lesson identity, published media, reading state, and reusable caches across the
+rename. Explicit ordering and editable titles are planned.
 
-*Delete* takes two clicks and removes the source video for good; there is no
-undo. It deliberately leaves the stage cache alone, so putting the same file
-back is instant rather than another whisper run. The next build removes the
-lesson's pages, screenshots and clips from the site.
+*Delete* takes two clicks and removes the original library file; there is no
+restore action yet. Reconciliation removes its current page and navigation entry.
+Stage caches, historical media revisions, and processing snapshots are retained.
 
 Only videos sitting directly in a course folder are listed. Ones nested deeper
 still build -- they are flattened into the same lesson list -- but they are not
@@ -484,115 +499,52 @@ network and the wrong one anywhere else -- set
 
 ## Where the state lives
 
-Nothing is in a database, and nothing lives outside these two directories:
-
+```text
+<stateDir>/library/           original imported videos
+<stateDir>/state/             catalog.sqlite and workflows.sqlite; persistent state
+<stateDir>/work/              disposable stage caches
+<stateDir>/site/_sources/     immutable processing/playback snapshots
+<stateDir>/site/_revisions/   committed media revisions
+<stateDir>/site/.staging/     artifacts used by in-flight builds
+<stateDir>/site/              generated pages, assets, and status.json
 ```
-<stateDir>/library/                 the videos, exactly as you put them there
-<stateDir>/work/<course>/<lesson>/  the stage cache: probe, transcript,
-                                    scenes, steps, assets -- one JSON each
-<stateDir>/site/                    everything served, all of it generated
-<stateDir>/site/site.json           every course, lesson and step as data
-<stateDir>/site/status.json         what the builder is doing right now
-```
 
-`work/` is a cache: deleting it costs a re-transcription and nothing else.
-`site/` is output: deleting it costs a rebuild, which is cheap while `work/` is
-intact. The library is the only thing that is not reproducible, so it is the
-only thing to back up.
-
-Course and lesson names come from the directory and file names, read fresh on
-every build -- there is no stored title to get out of step with them. Renaming
-a course folder renames it on the site at the next build, and the old pages are
-removed with it.
+Back up the original library and both SQLite databases. Stop the API and worker
+before copying live database files, or use SQLite's backup API. A recovering DBOS
+workflow can reference staged or published media, so preserve those artifacts with
+its execution history. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
 
 ## What happens when things go wrong
 
-The design principle is that a video is only ever built from a file that is
-completely on disk, and that no failure is allowed to leave a half-written page
-where a whole one used to be.
+Each lesson has an independent DBOS workflow. Completed stages are checkpointed;
+a restart recovers interrupted workflows, while a repeatedly crashing workflow is
+limited to three recovery attempts. Retryable network/API failures get bounded
+step retries. Other processing errors remain visible on the home page with Retry,
+and the worker continues to later lessons.
 
-**A copy that is still in progress.** The watcher waits for the library to look
-identical for a full poll before it touches anything, so a file still being
-written is not picked up. Browser uploads go further: they arrive under a
-leading dot, which `find_videos` skips, and are renamed into place only when
-complete.
+Rebuilding a lesson creates a new media revision. Its previous revision remains
+readable until replacement succeeds. Generation happens outside the published
+revision, and public text files are replaced atomically. A canceled or removed
+lesson cannot publish a stale result. Removing the final lesson publishes an empty
+library. The separate API service continues accepting uploads when the worker
+restarts.
 
-**A truncated or corrupt video.** It fails at the probe stage, is logged, shows
-as *Failed* on the home page, and the rest of the course builds around it.
-Replacing the file changes its size or modification time, which is a library
-change, which starts a fresh build.
+A dropped browser upload still needs to be retried. Each request uses its own
+hidden temporary file and commits under a destination lock. Existing imported
+filenames are looked up exactly, without sanitization changing the target.
 
-**A build that dies part way.** Each stage writes its cache atomically and only
-once it has finished, so a restart resumes from the last completed stage rather
-than from the beginning. Screenshots and clips are re-cut whenever their stage
-is re-run, so a half-written JPEG from a killed ffmpeg is overwritten rather
-than kept.
+Job controls are also available from the command line:
 
-**A deploy in the middle of a build.** `nixos-rebuild` restarts the service,
-which is the case above. The page reloads itself only when a build *finishes*,
-so an interrupted one leaves open browsers alone.
-
-**A build that fails outright** -- the API refusing, the disk full -- keeps the
-last good site exactly as it was, says so on the home page, and retries with a
-doubling delay up to an hour rather than waiting for someone to notice. The
-stage cache means a retry resumes rather than starting over. Touching the
-library resets the backoff.
-
-**An upload that drops part way** leaves nothing behind and has to be started
-again; there is no resume. On a LAN that is a minute of lost time, which is why
-it has not been built.
-
-**A lesson that keeps being processed again.** A rebuild reuses the stage cache
-and should be quick; if whisper runs every time, the cache is being missed or
-thrown away. The three causes, in order of likelihood:
-
-```bash
-# Is the service crash-looping? Each start triggers a fresh build pass.
-systemctl show video-to-website -p NRestarts
-journalctl -u video-to-website | grep -iE "killed|out of memory|Started|Stopped"
-
-# Is it transcribing, or reusing? The log says which, per lesson.
-journalctl -u video-to-website | grep -E "transcribing|transcript cached|course:"
+```sh
+v2w jobs list --state /var/lib/video-to-website/state
+v2w jobs retry LESSON_ID --state /var/lib/video-to-website/state
+v2w jobs cancel LESSON_ID --state /var/lib/video-to-website/state
 ```
 
-A killed process (whisper on a large lesson in a small container is the usual
-one) means systemd restarts it, the watcher rebuilds, and it is killed again --
-which looks exactly like a lesson being processed forever. More RAM on the
-container, or a smaller `whisperModel`, is the fix. Otherwise: a course folder
-renamed outside this page orphans its cache under the old slug, and re-uploading
-a file changes its modification time, which is a genuine change and rebuilds it.
-
-**A course folder copied in as root.** `scp` and `mv` over ssh create folders
-owned by root, which the builder can read but not write -- so the course builds
-fine and then every upload into it is refused. The service takes ownership of
-the whole library at each start, so a `systemctl restart video-to-website` or
-any deploy fixes it. Between restarts the upload page says which folder and
-what to run:
-
-```bash
-chown -R v2w /var/lib/video-to-website/library
-```
-
-**The API key** goes in a file on the server rather than the Nix store, which is
-world readable:
-
-```nix
-services.video-to-website = {
-  enable = true;
-  environmentFile = "/var/lib/secrets/v2w.env";   # ANTHROPIC_API_KEY=sk-ant-...
-  llm = "anthropic";
-  llmModel = "claude-sonnet-5";
-};
-```
-
-The API rather than the CLI is the default for the service on purpose: a box
-working through a course wants predictable per-token billing, not a session
-quota it can exhaust. Sonnet is the default model for the same reason; raise
-individual lessons to Opus if their coverage looks thin.
-
-The whisper model is pinned by hash and baked into the closure, so the service
-never downloads weights at runtime. `services.video-to-website.whisperModels`
-changes which, or set it to null to let it fetch its own.
+Deleting a library source removes its current catalog page, but historical media
+and processing snapshots are retained. Automatic artifact cleanup and trash/restore
+are not implemented yet. This means storage usage includes source snapshots and
+previous revisions, not just the original library.
 
 ## Running it on a Linux server
 

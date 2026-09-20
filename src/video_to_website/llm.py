@@ -22,6 +22,10 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 class LLMError(RuntimeError):
     """The backend refused, failed, or returned something unusable."""
 
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 SYSTEM_PROMPT = """\
 You convert transcripts of screen-recorded software tutorials into a condensed, \
@@ -244,9 +248,10 @@ class AnthropicBackend:
         try:
             message = self._final_message(system, user)
         except self._anthropic.APIStatusError as exc:
-            raise LLMError(f"Anthropic API error {exc.status_code}: {exc}") from exc
+            raise LLMError(f"Anthropic API error {exc.status_code}: {exc}",
+                           retryable=exc.status_code == 429 or exc.status_code >= 500) from exc
         except self._anthropic.APIConnectionError as exc:
-            raise LLMError(f"could not reach the Anthropic API: {exc}") from exc
+            raise LLMError(f"could not reach the Anthropic API: {exc}", retryable=True) from exc
 
         stop_reason = getattr(message, "stop_reason", None)
         if stop_reason == "refusal":
@@ -300,9 +305,10 @@ class OllamaBackend:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = json.loads(response.read())
         except urllib.error.HTTPError as exc:
-            raise LLMError(f"Ollama returned HTTP {exc.code}: {exc.read()[:400]!r}") from exc
+            raise LLMError(f"Ollama returned HTTP {exc.code}: {exc.read()[:400]!r}",
+                           retryable=exc.code == 429 or exc.code >= 500) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise LLMError(f"could not reach Ollama at {self.host}: {exc}") from exc
+            raise LLMError(f"could not reach Ollama at {self.host}: {exc}", retryable=True) from exc
 
         text = (body.get("message") or {}).get("content") or ""
         if not text.strip():

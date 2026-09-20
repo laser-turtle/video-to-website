@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sys
 import urllib.request
 from pathlib import Path
@@ -189,14 +188,14 @@ def transcribe(
         # stderr streams through: transcription is the slow stage and progress helps.
         run(cmd, capture_stdout=True, capture_stderr=False)
     except CommandError as exc:
-        die(f"whisper.cpp failed.\n  {exc}")
+        raise CommandError(f"whisper.cpp failed.\n  {exc}") from exc
 
     json_path = out_prefix.with_suffix(out_prefix.suffix + ".json")
     if not json_path.is_file():
         alt = Path(str(out_prefix) + ".json")
         json_path = alt if alt.is_file() else json_path
     if not json_path.is_file():
-        die(f"whisper.cpp produced no JSON at {json_path}")
+        raise CommandError(f"whisper.cpp produced no JSON at {json_path}")
 
     segments = _parse_whisper_json(json_path)
     if not segments:

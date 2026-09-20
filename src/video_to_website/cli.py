@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import sys
-import time
 from pathlib import Path
 
-from . import __version__, render
+from . import __version__
 from .ingest import IngestHandler, IngestMixin
 from .pipeline import STAGE_ORDER, BuildOptions, build
 from .progress import Progress
-from .util import die, find_videos, human_duration, log, warn
+from .util import die, find_videos, human_duration, log
 
 
 def _add_build_options(parser: argparse.ArgumentParser) -> None:
@@ -118,7 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_build_options(build_cmd)
 
     watch_cmd = sub.add_parser(
-        "watch", help="rebuild whenever the library changes, for running as a service"
+        "watch", help="process library changes with durable SQLite/DBOS workflows"
     )
     watch_cmd.add_argument("library", type=Path, help="directory of course folders to watch")
     watch_cmd.add_argument("--interval", type=float, default=30.0, help="seconds between polls (default: 30)")
@@ -129,6 +129,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     watch_cmd.add_argument("--api-bind", default="127.0.0.1", help="address for --api-port (default: 127.0.0.1)")
     _add_build_options(watch_cmd)
+    watch_cmd.add_argument("--state", type=Path, help="durable databases (default: <out-parent>/.v2w-state)")
 
     fetch_cmd = sub.add_parser("fetch-model", help="download a whisper.cpp model")
     fetch_cmd.add_argument("names", nargs="*", help="model names, e.g. small.en")
@@ -150,11 +151,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="stage cache to keep in step when a video is renamed (default: <directory>/.work)",
     )
 
+    serve_cmd.add_argument("--state", type=Path, help="durable catalog directory")
+    api_cmd = sub.add_parser("api", help="run the library API separately from the worker")
+    api_cmd.add_argument("library", type=Path)
+    api_cmd.add_argument("--state", type=Path, required=True)
+    api_cmd.add_argument("--bind", default="127.0.0.1")
+    api_cmd.add_argument("--port", type=int, default=8765)
+    jobs_cmd = sub.add_parser("jobs", help="inspect, retry, or cancel durable lesson builds")
+    jobs_cmd.add_argument("action", choices=["list", "retry", "cancel"], default="list", nargs="?")
+    jobs_cmd.add_argument("lesson", nargs="?")
+    jobs_cmd.add_argument("--state", type=Path, default=Path(".v2w-state"))
     sub.add_parser("doctor", help="check that external tools and credentials are in place")
     return parser
 
 
 def _options_from(args: argparse.Namespace) -> BuildOptions:
+    if not math.isfinite(args.chunk_minutes) or args.chunk_minutes <= 0.75:
+        die("--chunk-minutes must be finite and greater than 0.75")
+    if args.frame_width < 2 or args.clip_width < 2:
+        die("frame and clip widths must be at least 2 pixels")
     return BuildOptions(
         out=args.out.expanduser(),
         work=args.work.expanduser() if args.work else None,
@@ -264,13 +279,8 @@ def _retry_delay(failures: int, interval: float) -> float:
     return min(interval * 2**max(1, failures), _MAX_BACKOFF)
 
 
-def _start_api(library: Path, bind: str, port: int, work: Path | None = None) -> None:
-    """Take uploads on a side port while the watcher keeps polling.
-
-    A daemon thread rather than a second process: an upload is finished the
-    moment the file is in the library, and the loop in the main thread finds it
-    on its next pass with no coordination between the two at all.
-    """
+def _start_api(library: Path, bind: str, port: int, work: Path | None = None, catalog=None) -> None:
+    """Convenience mode; the NixOS service runs the API in its own process."""
     import http.server
     import threading
 
@@ -279,72 +289,55 @@ def _start_api(library: Path, bind: str, port: int, work: Path | None = None) ->
     httpd.library = library
     # So a rename can carry the stage cache with it rather than orphaning it.
     httpd.work = work
+    httpd.catalog = catalog
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     log(f"accepting uploads on http://{bind}:{port}/api/")
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
-    """Rebuild whenever the library settles after a change.
+    from .durable import watch
 
-    Polling rather than inotify: a video appearing is not latency-critical, and
-    it keeps this to the standard library and works the same on any filesystem,
-    including the network shares a video is likely to arrive over.
-    """
-    library = args.library.expanduser()
-    library.mkdir(parents=True, exist_ok=True)
     options = _options_from(args)
-    backend = _backend_for(options)
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        die("--interval must be a positive finite number")
+    state = (args.state or options.out.parent / ".v2w-state").expanduser().resolve()
+    watch(args.library.expanduser(), options, state, interval=args.interval,
+          api_port=args.api_port, api_bind=args.api_bind)
+    return 0
 
-    # Before anything is built the site directory is empty, and a web server
-    # pointed at it serves 403 rather than anything explanatory. Say so.
-    if not (options.out / "index.html").exists():
-        render.write_placeholder(options.out, f"Nothing built yet. Drop a course folder in {library}.")
-    progress = Progress(options.out)
-    if args.api_port:
-        _start_api(library, args.api_bind, args.api_port, options.work or (options.out / ".work"))
 
-    log(f"watching {library} every {args.interval:.0f}s, writing to {options.out}")
-    seen: tuple | None = None
-    done: tuple | None = None
-    failures = 0
-    retry_at = 0.0
+def _cmd_api(args: argparse.Namespace) -> int:
+    import http.server
 
-    while True:
-        state = _library_state(library)
-        decision = _watch_decision(state, seen, done)
-        seen = state
-        if decision == "settle":
-            if state:
-                log(f"library changed: {len(state)} videos, waiting for it to settle")
-                progress.queue([Path(path) for path, _, _ in state], "Waiting for the copy to finish")
-            # Whatever the library just did, give it another go straight away.
-            failures, retry_at = 0, 0.0
-        elif decision == "build" and time.time() >= retry_at:
-            try:
-                # The watcher always sees the whole library, so it is the one
-                # caller that can tell a removed course from an unmentioned one.
-                build([library], options, backend, progress, prune=True)
-                done = state
-                failures = 0
-            except SystemExit:
-                raise
-            except Exception as exc:  # a bad video must not take the service down
-                # `done` is deliberately not advanced: the build gets retried
-                # rather than waiting for someone to touch the library. Most of
-                # what fails here is transient -- the API, the network, the
-                # disk -- and the stage cache means a retry resumes rather than
-                # starting over. Backing off so a permanent failure is not an
-                # endless loop of API calls.
-                failures += 1
-                delay = _retry_delay(failures, args.interval)
-                retry_at = time.time() + delay
-                warn(f"build failed, retrying in {human_duration(delay)}: {exc}")
-                progress.fail_build(str(exc), retry_in=delay)
-        try:
-            time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("", file=sys.stderr)
-            return 0
+    from .catalog import Catalog
+
+    library = args.library.expanduser().resolve()
+    library.mkdir(parents=True, exist_ok=True)
+    with http.server.ThreadingHTTPServer((args.bind, args.port), IngestHandler) as server:
+        server.library = library
+        server.work = None
+        server.catalog = Catalog(args.state.expanduser())
+        log(f"library API at http://{args.bind}:{args.port}/api/")
+        server.serve_forever()
+    return 0
+
+
+def _cmd_jobs(args: argparse.Namespace) -> int:
+    import json
+
+    from .catalog import Catalog
+
+    catalog = Catalog(args.state.expanduser())
+    if args.action == "list":
+        print(json.dumps(catalog.status(), indent=2))
+    else:
+        if not args.lesson:
+            die("retry/cancel requires a lesson ID from `v2w jobs list`")
+        if args.action == "retry":
+            print(catalog.retry(args.lesson))
+        else:
+            catalog.cancel(args.lesson)
+    return 0
 
 
 def _cmd_fetch_model(args: argparse.Namespace) -> int:
@@ -460,6 +453,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     with http.server.ThreadingHTTPServer((args.bind, args.port), handler) as httpd:
         httpd.library = args.library.expanduser().resolve() if args.library else None
         httpd.work = (args.work.expanduser().resolve() if args.work else directory / ".work")
+        state = args.state.expanduser() if args.state else directory.parent / ".v2w-state"
+        if (state / "catalog.sqlite").exists():
+            from .catalog import Catalog
+            httpd.catalog = Catalog(state)
         log(f"serving {directory} at http://{args.bind}:{args.port}  (ctrl-c to stop)")
         if httpd.library:
             httpd.library.mkdir(parents=True, exist_ok=True)
@@ -472,7 +469,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_doctor(_args: argparse.Namespace) -> int:
-    from .llm import DEFAULT_OLLAMA_HOST, _anthropic_credentials_present, _ollama_reachable
+    from .llm import (
+        DEFAULT_OLLAMA_HOST,
+        _anthropic_credentials_present,
+        _ollama_reachable,
+    )
     from .whisper import model_dir
 
     ok = True
@@ -520,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "build": _cmd_build,
         "watch": _cmd_watch,
+        "api": _cmd_api,
+        "jobs": _cmd_jobs,
         "fetch-model": _cmd_fetch_model,
         "serve": _cmd_serve,
         "doctor": _cmd_doctor,

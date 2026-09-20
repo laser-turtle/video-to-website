@@ -8,7 +8,9 @@ import json
 import shutil
 from pathlib import Path
 
-from .util import hms, human_duration, log
+from .util import atomic_write, hms, human_duration, log
+
+QUEUE_SCRIPT = (Path(__file__).parent / "assets" / "queue.js").read_text(encoding="utf-8")
 
 STYLE = """\
 :root {
@@ -475,6 +477,37 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .building li.failed .dot { background: #c0392b; }
 .building li.failed .s { color: #c0392b; }
 .building .more { font-size: 12.5px; color: var(--muted); }
+.building .more a { color: var(--accent); }
+.task-queue { padding: 18px; }
+.queue-summary { font-size: 14px; font-weight: 600; margin: 0 0 16px; }
+.queue-tools { display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 18px; }
+.queue-tools label { display: grid; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.queue-tools label:last-child { flex: 1; min-width: 180px; }
+.queue-tools input, .queue-tools select {
+  width: 100%; font: inherit; font-size: 14px; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px;
+}
+.queue-tools input:focus, .queue-tools select:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.task-queue .job { gap: 8px; padding: 16px 0; border-top: 1px solid var(--line); }
+.job-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.task-queue .job h2 { margin: 0; font-size: 16px; color: inherit; letter-spacing: 0; text-transform: none; overflow-wrap: anywhere; }
+.job-state { font-size: 12px; font-weight: 600; border-radius: 5px; padding: 3px 7px; background: var(--bg); color: var(--muted); }
+.job.working .job-state { color: var(--accent); background: var(--accent-soft); }
+.job.failed .job-state, .job-error { color: #c0392b; }
+.job-source, .job-detail, .job-error, .queue-notice, .queue-updated, .queue-empty {
+  margin: 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere;
+}
+.job-source, .job-detail, .queue-updated { color: var(--muted); }
+.queue-notice { margin-bottom: 12px; }
+.queue-updated { margin-top: 16px; font-size: 12px; }
+.job-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.job-actions button, .job-actions a, .building > ul > li > button {
+  justify-self: start; font: inherit; font-size: 13px; cursor: pointer;
+  color: var(--accent); background: none; border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 10px; text-decoration: none;
+}
+.job-actions button:hover, .job-actions a:hover { border-color: var(--accent); }
+.job-actions button:disabled { opacity: .6; cursor: wait; }
 @keyframes v2w-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) {
   .building li.working .dot { animation: none; }
@@ -1337,8 +1370,6 @@ STATUS_SCRIPT = """\
   // it moves, and the page reloads itself so the new course actually appears.
   var builtAtLoad = null;
 
-  function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
-
   function elapsed(seconds) {
     var s = Math.round(seconds || 0);
     if (s < 60) { return s + 's'; }
@@ -1347,7 +1378,7 @@ STATUS_SCRIPT = """\
     return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
   }
 
-  function row(entry) {
+  function row(entry, updated) {
     var li = document.createElement('li');
     li.className = entry.state;
 
@@ -1360,6 +1391,10 @@ STATUS_SCRIPT = """\
     li.appendChild(title);
 
     var parts = [entry.course, entry.label];
+    if (entry.queue_position) { parts.push('#' + entry.queue_position + ' in queue'); }
+    if (entry.state === 'working' && updated && Date.now() / 1000 - updated > 120) {
+      parts.push('No recent update from the worker');
+    }
     if (entry.state === 'working' && entry.elapsed) { parts.push(elapsed(entry.elapsed)); }
     var sub = document.createElement('div');
     sub.className = 's';
@@ -1376,6 +1411,24 @@ STATUS_SCRIPT = """\
       fill.style.width = (100 * Math.max(0, entry.step - 0.5) / entry.steps) + '%';
       bar.appendChild(fill);
       li.appendChild(bar);
+    }
+    if (/^[a-f0-9]{32}$/.test(entry.id || '') &&
+        ['working', 'queued', 'failed', 'cancelled'].indexOf(entry.state) >= 0) {
+      var action = entry.state === 'failed' || entry.state === 'cancelled' ? 'retry' : 'cancel';
+      var control = document.createElement('button');
+      control.type = 'button';
+      control.textContent = action === 'retry' ? 'Retry' : 'Cancel';
+      control.addEventListener('click', function () {
+        control.disabled = true;
+        fetch('api/lessons/' + entry.id + '/' + action, { method: 'POST' }).then(function (res) {
+          if (!res.ok) { throw new Error('Request failed (' + res.status + ')'); }
+          poll();
+        }).catch(function (err) {
+          control.disabled = false;
+          control.textContent = err.message + ' — try again';
+        });
+      });
+      li.appendChild(control);
     }
     return li;
   }
@@ -1403,8 +1456,7 @@ STATUS_SCRIPT = """\
     var videos = data.videos || [];
     var active = videos.filter(function (v) { return v.state === 'working'; });
     var queued = videos.filter(function (v) { return v.state === 'queued'; });
-    var failed = videos.filter(function (v) { return v.state === 'failed'; });
-    var done = videos.filter(function (v) { return v.state === 'done' || v.state === 'skipped'; });
+    var failed = videos.filter(function (v) { return v.state === 'failed' || v.state === 'cancelled'; });
 
     var shown = active.concat(failed, queued.slice(0, QUEUE_SHOWN));
     if (!shown.length && !data.error) { panel.hidden = true; return; }
@@ -1413,19 +1465,22 @@ STATUS_SCRIPT = """\
     // A build that stopped part way is the one thing worth saying out loud:
     // the pages on disk are last build's, and nothing else on the page says so.
     if (data.error) { list.appendChild(errorRow(data)); }
-    shown.forEach(function (entry) { list.appendChild(row(entry)); });
+    shown.forEach(function (entry) { list.appendChild(row(entry, data.updated)); });
 
     var hidden = queued.length - Math.min(queued.length, QUEUE_SHOWN);
     if (hidden > 0) {
       var more = document.createElement('li');
       more.className = 'more';
-      more.textContent = plural(hidden, 'more video') + ' waiting';
+      var link = document.createElement('a');
+      link.href = 'queue.html';
+      link.textContent = 'View all ' + queued.length + ' waiting lessons';
+      more.appendChild(link);
       list.appendChild(more);
     }
     if (count) {
-      count.textContent = done.length && videos.length > 1
-        ? done.length + ' of ' + videos.length + ' done'
-        : '';
+      count.textContent = [active.length ? active.length + ' running' : '',
+        queued.length ? queued.length + ' waiting' : '',
+        failed.length ? failed.length + ' needing attention' : ''].filter(Boolean).join(' · ');
     }
     panel.hidden = false;
   }
@@ -1568,7 +1623,7 @@ UPLOAD_SCRIPT = """\
       remove.remove();
       var label = document.createElement('span');
       label.className = 'size';
-      label.textContent = 'Delete for good?';
+      label.textContent = 'Remove source from library?';
       row.appendChild(label);
       row.appendChild(button('Yes, delete', 'danger', function () {
         act(api('DELETE', videoPath(courseName, video.name)));
@@ -1606,7 +1661,7 @@ UPLOAD_SCRIPT = """\
 
   // The API is the only part of the site that is not a static file, so it can
   // be missing entirely -- a locally built copy, or a server with uploads off.
-  function load() {
+  function load(clearMessage) {
     return fetch('api/library').then(function (res) {
       if (!res.ok) { throw new Error(res.status); }
       return res.json();
@@ -1619,7 +1674,7 @@ UPLOAD_SCRIPT = """\
         list.appendChild(option);
       });
       if (library && libraryList) { renderLibrary(courses); }
-      say('');
+      if (clearMessage !== false) { say(''); }
     }).catch(function () {
       choose.disabled = true;
       if (library) { library.hidden = true; }
@@ -1665,6 +1720,7 @@ UPLOAD_SCRIPT = """\
     });
     xhr.addEventListener('load', function () {
       if (xhr.status === 201) {
+        job.ui.li.className = 'uploaded';
         job.ui.fill.style.width = '100%';
         job.ui.status.textContent = size(job.file.size) + ' \u00b7 uploaded to ' + job.course;
         next();
@@ -1693,7 +1749,9 @@ UPLOAD_SCRIPT = """\
         job.ui.li.className = '';
         job.ui.bar.hidden = false;
         job.ui.status.textContent = size(job.file.size) + ' \u00b7 waiting';
-        send(job, true);
+        job.overwrite = true;
+        pending.push(job);
+        if (!busy) { next(); }
       });
       job.ui.li.appendChild(again);
     }
@@ -1705,14 +1763,16 @@ UPLOAD_SCRIPT = """\
     if (!job) {
       busy = false;
       if (queue.children.length) {
-        load();
-        say('Done. The builder picks new videos up within a minute \u2014 watch it on the home page.');
+        load(false);
+        var failed = Array.prototype.filter.call(queue.children, function (row) { return row.className === 'failed'; }).length;
+        say(failed ? failed + ' upload(s) need attention. Uploaded videos are queued for the builder.'
+          : 'Uploaded. The builder will process these videos — watch progress on the home page.');
       }
       return;
     }
     busy = true;
     job.ui.status.textContent = size(job.file.size) + ' \u00b7 uploading';
-    send(job, false);
+    send(job, !!job.overwrite);
   }
 
   function add(files) {
@@ -2014,7 +2074,9 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
 {_lightbox()}
 {_shortcut_overlay()}"""
     return _page(
-        lesson["title"], body, depth=1, lesson_slug=lesson["slug"], scripts=(("app.js", SCRIPT),)
+        lesson["title"], body, depth=1,
+        lesson_slug=lesson.get("reading_key") or lesson.get("id") or course["slug"] + ":" + lesson["slug"],
+        scripts=(("app.js", SCRIPT),)
     )
 
 
@@ -2063,11 +2125,11 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
     # Filled in by status.js from status.json, which the builder keeps current.
     # Static markup so the page is not blank for the length of the first poll.
     status = """<section class="building" id="build-status" hidden>
-  <h2>Processing<span class="count" id="build-count"></span></h2>
+  <h2><a href="queue.html">Task queue</a><span class="count" id="build-count"></span></h2>
   <ul id="build-list"></ul>
 </section>"""
     body = f"""<header class="top">
-  <div class="crumbs"><a href="upload.html">Manage videos</a></div>
+  <div class="crumbs"><a href="upload.html">Manage videos</a> / <a href="queue.html">Task queue</a></div>
   <h1>Courses</h1>
   <div class="meta">{_esc(meta)}</div>
 </header>
@@ -2075,9 +2137,43 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
     return _page("Courses", body, depth=0, scripts=(("status.js", STATUS_SCRIPT),))
 
 
+def render_queue_page() -> str:
+    body = """<header class="top">
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="upload.html">Manage videos</a></div>
+  <h1>Task queue</h1>
+  <div class="meta">See what's processing and what's coming next. Cancelling keeps your source video.</div>
+</header>
+<main class="wrap">
+  <section class="building task-queue" aria-label="Processing queue">
+    <p id="queue-summary" class="queue-summary" role="status" aria-live="polite">Loading the queue…</p>
+    <div class="queue-tools">
+      <label for="job-filter">Show
+        <select id="job-filter">
+          <option value="active">Running and waiting</option>
+          <option value="queued">Waiting</option>
+          <option value="failed">Failed</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="done">Ready</option>
+          <option value="all">All lessons</option>
+        </select>
+      </label>
+      <label for="job-search">Find a lesson
+        <input id="job-search" type="search" placeholder="Course or filename" autocomplete="off">
+      </label>
+    </div>
+    <p id="queue-notice" class="queue-notice" role="status" hidden></p>
+    <ul id="job-list"></ul>
+    <p id="queue-empty" class="queue-empty" hidden></p>
+    <p id="queue-updated" class="queue-updated"></p>
+    <noscript>Enable JavaScript to view live processing status and manage the queue.</noscript>
+  </section>
+</main>"""
+    return _page("Task queue", body, depth=0, scripts=(("queue.js", QUEUE_SCRIPT),))
+
+
 def render_upload_page() -> str:
     body = """<header class="top">
-  <div class="crumbs"><a href="index.html">All courses</a></div>
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="queue.html">Task queue</a></div>
   <h1>Videos</h1>
   <div class="meta">What the builder works from. Anything changed here rebuilds the site.</div>
 </header>
@@ -2098,6 +2194,7 @@ def render_upload_page() -> str:
   </div>
   <section class="library" id="library" hidden>
     <h2>Library</h2>
+    <p class="hint">Deleting removes the library source. Processing snapshots and previous versions are retained.</p>
     <div id="library-list"></div>
   </section>
 </div>"""
@@ -2121,9 +2218,9 @@ def render_lesson_markdown(lesson: dict) -> str:
             out += ["", f"> {step['note']}"]
         if step.get("clip"):
             clip = step["clip"]
-            out += ["", f"[{clip['seconds']:.0f}s clip from {hms(clip['time'])}]({clip['src']})"]
+            out += ["", f"[{clip['seconds']:.0f}s clip from {hms(clip['time'])}](../{clip['src']})"]
         for shot in step.get("frames") or ([{"time": step["start"], "src": step["frame"]}] if step.get("frame") else []):
-            out += ["", f"![step {step['index']} at {hms(shot['time'])}]({shot['src']})"]
+            out += ["", f"![step {step['index']} at {hms(shot['time'])}](../{shot['src']})"]
         out += [""]
     return "\n".join(out) + "\n"
 
@@ -2131,10 +2228,11 @@ def render_lesson_markdown(lesson: dict) -> str:
 def write_assets(site_dir: Path) -> None:
     assets = site_dir / "assets"
     assets.mkdir(parents=True, exist_ok=True)
-    (assets / "style.css").write_text(STYLE)
-    (assets / "app.js").write_text(SCRIPT)
-    (assets / "status.js").write_text(STATUS_SCRIPT)
-    (assets / "upload.js").write_text(UPLOAD_SCRIPT)
+    atomic_write(assets / "style.css", STYLE)
+    atomic_write(assets / "app.js", SCRIPT)
+    atomic_write(assets / "status.js", STATUS_SCRIPT)
+    atomic_write(assets / "upload.js", UPLOAD_SCRIPT)
+    atomic_write(assets / "queue.js", QUEUE_SCRIPT)
 
 
 def write_placeholder(site_dir: Path, note: str) -> None:
@@ -2146,8 +2244,9 @@ def write_placeholder(site_dir: Path, note: str) -> None:
     """
     site_dir.mkdir(parents=True, exist_ok=True)
     write_assets(site_dir)
-    (site_dir / "index.html").write_text(render_root_index([], note=note))
-    (site_dir / "upload.html").write_text(render_upload_page())
+    atomic_write(site_dir / "index.html", render_root_index([], note=note))
+    atomic_write(site_dir / "upload.html", render_upload_page())
+    atomic_write(site_dir / "queue.html", render_queue_page())
 
 
 def _prune_course(course_dir: Path, lessons: set[str]) -> int:
@@ -2190,7 +2289,7 @@ def prune_site(site_dir: Path, keep: dict[str, set[str]]) -> int:
     """
     removed = 0
     for entry in sorted(site_dir.iterdir()):
-        if entry.is_file() or entry.name.startswith(".") or entry.name == "assets":
+        if entry.is_file() or entry.name.startswith(".") or entry.name in {"assets", "_revisions", "_sources"}:
             continue
         if entry.name not in keep:
             shutil.rmtree(entry)
@@ -2213,13 +2312,13 @@ def write_site(
     for course in courses:
         course_dir = site_dir / course["slug"]
         course_dir.mkdir(parents=True, exist_ok=True)
-        (course_dir / "index.html").write_text(render_course_page(course))
+        atomic_write(course_dir / "index.html", render_course_page(course))
         for lesson in course["lessons"]:
-            (course_dir / f"{lesson['slug']}.html").write_text(render_lesson_page(lesson, course))
+            atomic_write(course_dir / f"{lesson['slug']}.html", render_lesson_page(lesson, course))
             if write_markdown:
                 md_dir = course_dir / "md"
                 md_dir.mkdir(parents=True, exist_ok=True)
-                (md_dir / f"{lesson['slug']}.md").write_text(render_lesson_markdown(lesson))
+                atomic_write(md_dir / f"{lesson['slug']}.md", render_lesson_markdown(lesson))
 
     if keep is not None:
         # Whatever was just written stays, whatever the caller said: a bug in
@@ -2234,9 +2333,10 @@ def write_site(
 
     # The root index goes last. Until the pages it links to are on disk, a
     # reader who follows one gets a 404.
-    (site_dir / "index.html").write_text(render_root_index(courses))
-    (site_dir / "upload.html").write_text(render_upload_page())
-    (site_dir / "site.json").write_text(json.dumps(courses, indent=2))
+    atomic_write(site_dir / "queue.html", render_queue_page())
+    atomic_write(site_dir / "index.html", render_root_index(courses))
+    atomic_write(site_dir / "upload.html", render_upload_page())
+    atomic_write(site_dir / "site.json", json.dumps(courses, indent=2))
     log(f"site written to {site_dir}")
 
 

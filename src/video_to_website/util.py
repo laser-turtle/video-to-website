@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, NoReturn, Sequence
@@ -33,6 +39,61 @@ _USE_COLOR = sys.stderr.isatty() and os.environ.get("NO_COLOR") is None
 
 class CommandError(RuntimeError):
     """A subprocess exited non-zero."""
+
+
+class BuildCancelled(RuntimeError):
+    """The requested source revision is no longer wanted."""
+
+
+_process_check = contextvars.ContextVar("v2w_process_check", default=None)
+
+
+@contextlib.contextmanager
+def process_control(check):
+    token = _process_check.set(check)
+    try:
+        yield
+    finally:
+        _process_check.reset(token)
+
+
+def digest_json(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def digest_file(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Publish a complete file; distinct writers never share a temporary path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, *, blocking: bool = True):
+    """Coordinate local processes on the supported Linux/macOS deployments."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 def _paint(text: str, code: str) -> str:
@@ -66,19 +127,50 @@ def run(
     capture_stderr: bool = True,
     check: bool = True,
     cwd: Path | None = None,
+    text: bool = True,
+    timeout: float = 7200,
 ) -> subprocess.CompletedProcess:
     """Run a command. stderr is captured by default; pass capture_stderr=False to stream it."""
-    proc = subprocess.run(
+    check_cancelled = _process_check.get()
+    if check_cancelled:
+        check_cancelled()
+    process = subprocess.Popen(
         list(cmd),
         stdout=subprocess.PIPE if capture_stdout else None,
         stderr=subprocess.PIPE if capture_stderr else None,
         stdin=subprocess.DEVNULL,
-        text=True,
-        errors="replace",
+        text=text,
+        errors="replace" if text else None,
         cwd=str(cwd) if cwd else None,
+        start_new_session=True,
     )
+    started = time.monotonic()
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if check_cancelled:
+                    check_cancelled()
+                if time.monotonic() - started > timeout:
+                    raise CommandError(f"{cmd[0]} exceeded its {timeout:g}s timeout")
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        raise
+    proc = subprocess.CompletedProcess(list(cmd), process.returncode, stdout, stderr)
     if check and proc.returncode != 0:
-        tail = (proc.stderr or "").strip().splitlines()[-12:]
+        error = proc.stderr or ""
+        if isinstance(error, bytes):
+            error = error.decode(errors="replace")
+        tail = error.strip().splitlines()[-12:]
         detail = "\n  ".join(tail)
         raise CommandError(
             f"{cmd[0]} exited {proc.returncode}\n  command: {' '.join(cmd)}"
@@ -174,9 +266,7 @@ def write_stage(cache_path: Path, fingerprint: dict, params: dict, data: Any) ->
         "params": params,
         "data": data,
     }
-    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(cache_path)
+    atomic_write(cache_path, json.dumps(payload, indent=2))
 
 
 def find_videos(root: Path) -> list[Path]:
@@ -186,6 +276,7 @@ def find_videos(root: Path) -> list[Path]:
     found = [
         p
         for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES and not p.name.startswith(".")
+        if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES
+        and not any(part.startswith(".") for part in p.relative_to(root).parts)
     ]
     return sorted(found, key=lambda p: natural_key(str(p.relative_to(root))))

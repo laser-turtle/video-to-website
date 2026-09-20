@@ -45,6 +45,7 @@ test:
 	  && node --check app.js && node tests/test_app_js.mjs app.js \
 	  && node --check status.js && node tests/test_status_js.mjs status.js \
 	  && node --check upload.js && node tests/test_upload_js.mjs upload.js \
+	  && node --check src/video_to_website/assets/queue.js && node tests/test_queue_js.mjs src/video_to_website/assets/queue.js \
 	  && rm -f app.js status.js upload.js'
 
 check:

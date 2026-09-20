@@ -6,7 +6,7 @@ import math
 import re
 from typing import Any
 
-from .llm import LLMError, SYSTEM_PROMPT, build_user_prompt, extract_json
+from .llm import SYSTEM_PROMPT, LLMError, build_user_prompt, extract_json
 from .util import log, warn
 
 MAX_TITLE_CHARS = 90
@@ -23,6 +23,8 @@ def _window_segments(segments: list[dict], start: float, end: float) -> list[dic
 
 def _plan_windows(duration: float, chunk_minutes: float, overlap: float) -> list[tuple[float, float]]:
     span = chunk_minutes * 60.0
+    if not math.isfinite(span) or span <= overlap:
+        raise ValueError("chunk length must be finite and greater than the overlap (45 seconds)")
     if duration <= span * 1.25:
         return [(0.0, duration + 1.0)]
     windows: list[tuple[float, float]] = []

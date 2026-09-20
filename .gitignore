@@ -9,4 +9,5 @@ __pycache__/
 site/
 .v2w/
 .v2w-models/
+.v2w-state/
 samples/

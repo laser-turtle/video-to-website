@@ -23,6 +23,27 @@
 
           runtimeDeps = [ pkgs.ffmpeg pkgs.whisper-cpp ];
 
+          dbos = python.pkgs.buildPythonPackage {
+            pname = "dbos";
+            version = "3.0.0";
+            pyproject = true;
+            src = pkgs.fetchPypi {
+              pname = "dbos";
+              version = "3.0.0";
+              hash = "sha256-2bi5LuE5s+8fcH3QVIMcT42wOdL3kJdc0MgX7L0nbB8=";
+            };
+            build-system = [ python.pkgs.pdm-backend ];
+            dependencies = with python.pkgs; [
+              pyyaml python-dateutil psycopg websockets click sqlalchemy greenlet
+            ];
+            # Nix provides psycopg with its own libpq, not the PyPI binary extra.
+            postPatch = ''
+              substituteInPlace pyproject.toml --replace-fail 'psycopg[binary]' 'psycopg'
+            '';
+            pythonImportsCheck = [ "dbos" ];
+            doCheck = false;
+          };
+
           modelFile = name:
             pkgs.fetchurl {
               url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${name}.bin";
@@ -46,7 +67,7 @@
             src = ./.;
 
             build-system = [ python.pkgs.hatchling ];
-            dependencies = [ python.pkgs.anthropic ];
+            dependencies = [ python.pkgs.anthropic dbos ];
 
             # ffmpeg and whisper-cli must be on PATH wherever v2w runs.
             makeWrapperArgs = [
@@ -79,7 +100,7 @@
             };
         in
         {
-          inherit v2w modelDir withModel runtimeDeps python;
+          inherit v2w modelDir withModel runtimeDeps python dbos;
         };
     in
     {
@@ -147,7 +168,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           built = mkPackages pkgs;
-          pythonEnv = built.python.withPackages (ps: [ ps.anthropic ]);
+          pythonEnv = built.python.withPackages (ps: [ ps.anthropic built.dbos ]);
         in
         {
           default = pkgs.mkShell {
@@ -178,7 +199,7 @@
           tests = pkgs.runCommand "video-to-website-tests"
             {
               nativeBuildInputs = [
-                (built.python.withPackages (ps: [ ps.anthropic ]))
+                (built.python.withPackages (ps: [ ps.anthropic built.dbos ]))
                 pkgs.nodejs
               ];
             } ''
@@ -199,6 +220,8 @@
             python -c "from video_to_website.render import UPLOAD_SCRIPT; open('upload.js','w').write(UPLOAD_SCRIPT)"
             node --check upload.js
             node tests/test_upload_js.mjs upload.js
+            node --check src/video_to_website/assets/queue.js
+            node tests/test_queue_js.mjs src/video_to_website/assets/queue.js
             touch $out
           '';
         });

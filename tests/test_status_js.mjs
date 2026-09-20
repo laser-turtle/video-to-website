@@ -13,6 +13,8 @@ function makeElement(tag) {
     children: [],
     hidden: false,
     style: {},
+    listeners: {},
+    addEventListener(type, fn) { this.listeners[type] = fn; },
     _text: '',
     appendChild(child) { this.children.push(child); return child; },
     get textContent() {
@@ -106,7 +108,9 @@ await flush();
 await flush();
 assert.equal(list.children.length, 8, 'one working, six queued, one summary');
 assert.equal(list.children[7].className, 'more');
-assert.equal(list.children[7].textContent, '3 more videos waiting');
+assert.equal(list.children[7].textContent, 'View all 9 waiting lessons');
+assert.equal(list.children[7].children[0].href, 'queue.html');
+assert.equal(count.textContent, '1 running · 9 waiting');
 
 // 5. A failure is always shown, never collapsed away.
 payload = {
@@ -135,7 +139,7 @@ tick();
 await flush();
 await flush();
 assert.equal(list.children.length, 1, 'only the unfinished video is listed');
-assert.equal(count.textContent, '2 of 3 done');
+assert.equal(count.textContent, '1 running');
 
 // 7. A build finishing moves `built`, and the page reloads to pick up the
 // courses that just appeared.
@@ -177,5 +181,15 @@ payload = { updated: 7, building: true, built: 1758300000, videos: [video({ stat
 const before = fetched.length;
 documentListeners.visibilitychange.forEach((fn) => fn());
 assert.equal(fetched.length, before + 1, 'coming back to the tab refreshes it');
+
+// Durable jobs expose retry through stable lesson IDs.
+await flush(); await flush();
+payload = { updated: 8, built: 0, videos: [video({id: 'a'.repeat(32), state: 'failed'})] };
+tick(); await flush(); await flush();
+const retry = list.children[0].children.find(c => c.tagName === 'button');
+assert.equal(retry.textContent, 'Retry');
+retry.listeners.click();
+await flush(); await flush();
+assert.ok(fetched.some(url => url === 'api/lessons/' + 'a'.repeat(32) + '/retry'));
 
 console.log('status.js runtime checks passed');

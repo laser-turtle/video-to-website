@@ -491,7 +491,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Press X &amp; confirm", html)
         self.assertIn('data-t="12.00"', html)
         self.assertIn('src="videos/lesson-one.mp4"', html)
-        self.assertIn('data-lesson="lesson-one"', html)
+        self.assertIn('data-lesson="course:lesson-one"', html)
         self.assertIn("Full transcript", html)
 
     def test_page_without_video_has_no_player(self):
@@ -809,6 +809,20 @@ class RenderTests(unittest.TestCase):
             self.assertIn("Nothing built yet. Drop a course in /lib.", html)
             self.assertTrue((site / "assets" / "style.css").exists())
             self.assertTrue((site / "assets" / "app.js").exists())
+            self.assertTrue((site / "queue.html").exists())
+            self.assertTrue((site / "assets" / "queue.js").exists())
+
+    def test_queue_page_is_discoverable_and_emitted_on_rebuild(self):
+        self.assertIn('href="queue.html"', render.render_root_index([self.course]))
+        self.assertIn('href="queue.html"', render.render_upload_page())
+        with tempfile.TemporaryDirectory() as tmp:
+            site = Path(tmp)
+            render.write_site(site, [self.course])
+            queue = (site / "queue.html").read_text()
+            self.assertIn('id="job-list"', queue)
+            self.assertIn('id="job-filter"', queue)
+            self.assertIn('id="job-search"', queue)
+            self.assertIn('assets/queue.js?v=', queue)
 
     def test_note_gives_way_to_the_course_count(self):
         html = render.render_root_index([self.course], note="Nothing built yet.")
@@ -1035,6 +1049,71 @@ class UploadServerTests(unittest.TestCase):
     def test_an_empty_body_is_refused(self):
         status, _ = self.put("/api/library/my_course/lesson_one.mp4", b"")
         self.assertEqual(status, 413)
+
+    def test_existing_names_are_not_rewritten_when_deleting(self):
+        self.lesson("course", "What's next.mp4", b"original")
+        self.lesson("course", "What_s next.mp4", b"different")
+        status, _ = self.request("DELETE", "/api/library/course/What%27s%20next.mp4")
+        self.assertEqual(status, 200)
+        self.assertFalse((self.library / "course" / "What's next.mp4").exists())
+        self.assertEqual((self.library / "course" / "What_s next.mp4").read_bytes(), b"different")
+
+    def test_existing_course_name_survives_rename_and_upload(self):
+        self.lesson("O'Reilly", "one.mp4")
+        status, _ = self.post("/api/library/O%27Reilly/one.mp4", {"to_name": "two.mp4"})
+        self.assertEqual(status, 200)
+        self.assertTrue((self.library / "O'Reilly" / "two.mp4").exists())
+        status, _ = self.put("/api/library/O%27Reilly/three.mp4")
+        self.assertEqual(status, 201)
+        self.assertTrue((self.library / "O'Reilly" / "three.mp4").exists())
+
+    def test_symlink_course_cannot_escape_the_library(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "source.mp4").write_bytes(b"keep")
+        (self.library / "escape").symlink_to(outside, target_is_directory=True)
+        status, _ = self.request("DELETE", "/api/library/escape/source.mp4")
+        self.assertEqual(status, 400)
+        self.assertTrue((outside / "source.mp4").exists())
+
+    def test_concurrent_uploads_do_not_share_temporary_files(self):
+        import http.client
+        import time
+
+        connections = [http.client.HTTPConnection("127.0.0.1", self.port, timeout=5) for _ in range(2)]
+        for conn in connections:
+            self.addCleanup(conn.close)
+            conn.putrequest("PUT", "/api/library/course/race.mp4")
+            conn.putheader("Content-Length", "8")
+            conn.endheaders()
+            conn.send(b"1234")
+        deadline = time.monotonic() + 3
+        while len(list((self.library / "course").glob(".incoming-*"))) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(list((self.library / "course").glob(".incoming-*"))), 2)
+        connections[0].send(b"AAAA")
+        first = connections[0].getresponse()
+        first.read()
+        connections[1].send(b"BBBB")
+        second = connections[1].getresponse()
+        second.read()
+        self.assertEqual((first.status, second.status), (201, 409))
+        self.assertEqual((self.library / "course" / "race.mp4").read_bytes(), b"1234AAAA")
+
+    def test_job_actions_use_the_durable_catalog(self):
+        from video_to_website.catalog import Catalog
+        self.lesson("course", "one.mp4")
+        self.httpd.catalog = Catalog(Path(self.tmp.name) / "state")
+        self.httpd.catalog.reconcile(self.library, {})
+        lesson = self.httpd.catalog.rows("SELECT * FROM lessons")[0]
+        status, payload = self.request("GET", "/api/jobs")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["videos"][0]["id"], lesson["id"])
+        self.post(f"/api/lessons/{lesson['id']}/cancel", {})
+        self.assertFalse(self.httpd.catalog.is_current(lesson["desired_build"]))
+        status, retried = self.post(f"/api/lessons/{lesson['id']}/retry", {})
+        self.assertEqual(status, 200)
+        self.assertNotEqual(retried["build_id"], lesson["desired_build"])
 
     def test_the_course_list_is_offered_for_the_dropdown(self):
         (self.library / "course_a").mkdir()

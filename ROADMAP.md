@@ -8,40 +8,50 @@ file is the part that is not true yet.
 
 **The pipeline.** Transcribe with whisper.cpp, split into steps with an LLM,
 cut a screenshot per step and a clip for the steps that are movement, render a
-page per lesson with a course index above it. Every stage is cached against the
-video's size and modification time, so re-running is cheap and a moved or
-renamed file keeps its cache.
+page per lesson with a course index above it. Stages retain file caches; the
+service also checkpoints each stage with DBOS.
+A SQLite catalog tracks stable lesson IDs, source digests, desired builds, and
+published revisions. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Reading.** Keyboard-driven: step navigation, a floating player that enlarges,
 quick seek, playback speed and clip looping that persist, per-step done
 checkboxes, Markdown export.
 
 **Running as a service.** A NixOS module, an LXC image for Proxmox, nginx in
-front, uploads proxied to a loopback port. The builder watches a library
-directory and rebuilds when it settles.
+front, uploads proxied to a loopback port. A dedicated DBOS worker reconciles a
+settled library and processes one lesson
+workflow at a time. The upload API runs in a separate service.
 
 **Ingest.** Upload videos from the browser, rename them to fix lesson order --
-carrying the stage cache across so reordering costs nothing -- and delete them.
-The home page shows what is being processed, stage by stage.
+preserving lesson identity and reusable caches -- and delete them.
+The home page links to a full task queue with positions, search, status filters,
+published-lesson links, retry, and cancel. Generated
+media uses immutable revisions, and failed replacements retain the previous page.
 
 ## Next
 
-### Stage 3: organisation
+### Stage 3: upload and library management
 
-Chapters are the gap. Videos nested inside a course folder build, but they are
-flattened into one lesson list, so a course with sections loses its shape. This
-needs a course manifest of some kind, nested directories to mean something, and
-prev/next links between lessons -- none of which exist today.
+Keep the existing reader design. Build folder-import preview, upload cancellation
+and retry, searchable library management, explicit ordering, chapters, moving
+lessons, and bulk actions. Add trash/restore and a retention policy that covers
+originals, processing snapshots, historical revisions, and caches separately.
+Previous/next lesson links should follow explicit course organization.
+
+The first durable foundation is built: SQLite catalog and schema versioning,
+per-lesson DBOS workflows, bounded recovery, immutable publication, separate API
+and worker processes, source/configuration invalidation, and exact-name management.
+The next architecture work is artifact garbage collection, preserving old URLs
+through migration, finer checkpoints for LLM windows/assets, and typed catalog
+metadata for chapter/order editing.
 
 ### Stage 4: reading state that follows you
 
-Reading position, done checkboxes and preferences live in `localStorage`, so
-they are per browser. Syncing them means a small API and somewhere to keep
-them, and this is the one part of the system where SQLite is the right answer
-rather than a heavier version of what already works: many small rows, several
-writers, real queries, and no sensible representation as files. `sqlite3` is in
-the standard library, so it costs no dependency. The work is threading -- the
-ingest server already runs alongside the build loop -- and schema migrations.
+Done checkboxes and preferences currently live in `localStorage`. Durable lesson
+IDs and instruction-content namespaces now prevent cross-course collisions and
+misapplied completion after regeneration. Saved reading position and synchronization
+are still to build. Store user reading state in the application SQLite database;
+DBOS execution history is separate from that product data.
 
 ### Stage 5: per-course tuning
 
@@ -50,16 +60,11 @@ per-course settings file, read at discovery time.
 
 ## Smaller things
 
-- **Quarantine a lesson that keeps killing the build.** Whisper on a long
-  lesson in a small container gets OOM-killed; systemd restarts the service,
-  the watcher rebuilds, and it is killed again. Durable per-lesson attempt
-  counts would break that loop. This is the change most likely to matter next.
-- **Persist the watcher's state.** `seen` and `done` are in memory, so every
-  restart re-walks the library. Cheap with warm caches, but not free.
-- **Prune orphaned stage files.** `work/` still holds `whisper.json` and
-  `frames.json` from stage names that no longer exist. Nothing cleans them up.
-- **Resume a dropped upload.** A drop at 90% starts over. On a LAN that is a
-  minute, which is why it is not built.
+- **Artifact retention and cleanup.** Immutable source snapshots and old media
+  revisions are retained today. Garbage collection must respect published and
+  in-flight workflow references. Raw `whisper.json` is still an intentional output.
+- **Resume a dropped upload.** A drop at 90% starts over. Add resumable transfer
+  after basic queue cancellation/retry, guided by actual file sizes and failures.
 - **A Blender add-on** showing the steps in the viewport sidebar. Blender can
   do it -- `bpy.data.images.load()` gives a `MOVIE` source, `UILayout` has
   `template_image`, and `WindowManager.event_timer_add` exists -- the only
@@ -68,14 +73,15 @@ per-course settings file, read at discovery time.
 
 ## Settled
 
-**The stage cache stays as files, not a database.** It is write-once,
-read-once, keyed by one identity, and measured at roughly 100-200 KB per
-lesson. Files give atomicity through rename, `rm -rf work/` as a recovery tool,
-and `jq` to see what the model actually returned. More importantly the library
-is the source of truth -- everything is derived from `stat()` on the files,
-which is why an `scp` and a browser upload are interchangeable. A database
-mirroring the filesystem would invent a class of bug that currently cannot
-exist.
+**Python + SQLite + DBOS for the durable service.** The application catalog owns
+identity, organization, build intent, and publication records. DBOS owns execution
+and recovery. This is a single-host deployment with one worker and local SQLite
+files. Both databases are persistent application state and need backups.
+
+**Stage caches and media stay as files.** They remain inspectable and reusable.
+The catalog does not store video bytes. Source snapshots and published media are
+immutable; public pages are replaced atomically. Filenames and display names do
+not serve as lesson identity.
 
 **The API, not the CLI, for the server.** A box working through a course wants
 predictable per-token billing, not a subscription quota it can exhaust.

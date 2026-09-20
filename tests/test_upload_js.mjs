@@ -225,7 +225,7 @@ apiCalls.length = 0;
 const doomed = rows()[0];
 buttonIn(doomed, 'Delete').click();
 assert.equal(apiCalls.length, 0, 'the first click deletes nothing');
-assert.ok(doomed.textContent.includes('Delete for good?'), 'it asks first');
+assert.ok(doomed.textContent.includes('Remove source from library?'), 'it asks first');
 assert.ok(buttonIn(doomed, 'Cancel'), 'and offers a way out');
 buttonIn(doomed, 'Yes, delete').click();
 await flush();
@@ -246,6 +246,24 @@ await flush();
 assert.ok(message.textContent.includes('already there'), 'the server reason is surfaced');
 assert.equal(message.className, 'message bad');
 mutationError = null;
+
+// A replacement waits behind an active upload and keeps the navigation guard.
+const requestStart = sent.length;
+const rowStart = queue.children.length;
+course.value = 'course';
+picker.files = [file('existing.mp4', 100), file('next.mp4', 100)];
+picker.fire('change');
+sent[requestStart].finish(409);
+queue.children[rowStart].children.find(c => c.className === 'again').click();
+assert.equal(sent.length, requestStart + 2, 'replacement is queued behind the next file');
+sent[requestStart + 1].finish(201);
+assert.equal(sent.length, requestStart + 3, 'replacement starts when the active file finishes');
+let guarded = false;
+fakeWindow.listeners.beforeunload({preventDefault() { guarded = true; }});
+assert.equal(guarded, true, 'replacement is included in the navigation guard');
+sent[requestStart + 2].finish(201);
+await flush(); await flush();
+assert.equal(message.hidden, false, 'library refresh preserves the outcome message');
 
 // 13. A site with no API behind it says so rather than failing silently.
 apiOk = false;

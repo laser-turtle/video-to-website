@@ -156,6 +156,7 @@ in
       "d ${cfg.stateDir}/library 0775 ${cfg.user} ${cfg.group} -"
       "d ${cfg.stateDir}/site    0755 ${cfg.user} ${cfg.group} -"
       "d ${cfg.stateDir}/work    0750 ${cfg.user} ${cfg.group} -"
+      "d ${cfg.stateDir}/state   0750 ${cfg.user} ${cfg.group} -"
     ];
 
     systemd.services.video-to-website = {
@@ -177,6 +178,8 @@ in
           "${cfg.stateDir}/site"
           "--work"
           "${cfg.stateDir}/work"
+          "--state"
+          "${cfg.stateDir}/state"
           "--interval"
           (toString cfg.interval)
           "--model"
@@ -185,7 +188,6 @@ in
           cfg.llm
         ]
         ++ optionals (cfg.llmModel != null) [ "--llm-model" cfg.llmModel ]
-        ++ optionals cfg.uploads [ "--api-port" (toString cfg.apiPort) "--api-bind" "127.0.0.1" ]
         ++ cfg.extraArgs);
 
         # '+' runs it as root, before User= takes effect; '-' keeps a failure
@@ -213,6 +215,31 @@ in
         ProtectControlGroups = true;
         RestrictSUIDSGID = true;
         LockPersonality = true;
+      };
+    };
+
+    # Uploads survive worker restarts and failures in native media tools.
+    systemd.services.video-to-website-api = mkIf cfg.uploads {
+      description = "Manage the video-to-website library";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${cfg.package}/bin/v2w" "api" "${cfg.stateDir}/library"
+          "--state" "${cfg.stateDir}/state"
+          "--port" (toString cfg.apiPort) "--bind" "127.0.0.1"
+        ];
+        ExecStartPre = "-+${takeLibrary}/bin/v2w-take-library";
+        User = cfg.user;
+        Group = cfg.group;
+        Restart = "on-failure";
+        RestartSec = 5;
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectHome = true;
+        ProtectSystem = "strict";
+        ReadWritePaths = [ cfg.stateDir ];
+        RestrictSUIDSGID = true;
       };
     };
 
