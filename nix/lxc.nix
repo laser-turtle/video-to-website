@@ -24,7 +24,7 @@
   networking.useDHCP = false;
   networking.interfaces.eth0.ipv4.addresses = [
     {
-      address = "192.168.1.202";
+      address = "192.168.1.100";
       prefixLength = 24;
     }
   ];
