@@ -450,10 +450,34 @@ The service listens on loopback only and nginx proxies `/api/` to it, with body
 buffering off so a 2 GB lesson streams through rather than filling nginx's
 spool first.
 
+### Renaming, reordering and deleting
+
+The same page lists the library underneath. Each course shows its lessons **in
+the order the builder will take them**, numbered, which is usually enough to
+spot why a course came out in the wrong order -- `4.02 - Reference Board.mp4`
+sorts after `10 - ...` but before `5 - ...` only once you read it as a number.
+
+*Rename* edits the filename in place, which is how the order gets fixed; the
+title on the site follows from it. **A rename carries the stage cache with it**,
+so reordering a course costs nothing -- without that, renaming a file orphans
+its transcript and the lesson is transcribed again from scratch. It is
+best-effort: the builder numbers slugs that collide within a course and this
+cannot know about that, so the worst case is one re-transcription.
+
+*Delete* takes two clicks and removes the source video for good; there is no
+undo. It deliberately leaves the stage cache alone, so putting the same file
+back is instant rather than another whisper run. The next build removes the
+lesson's pages, screenshots and clips from the site.
+
+Only videos sitting directly in a course folder are listed. Ones nested deeper
+still build -- they are flattened into the same lesson list -- but they are not
+something this page can meaningfully rename.
+
 **There is no authentication.** Anyone who can reach the site can add a course
-or replace a lesson. That is the right trade on a home network and the wrong one
-anywhere else -- set `services.video-to-website.uploads = false` to turn the
-endpoint off and keep `scp`, or put the whole vhost behind auth.
+or replace a lesson -- or now delete one. That is the right trade on a home
+network and the wrong one anywhere else -- set
+`services.video-to-website.uploads = false` to turn the endpoint off and keep
+`scp`, or put the whole vhost behind auth.
 
 ## Where the state lives
 
@@ -514,6 +538,26 @@ library resets the backoff.
 **An upload that drops part way** leaves nothing behind and has to be started
 again; there is no resume. On a LAN that is a minute of lost time, which is why
 it has not been built.
+
+**A lesson that keeps being processed again.** A rebuild reuses the stage cache
+and should be quick; if whisper runs every time, the cache is being missed or
+thrown away. The three causes, in order of likelihood:
+
+```bash
+# Is the service crash-looping? Each start triggers a fresh build pass.
+systemctl show video-to-website -p NRestarts
+journalctl -u video-to-website | grep -iE "killed|out of memory|Started|Stopped"
+
+# Is it transcribing, or reusing? The log says which, per lesson.
+journalctl -u video-to-website | grep -E "transcribing|transcript cached|course:"
+```
+
+A killed process (whisper on a large lesson in a small container is the usual
+one) means systemd restarts it, the watcher rebuilds, and it is killed again --
+which looks exactly like a lesson being processed forever. More RAM on the
+container, or a smaller `whisperModel`, is the fix. Otherwise: a course folder
+renamed outside this page orphans its cache under the old slug, and re-uploading
+a file changes its modification time, which is a genuine change and rebuilds it.
 
 **A course folder copied in as root.** `scp` and `mv` over ssh create folders
 owned by root, which the builder can read but not write -- so the course builds

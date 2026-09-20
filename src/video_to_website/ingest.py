@@ -11,6 +11,7 @@ when cgi was removed in 3.13, so parsing one would mean writing it here.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -19,7 +20,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from .util import VIDEO_SUFFIXES, log, warn
+from .util import VIDEO_SUFFIXES, log, natural_key, slugify, warn
 
 API_PREFIX = "/api/"
 CHUNK = 1 << 20
@@ -56,6 +57,38 @@ def safe_component(name: str) -> str | None:
     if not name or name in (".", ".."):
         return None
     return name[:120]
+
+
+def course_videos(course_dir: Path) -> list[Path]:
+    """The lessons in a course, in the order the builder will take them.
+
+    Immediate children only. Videos nested deeper still build -- they are
+    flattened into the same lesson list -- but they are not something this page
+    can meaningfully rename, so it does not offer to.
+    """
+    try:
+        found = [
+            p
+            for p in course_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES and not p.name.startswith(".")
+        ]
+    except OSError:
+        return []
+    return sorted(found, key=lambda p: natural_key(p.name))
+
+
+def library_listing(library: Path) -> list[dict]:
+    courses = []
+    for name in course_names(library):
+        videos = []
+        for video in course_videos(library / name):
+            try:
+                stat = video.stat()
+            except OSError:
+                continue
+            videos.append({"name": video.name, "bytes": stat.st_size, "mtime": stat.st_mtime})
+        courses.append({"name": name, "videos": videos})
+    return courses
 
 
 def course_names(library: Path) -> list[str]:
@@ -120,9 +153,125 @@ class IngestMixin:
             self._json(503, {"error": "uploads are not enabled here"})
         elif path == "/api/courses":
             self._json(200, {"courses": course_names(self.library)})
+        elif path == "/api/library":
+            self._json(200, {"courses": library_listing(self.library)})
         else:
             self._json(404, {"error": "no such endpoint"})
         return True
+
+    @property
+    def work(self) -> Path | None:
+        return getattr(self.server, "work", None)
+
+    def _target(self) -> tuple[Path, str, str] | None:
+        """Resolve /api/library/<course>/<name>, answering the error itself."""
+        path = urlparse(self.path).path
+        if self.library is None:
+            self._json(503, {"error": "uploads are not enabled here"}, close=True)
+            return None
+        parts = path[len(API_PREFIX):].split("/") if path.startswith(API_PREFIX) else []
+        if len(parts) != 3 or parts[0] != "library":
+            self._json(404, {"error": "no such endpoint"}, close=True)
+            return None
+        course, name = safe_component(parts[1]), safe_component(parts[2])
+        if not course or not name:
+            self._json(400, {"error": "unusable course or file name"}, close=True)
+            return None
+        return self.library / course / name, course, name
+
+    def do_DELETE(self):
+        found = self._target()
+        if found is None:
+            return
+        target, course, name = found
+        if not target.is_file():
+            self._json(404, {"error": f"{course}/{name} is not there"}, close=True)
+            return
+        try:
+            target.unlink()
+            # The course folder goes too once its last lesson does, so a
+            # deleted course does not linger as an empty directory.
+            if not course_videos(target.parent):
+                with contextlib.suppress(OSError):
+                    target.parent.rmdir()
+        except PermissionError:
+            self._json(403, {"error": self._denied(target.parent)}, close=True)
+            return
+        except OSError as exc:
+            self._json(500, {"error": str(exc)}, close=True)
+            return
+        # The stage cache is deliberately left alone: putting the same file
+        # back should not mean transcribing it again.
+        log(f"deleted {course}/{name}")
+        self._json(200, {"deleted": f"{course}/{name}"})
+
+    def do_POST(self):
+        found = self._target()
+        if found is None:
+            return
+        source, course, name = found
+        if not source.is_file():
+            self._json(404, {"error": f"{course}/{name} is not there"}, close=True)
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(size) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self._json(400, {"error": "expected a JSON body"}, close=True)
+            return
+
+        to_course = safe_component(str(body.get("to_course") or course))
+        to_name = safe_component(str(body.get("to_name") or name))
+        if not to_course or not to_name:
+            self._json(400, {"error": "unusable course or file name"}, close=True)
+            return
+        if Path(to_name).suffix.lower() not in VIDEO_SUFFIXES:
+            self._json(415, {"error": f"{Path(to_name).suffix or 'that'} is not a video file"}, close=True)
+            return
+        target = self.library / to_course / to_name
+        if target == source:
+            self._json(200, {"course": course, "name": name})
+            return
+        if target.exists():
+            self._json(409, {"error": f"{to_course}/{to_name} is already there"}, close=True)
+            return
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
+            if not course_videos(source.parent):
+                with contextlib.suppress(OSError):
+                    source.parent.rmdir()
+        except PermissionError:
+            self._json(403, {"error": self._denied(target.parent)}, close=True)
+            return
+        except OSError as exc:
+            self._json(500, {"error": str(exc)}, close=True)
+            return
+
+        self._move_cache(course, name, to_course, to_name)
+        log(f"renamed {course}/{name} to {to_course}/{to_name}")
+        self._json(200, {"course": to_course, "name": to_name})
+
+    def _move_cache(self, course: str, name: str, to_course: str, to_name: str) -> None:
+        """Carry the stage cache across a rename, so reordering is free.
+
+        Best effort by design. The builder numbers a slug that collides with
+        another in the same course, and this cannot know about that, so a miss
+        here costs a re-transcription rather than anything worse.
+        """
+        if self.work is None:
+            return
+        old = self.work / slugify(course) / slugify(Path(name).stem)
+        new = self.work / slugify(to_course) / slugify(Path(to_name).stem)
+        if not old.is_dir() or new.exists():
+            return
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            old.replace(new)
+            log(f"  carried the cache across to {new.parent.name}/{new.name}")
+        except OSError as exc:
+            warn(f"  could not carry the cache across, it will rebuild: {exc}")
 
     def do_PUT(self):
         path = urlparse(self.path).path

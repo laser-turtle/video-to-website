@@ -144,6 +144,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="accept browser uploads into this directory, as the service does",
     )
+    serve_cmd.add_argument(
+        "--work",
+        type=Path,
+        help="stage cache to keep in step when a video is renamed (default: <directory>/.work)",
+    )
 
     sub.add_parser("doctor", help="check that external tools and credentials are in place")
     return parser
@@ -259,7 +264,7 @@ def _retry_delay(failures: int, interval: float) -> float:
     return min(interval * 2**max(1, failures), _MAX_BACKOFF)
 
 
-def _start_api(library: Path, bind: str, port: int) -> None:
+def _start_api(library: Path, bind: str, port: int, work: Path | None = None) -> None:
     """Take uploads on a side port while the watcher keeps polling.
 
     A daemon thread rather than a second process: an upload is finished the
@@ -272,6 +277,8 @@ def _start_api(library: Path, bind: str, port: int) -> None:
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     httpd = http.server.ThreadingHTTPServer((bind, port), IngestHandler)
     httpd.library = library
+    # So a rename can carry the stage cache with it rather than orphaning it.
+    httpd.work = work
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     log(f"accepting uploads on http://{bind}:{port}/api/")
 
@@ -294,7 +301,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         render.write_placeholder(options.out, f"Nothing built yet. Drop a course folder in {library}.")
     progress = Progress(options.out)
     if args.api_port:
-        _start_api(library, args.api_bind, args.api_port)
+        _start_api(library, args.api_bind, args.api_port, options.work or (options.out / ".work"))
 
     log(f"watching {library} every {args.interval:.0f}s, writing to {options.out}")
     seen: tuple | None = None
@@ -452,6 +459,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     with http.server.ThreadingHTTPServer((args.bind, args.port), handler) as httpd:
         httpd.library = args.library.expanduser().resolve() if args.library else None
+        httpd.work = (args.work.expanduser().resolve() if args.work else directory / ".work")
         log(f"serving {directory} at http://{args.bind}:{args.port}  (ctrl-c to stop)")
         if httpd.library:
             httpd.library.mkdir(parents=True, exist_ok=True)

@@ -510,6 +510,26 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 }
 .upload .message { font-size: 13.5px; margin: 16px 0 0; }
 .upload .message.bad { color: #c0392b; }
+.library { margin-top: 20px; }
+.library > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+.lib-course { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px; }
+.lib-course > h3 { margin: 0 0 4px; font-size: 15px; }
+.lib-course > .hint { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; }
+.lib-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+.lib-row .n { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; min-width: 1.6em; text-align: right; flex: none; }
+.lib-row .name { flex: 1; font-size: 14px; word-break: break-word; }
+.lib-row .size { font-size: 12.5px; color: var(--muted); flex: none; }
+.lib-row input {
+  width: 100%; font: inherit; font-size: 14px; color: inherit;
+  background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 5px 8px;
+}
+.lib-row button {
+  font: inherit; font-size: 12.5px; cursor: pointer; flex: none;
+  color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px;
+}
+.lib-row button:hover { border-color: var(--accent); }
+.lib-row button.danger { color: #c0392b; }
+.lib-row.busy { opacity: .5; }
 """
 
 
@@ -1292,7 +1312,7 @@ SCRIPT = """\
     }
   });
 
-  var match = /[#&]t=(\d+(?:\.\d+)?)/.exec(location.hash);
+  var match = /[#&]t=(\\d+(?:\\.\\d+)?)/.exec(location.hash);
   if (match && video) {
     video.addEventListener('loadedmetadata', function () {
       video.currentTime = parseFloat(match[1]);
@@ -1465,21 +1485,149 @@ UPLOAD_SCRIPT = """\
     return Math.max(1, Math.round(bytes / 1024)) + ' KB';
   }
 
+  var library = document.getElementById('library');
+  var libraryList = document.getElementById('library-list');
+
+  function button(text, className, onClick) {
+    var el = document.createElement('button');
+    el.type = 'button';
+    if (className) { el.className = className; }
+    el.textContent = text;
+    el.addEventListener('click', onClick);
+    return el;
+  }
+
+  function api(method, path, body) {
+    var init = { method: method };
+    if (body) {
+      init.body = JSON.stringify(body);
+      init.headers = { 'Content-Type': 'application/json' };
+    }
+    return fetch(path, init).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) { throw new Error(data.error || (method + ' failed (' + res.status + ')')); }
+        return data;
+      });
+    });
+  }
+
+  function videoPath(course, name) {
+    return 'api/library/' + encodeURIComponent(course) + '/' + encodeURIComponent(name);
+  }
+
+  function libRow(courseName, video, index) {
+    var row = document.createElement('div');
+    row.className = 'lib-row';
+
+    var number = document.createElement('span');
+    number.className = 'n';
+    number.textContent = index + 1 + '.';
+    var name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = video.name;
+    var bytes = document.createElement('span');
+    bytes.className = 'size';
+    bytes.textContent = size(video.bytes);
+    row.appendChild(number);
+    row.appendChild(name);
+    row.appendChild(bytes);
+
+    function act(promise) {
+      row.className = 'lib-row busy';
+      promise.then(load).catch(function (err) {
+        row.className = 'lib-row';
+        say(err.message, true);
+      });
+    }
+
+    var rename = button('Rename', '', function () {
+      var input = document.createElement('input');
+      input.type = 'text';
+      input.value = video.name;
+      name.textContent = '';
+      name.appendChild(input);
+      rename.remove();
+      remove.remove();
+      var save = button('Save', '', function () {
+        var wanted = (input.value || '').trim();
+        if (!wanted || wanted === video.name) { load(); return; }
+        act(api('POST', videoPath(courseName, video.name), { to_name: wanted }));
+      });
+      row.appendChild(save);
+      row.appendChild(button('Cancel', '', load));
+      input.focus();
+      input.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') { save.click(); }
+        if (event.key === 'Escape') { load(); }
+      });
+    });
+
+    // Two steps, because this deletes the source video and there is no undo.
+    var remove = button('Delete', 'danger', function () {
+      rename.remove();
+      remove.remove();
+      var label = document.createElement('span');
+      label.className = 'size';
+      label.textContent = 'Delete for good?';
+      row.appendChild(label);
+      row.appendChild(button('Yes, delete', 'danger', function () {
+        act(api('DELETE', videoPath(courseName, video.name)));
+      }));
+      row.appendChild(button('Cancel', '', load));
+    });
+
+    row.appendChild(rename);
+    row.appendChild(remove);
+    return row;
+  }
+
+  function renderLibrary(courses) {
+    libraryList.textContent = '';
+    var any = false;
+    courses.forEach(function (course) {
+      if (!course.videos.length) { return; }
+      any = true;
+      var box = document.createElement('div');
+      box.className = 'lib-course';
+      var heading = document.createElement('h3');
+      heading.textContent = course.name;
+      var hint = document.createElement('p');
+      hint.className = 'hint';
+      hint.textContent = 'Lessons build in this order. Rename to change it.';
+      box.appendChild(heading);
+      box.appendChild(hint);
+      course.videos.forEach(function (video, index) {
+        box.appendChild(libRow(course.name, video, index));
+      });
+      libraryList.appendChild(box);
+    });
+    library.hidden = !any;
+  }
+
   // The API is the only part of the site that is not a static file, so it can
   // be missing entirely -- a locally built copy, or a server with uploads off.
-  fetch('api/courses').then(function (res) {
-    if (!res.ok) { throw new Error(res.status); }
-    return res.json();
-  }).then(function (data) {
-    (data.courses || []).forEach(function (name) {
-      var option = document.createElement('option');
-      option.value = name;
-      list.appendChild(option);
+  function load() {
+    return fetch('api/library').then(function (res) {
+      if (!res.ok) { throw new Error(res.status); }
+      return res.json();
+    }).then(function (data) {
+      var courses = data.courses || [];
+      list.textContent = '';
+      courses.forEach(function (course) {
+        var option = document.createElement('option');
+        option.value = course.name;
+        list.appendChild(option);
+      });
+      if (library && libraryList) { renderLibrary(courses); }
+      say('');
+    }).catch(function () {
+      choose.disabled = true;
+      if (library) { library.hidden = true; }
+      say('This copy of the site cannot take uploads. Add videos to the library folder directly.', true);
     });
-  }).catch(function () {
-    choose.disabled = true;
-    say('This copy of the site cannot take uploads. Add videos to the library folder directly.', true);
-  });
+  }
+
+  load();
 
   function row(file) {
     var li = document.createElement('li');
@@ -1557,6 +1705,7 @@ UPLOAD_SCRIPT = """\
     if (!job) {
       busy = false;
       if (queue.children.length) {
+        load();
         say('Done. The builder picks new videos up within a minute \u2014 watch it on the home page.');
       }
       return;
@@ -1918,7 +2067,7 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
   <ul id="build-list"></ul>
 </section>"""
     body = f"""<header class="top">
-  <div class="crumbs"><a href="upload.html">Add videos</a></div>
+  <div class="crumbs"><a href="upload.html">Manage videos</a></div>
   <h1>Courses</h1>
   <div class="meta">{_esc(meta)}</div>
 </header>
@@ -1929,8 +2078,8 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
 def render_upload_page() -> str:
     body = """<header class="top">
   <div class="crumbs"><a href="index.html">All courses</a></div>
-  <h1>Add videos</h1>
-  <div class="meta">They start building on their own once the upload finishes.</div>
+  <h1>Videos</h1>
+  <div class="meta">What the builder works from. Anything changed here rebuilds the site.</div>
 </header>
 <div class="wrap">
   <div class="upload">
@@ -1947,8 +2096,12 @@ def render_upload_page() -> str:
     <ul class="queue" id="queue"></ul>
     <p class="message" id="message" hidden></p>
   </div>
+  <section class="library" id="library" hidden>
+    <h2>Library</h2>
+    <div id="library-list"></div>
+  </section>
 </div>"""
-    return _page("Add videos", body, depth=0, scripts=(("upload.js", UPLOAD_SCRIPT),))
+    return _page("Videos", body, depth=0, scripts=(("upload.js", UPLOAD_SCRIPT),))
 
 
 def render_lesson_markdown(lesson: dict) -> str:

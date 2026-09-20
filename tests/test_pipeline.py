@@ -948,10 +948,13 @@ class UploadServerTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.library = Path(self.tmp.name) / "library"
         self.library.mkdir()
+        self.work = Path(self.tmp.name) / "work"
+        self.work.mkdir()
 
         http.server.ThreadingHTTPServer.allow_reuse_address = True
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ingest.IngestHandler)
         self.httpd.library = self.library
+        self.httpd.work = self.work
         # A short poll interval only so shutdown() in teardown is not a half
         # second of waiting per test.
         self.thread = threading.Thread(
@@ -975,6 +978,25 @@ class UploadServerTests(unittest.TestCase):
 
     def put(self, path, body=b"video bytes"):
         return self.request("PUT", path, body=body, headers={"Content-Length": str(len(body))})
+
+    def post(self, path, payload):
+        body = json.dumps(payload).encode()
+        return self.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Length": str(len(body)), "Content-Type": "application/json"},
+        )
+
+    def lesson(self, course, name, content=b"video"):
+        (self.library / course).mkdir(parents=True, exist_ok=True)
+        (self.library / course / name).write_bytes(content)
+
+    def cache_for(self, course, stem):
+        directory = self.work / course / stem
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "transcript.json").write_text("{}")
+        return directory
 
     def test_an_upload_lands_in_the_library(self):
         status, payload = self.put("/api/library/my_course/lesson_one.mp4", b"abc123")
@@ -1037,6 +1059,81 @@ class UploadServerTests(unittest.TestCase):
         self.assertIn("cannot write into from_scp/", payload["error"])
         self.assertIn("chown -R", payload["error"])
         self.assertIn(str(self.library), payload["error"])
+
+    def test_the_library_listing_is_in_build_order(self):
+        """Which is the point of showing it: ordering is what goes wrong."""
+        for name in ["lesson 10.mp4", "lesson 2.mp4", "notes.txt", ".hidden.mp4"]:
+            self.lesson("a_course", name)
+        status, payload = self.request("GET", "/api/library")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["courses"][0]["name"], "a_course")
+        names = [v["name"] for v in payload["courses"][0]["videos"]]
+        self.assertEqual(names, ["lesson 2.mp4", "lesson 10.mp4"])
+        self.assertEqual(payload["courses"][0]["videos"][0]["bytes"], 5)
+
+    def test_a_video_can_be_deleted(self):
+        self.lesson("a_course", "one.mp4")
+        self.lesson("a_course", "two.mp4")
+        status, _ = self.request("DELETE", "/api/library/a_course/one.mp4")
+        self.assertEqual(status, 200)
+        self.assertFalse((self.library / "a_course" / "one.mp4").exists())
+        self.assertTrue((self.library / "a_course" / "two.mp4").exists())
+
+    def test_the_last_deletion_takes_the_course_with_it(self):
+        self.lesson("a_course", "only.mp4")
+        self.request("DELETE", "/api/library/a_course/only.mp4")
+        self.assertFalse((self.library / "a_course").exists())
+
+    def test_deleting_keeps_the_cache_for_if_it_comes_back(self):
+        self.lesson("a_course", "one.mp4")
+        cache = self.cache_for("a-course", "one")
+        self.request("DELETE", "/api/library/a_course/one.mp4")
+        self.assertTrue((cache / "transcript.json").exists())
+
+    def test_deleting_something_that_is_not_there(self):
+        self.assertEqual(self.request("DELETE", "/api/library/a_course/gone.mp4")[0], 404)
+
+    def test_renaming_moves_the_file(self):
+        self.lesson("a_course", "4.02 - board.mp4")
+        status, payload = self.post("/api/library/a_course/4.02%20-%20board.mp4", {"to_name": "02 - board.mp4"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["name"], "02 - board.mp4")
+        self.assertTrue((self.library / "a_course" / "02 - board.mp4").exists())
+        self.assertFalse((self.library / "a_course" / "4.02 - board.mp4").exists())
+
+    def test_renaming_carries_the_cache_so_reordering_is_free(self):
+        """Otherwise fixing the numbering re-transcribes the whole course."""
+        self.lesson("a_course", "4.02 - board.mp4")
+        # Slugs as the builder makes them: slugify drops the dot.
+        self.cache_for("a-course", "402-board")
+        self.post("/api/library/a_course/4.02%20-%20board.mp4", {"to_name": "02 - board.mp4"})
+        self.assertTrue((self.work / "a-course" / "02-board" / "transcript.json").exists())
+        self.assertFalse((self.work / "a-course" / "402-board").exists())
+
+    def test_a_video_can_move_to_another_course(self):
+        self.lesson("a_course", "one.mp4")
+        status, _ = self.post("/api/library/a_course/one.mp4", {"to_course": "b_course"})
+        self.assertEqual(status, 200)
+        self.assertTrue((self.library / "b_course" / "one.mp4").exists())
+        self.assertFalse((self.library / "a_course").exists())
+
+    def test_renaming_onto_an_existing_lesson_is_refused(self):
+        self.lesson("a_course", "one.mp4", b"first")
+        self.lesson("a_course", "two.mp4", b"second")
+        status, _ = self.post("/api/library/a_course/one.mp4", {"to_name": "two.mp4"})
+        self.assertEqual(status, 409)
+        self.assertEqual((self.library / "a_course" / "two.mp4").read_bytes(), b"second")
+        self.assertTrue((self.library / "a_course" / "one.mp4").exists())
+
+    def test_renaming_cannot_escape_the_library(self):
+        self.lesson("a_course", "one.mp4")
+        status, _ = self.post("/api/library/a_course/one.mp4", {"to_course": "../../etc"})
+        self.assertEqual(status, 400)
+        self.assertTrue((self.library / "a_course" / "one.mp4").exists())
+
+    def test_renaming_to_something_that_is_not_a_video(self):
+        self.lesson("a_course", "one.mp4")
+        self.assertEqual(self.post("/api/library/a_course/one.mp4", {"to_name": "one.txt"})[0], 415)
 
     def test_unknown_endpoints_say_so(self):
         self.assertEqual(self.request("GET", "/api/nope")[0], 404)
