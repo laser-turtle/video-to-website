@@ -16,6 +16,7 @@ anthropic = ["anthropic>=0.40"]
 
 [project.scripts]
 v2w = "video_to_website.cli:main"
+v2w-worker = "video_to_website.worker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/video_to_website"]

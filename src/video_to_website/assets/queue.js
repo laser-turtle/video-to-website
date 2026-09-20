@@ -17,6 +17,15 @@
   var pollAgain = false;
   var pending = {};
   var errors = {};
+  var params = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+  var selectedLesson = params.get('lesson');
+  var selectedCourse = params.get('course');
+  var courseScope = document.getElementById('queue-course');
+  var courseName = document.getElementById('queue-course-name');
+  var clearCourse = document.getElementById('queue-all-courses');
+  if (params.get('q')) search.value = params.get('q');
+  if (['active', 'queued', 'failed', 'cancelled', 'done', 'all'].includes(params.get('state'))) filter.value = params.get('state');
+  if (selectedLesson) filter.value = 'all';
   var stateLabels = {
     working: 'Running', queued: 'Waiting', failed: 'Failed',
     cancelled: 'Cancelled', done: 'Ready', skipped: 'Skipped'
@@ -37,11 +46,6 @@
     if (selected === 'all') return true;
     if (selected === 'active') return entry.state === 'working' || entry.state === 'queued';
     return entry.state === selected;
-  }
-
-  function duration(seconds) {
-    var minutes = Math.floor(seconds / 60);
-    return minutes ? minutes + 'm ' + Math.floor(seconds % 60) + 's' : Math.floor(seconds) + 's';
   }
 
   function act(entry, action) {
@@ -77,18 +81,54 @@
     item.appendChild(element('p', 'job-source', entry.course + ' · ' + (entry.source_path || entry.source_name || entry.title)));
 
     if (entry.state === 'working') {
-      var stage = entry.label || 'Processing';
-      if (entry.elapsed) stage += ' · ' + duration(entry.elapsed) + ' in this stage';
-      item.appendChild(element('p', 'job-detail', stage));
-      if (entry.steps && entry.step) {
-        var bar = element('div', 'bar');
-        var fill = element('i');
-        fill.style.width = 100 * Math.max(0, entry.step - 0.5) / entry.steps + '%';
-        bar.appendChild(fill);
-        item.appendChild(bar);
+      if (entry.executions && entry.executions.length > 1) {
+        var active = entry.executions.filter(function (e) { return e.state === 'running'; });
+        active.forEach(function (execution) {
+          var machine = element('p', 'job-work');
+          if (/^(server|[a-f0-9]{32})$/.test(execution.worker_id || '')) {
+            var link = element('a', '', execution.worker_name || 'Processing computer');
+            link.href = 'workers.html#worker-' + execution.worker_id;
+            machine.appendChild(link);
+          } else machine.appendChild(element('span', '', execution.worker_name || 'Processing computer'));
+          machine.appendChild(element('span', '', ' · ' + (execution.description || execution.kind)));
+          item.appendChild(machine);
+        });
+        var ready = entry.executions.filter(function (e) { return e.state === 'pending'; }).length;
+        var local = entry.executions.filter(function (e) { return e.state === 'fallback'; }).length;
+        var waiting = [];
+        if (ready) waiting.push(ready + (ready === 1 ? ' operation ready' : ' operations ready') + ' for a processor');
+        if (local) waiting.push(local + (local === 1 ? ' operation waiting' : ' operations waiting') + ' for server fallback');
+        if (waiting.length) item.appendChild(element('p', 'job-work', waiting.join(' · ')));
+      } else if (entry.execution) {
+        var execution = entry.execution;
+        var machine = element('p', 'job-work');
+        var name = execution.worker_name || (execution.state === 'fallback' ? 'Library server (waiting for CPU)' : 'Assigning a processor');
+        if (/^(server|[a-f0-9]{32})$/.test(execution.worker_id || '')) {
+          var workerLink = element('a', '', name);
+          workerLink.href = 'workers.html#worker-' + execution.worker_id;
+          machine.appendChild(workerLink);
+        } else machine.textContent = name;
+        item.appendChild(machine);
+        if (execution.error) item.appendChild(element('p', 'job-work', execution.error));
       }
+      var progress = V2WProgress.describe(entry);
+      var stage = progress.text;
+      if (progress.hasElapsed) stage += ' · ' + progress.elapsed + ' in this stage';
+      item.appendChild(element('p', 'job-detail', stage));
+      if (progress.detail) item.appendChild(element('p', 'job-work', progress.detail));
+      item.appendChild(element('p', 'job-estimate', progress.estimate));
+      var bar = element('div', 'bar' + (progress.fraction === null ? ' indeterminate' : '') + (progress.stale ? ' progress-paused' : ''));
+      bar.setAttribute('role', 'progressbar');
+      bar.setAttribute('aria-label', progress.label);
+      bar.setAttribute('aria-valuemin', '0');
+      bar.setAttribute('aria-valuemax', '100');
+      if (progress.fraction !== null) bar.setAttribute('aria-valuenow', String(progress.percent));
+      var fill = element('i');
+      fill.style.width = progress.fraction === null ? '30%' : progress.percent + '%';
+      bar.appendChild(fill);
+      item.appendChild(bar);
     } else if (entry.state === 'queued') {
-      item.appendChild(element('p', 'job-detail', entry.queue_position === 1 ? 'Next to start when the worker is available' : 'Waiting for earlier lessons to finish'));
+      item.appendChild(element('p', 'job-detail', entry.queue_position === 1 ? 'Next in line for an available processor' : 'Waiting for processing capacity'));
     } else if (entry.state === 'cancelled') {
       item.appendChild(element('p', 'job-detail', 'Processing cancelled. Your source video is still in the library.'));
     }
@@ -130,15 +170,21 @@
   }
 
   function render() {
-    var videos = data.videos || [];
-    var counts = {};
+    var allVideos = data.videos || [];
     var position = 0;
+    allVideos.forEach(function (entry) {
+      if (entry.state === 'queued') { position++; entry.queue_position = entry.queue_position || position; }
+    });
+    var videos = selectedCourse ? allVideos.filter(function (entry) {
+      return entry.course_id === selectedCourse || entry.course_slug === selectedCourse;
+    }) : allVideos;
+    if (courseScope) {
+      courseScope.hidden = !selectedCourse;
+      courseName.textContent = selectedCourse ? 'Course: ' + (videos.length ? videos[0].course : 'No remaining jobs') : '';
+    }
+    var counts = {};
     videos.forEach(function (entry) {
       counts[entry.state] = (counts[entry.state] || 0) + 1;
-      if (entry.state === 'queued') {
-        position++;
-        entry.queue_position = entry.queue_position || position;
-      }
     });
     var parts = [
       (counts.working || 0) + ' running', (counts.queued || 0) + ' waiting',
@@ -153,6 +199,7 @@
 
     var query = search.value.trim().toLowerCase();
     var shown = videos.filter(function (entry) {
+      if (selectedLesson && entry.id !== selectedLesson) return false;
       return matches(entry, filter.value) && [entry.title, entry.course, entry.source_name, entry.source_path]
         .join(' ').toLowerCase().includes(query);
     });
@@ -173,7 +220,7 @@
     shown.forEach(function (entry) { list.appendChild(row(entry, controls)); });
     if (focusKey && controls[focusKey]) controls[focusKey].focus({ preventScroll: true });
     empty.hidden = shown.length > 0;
-    empty.textContent = !videos.length ? 'No processing activity yet. Upload videos to get started.'
+    empty.textContent = !videos.length ? (selectedCourse ? 'No processing activity for this course.' : 'No processing activity yet. Upload videos to get started.')
       : query ? 'No lessons match your search.'
       : filter.value === 'active' ? 'Nothing is running or waiting. Choose Ready to see completed lessons.'
       : 'No lessons with this status.';
@@ -221,8 +268,9 @@
     });
   }
 
-  filter.addEventListener('change', render);
-  search.addEventListener('input', render);
+  filter.addEventListener('change', function () { selectedLesson = null; render(); });
+  if (clearCourse) clearCourse.addEventListener('click', function () { selectedCourse = null; render(); });
+  search.addEventListener('input', function () { selectedLesson = null; render(); });
   document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
   poll();
   setInterval(poll, 3000);

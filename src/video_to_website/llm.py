@@ -11,6 +11,7 @@ import urllib.request
 from pathlib import Path
 
 from .util import die, log, warn
+from .work_progress import report_work
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
 DEFAULT_CLAUDE_CLI_MODEL = "opus"
@@ -225,7 +226,7 @@ class AnthropicBackend:
                     extra_body={"fallbacks": "default"},
                     **kwargs,
                 ) as stream:
-                    return stream.get_final_message()
+                    return self._collect_stream(stream)
             except Exception as exc:
                 if not self._is_unsupported(exc):
                     raise
@@ -235,7 +236,15 @@ class AnthropicBackend:
                 )
                 self._fallbacks_unavailable = True
         with self._client.messages.stream(**kwargs) as stream:
-            return stream.get_final_message()
+            return self._collect_stream(stream)
+
+    @staticmethod
+    def _collect_stream(stream):
+        characters = 0
+        for chunk in stream.text_stream:
+            characters += len(chunk)
+            report_work("model", "Receiving instructions", detail=f"{characters:,} characters received")
+        return stream.get_final_message()
 
     @staticmethod
     def _is_unsupported(exc: Exception) -> bool:

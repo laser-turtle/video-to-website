@@ -13,7 +13,23 @@ from . import __version__
 from .ingest import IngestHandler, IngestMixin
 from .pipeline import STAGE_ORDER, BuildOptions, build
 from .progress import Progress
+from .storage import DEFAULT_BUFFER, GIB
 from .util import die, find_videos, human_duration, log
+
+
+def _buffer_bytes(value: str) -> int:
+    try:
+        gib = float(value)
+        if not math.isfinite(gib) or gib < 0:
+            raise ValueError()
+        return int(gib * GIB)
+    except (ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError("Use a non-negative number of GiB for the free-space buffer.") from exc
+
+
+def _add_storage_options(parser):
+    parser.add_argument("--min-free-gib", dest="min_free_bytes", type=_buffer_bytes,
+                        default=DEFAULT_BUFFER, help="disk space to keep free when accepting uploads, in GiB (default: 1)")
 
 
 def _add_build_options(parser: argparse.ArgumentParser) -> None:
@@ -41,6 +57,8 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--frame-quality", type=int, default=3, help="screenshot JPEG quality, 2 is finest, 31 coarsest (default: 3)")
     parser.add_argument("--clip-width", type=int, default=1920, help="clip width, never upscaled (default: 1920)")
     parser.add_argument("--clip-crf", type=int, default=24, help="clip quality, lower is better (default: 24)")
+    parser.add_argument("--clip-encoder", choices=["auto", "libx264"], default="auto",
+                        help="allow a helper's hardware encoding profile, or require libx264 (local fallback always uses libx264)")
     parser.add_argument("--frames-per-step", type=int, default=4, help="most screenshots to show per step (default: 4)")
     parser.add_argument(
         "--screenshot-every",
@@ -129,6 +147,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     watch_cmd.add_argument("--api-bind", default="127.0.0.1", help="address for --api-port (default: 127.0.0.1)")
     _add_build_options(watch_cmd)
+    _add_storage_options(watch_cmd)
     watch_cmd.add_argument("--state", type=Path, help="durable databases (default: <out-parent>/.v2w-state)")
 
     fetch_cmd = sub.add_parser("fetch-model", help="download a whisper.cpp model")
@@ -152,11 +171,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     serve_cmd.add_argument("--state", type=Path, help="durable catalog directory")
+    _add_storage_options(serve_cmd)
     api_cmd = sub.add_parser("api", help="run the library API separately from the worker")
     api_cmd.add_argument("library", type=Path)
     api_cmd.add_argument("--state", type=Path, required=True)
     api_cmd.add_argument("--bind", default="127.0.0.1")
     api_cmd.add_argument("--port", type=int, default=8765)
+    api_cmd.add_argument("--no-uploads", action="store_true", help="disable library mutations while keeping worker endpoints available")
+    api_cmd.add_argument("--no-workers", action="store_true", help="disable remote-helper endpoints")
+    _add_storage_options(api_cmd)
     jobs_cmd = sub.add_parser("jobs", help="inspect, retry, or cancel durable lesson builds")
     jobs_cmd.add_argument("action", choices=["list", "retry", "cancel"], default="list", nargs="?")
     jobs_cmd.add_argument("lesson", nargs="?")
@@ -185,6 +208,7 @@ def _options_from(args: argparse.Namespace) -> BuildOptions:
         frame_quality=max(2, min(31, args.frame_quality)),
         clip_width=args.clip_width,
         clip_crf=max(0, min(51, args.clip_crf)),
+        clip_encoder=args.clip_encoder,
         frames_per_step=max(1, args.frames_per_step),
         seconds_per_frame=max(1.0, args.screenshot_every),
         clips=args.clips,
@@ -279,7 +303,7 @@ def _retry_delay(failures: int, interval: float) -> float:
     return min(interval * 2**max(1, failures), _MAX_BACKOFF)
 
 
-def _start_api(library: Path, bind: str, port: int, work: Path | None = None, catalog=None) -> None:
+def _start_api(library: Path, bind: str, port: int, work: Path | None = None, catalog=None, min_free_bytes=DEFAULT_BUFFER) -> None:
     """Convenience mode; the NixOS service runs the API in its own process."""
     import http.server
     import threading
@@ -290,6 +314,7 @@ def _start_api(library: Path, bind: str, port: int, work: Path | None = None, ca
     # So a rename can carry the stage cache with it rather than orphaning it.
     httpd.work = work
     httpd.catalog = catalog
+    httpd.min_free_bytes = min_free_bytes
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     log(f"accepting uploads on http://{bind}:{port}/api/")
 
@@ -302,7 +327,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         die("--interval must be a positive finite number")
     state = (args.state or options.out.parent / ".v2w-state").expanduser().resolve()
     watch(args.library.expanduser(), options, state, interval=args.interval,
-          api_port=args.api_port, api_bind=args.api_bind)
+          api_port=args.api_port, api_bind=args.api_bind, min_free_bytes=args.min_free_bytes)
     return 0
 
 
@@ -317,6 +342,12 @@ def _cmd_api(args: argparse.Namespace) -> int:
         server.library = library
         server.work = None
         server.catalog = Catalog(args.state.expanduser())
+        server.min_free_bytes = args.min_free_bytes
+        server.uploads_enabled = not args.no_uploads
+        server.workers_enabled = not args.no_workers
+        with server.catalog.connect() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES('workers_enabled',?)", ("0" if args.no_workers else "1",))
+            db.execute("INSERT OR REPLACE INTO settings VALUES('min_free_bytes',?)", (str(args.min_free_bytes),))
         log(f"library API at http://{args.bind}:{args.port}/api/")
         server.serve_forever()
     return 0
@@ -452,6 +483,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     with http.server.ThreadingHTTPServer((args.bind, args.port), handler) as httpd:
         httpd.library = args.library.expanduser().resolve() if args.library else None
+        httpd.min_free_bytes = args.min_free_bytes
         httpd.work = (args.work.expanduser().resolve() if args.work else directory / ".work")
         state = args.state.expanduser() if args.state else directory.parent / ".v2w-state"
         if (state / "catalog.sqlite").exists():

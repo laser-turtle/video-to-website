@@ -276,8 +276,8 @@ playerHead.fire('click');
 assert.ok(!player.classes.has('collapsed'), 'and opens it again');
 
 // 8. Focus mode: a bigger centred player, quick to toggle and quick to leave.
-const press = (key, target = {}) =>
-  documentListeners.keydown.forEach((fn) => fn({ key, target, preventDefault() {} }));
+const press = (key, target = {}, extra = {}) =>
+  documentListeners.keydown.forEach((fn) => fn({ key, target, preventDefault() {}, ...extra }));
 
 press('f');
 assert.ok(player.classes.has('focus'), 'f should open the larger view');
@@ -312,11 +312,37 @@ press('f');
 assert.ok(!player.classes.has('collapsed'), 'focus implies open');
 assert.ok(player.classes.has('focus'), 'and focused');
 
+// Visibility has its own shortcut, preserving playback and clearing the
+// backdrop if the player is collapsed from the larger view.
+const playbackBeforeHide = [mainVideo.paused, mainVideo.currentTime];
+press('v');
+assert.ok(player.classes.has('collapsed'), 'v collapses the player');
+assert.ok(!player.classes.has('focus') && !backdrop.classes.has('on'), 'no backdrop remains over the lesson');
+assert.deepEqual([mainVideo.paused, mainVideo.currentTime], playbackBeforeHide);
+assert.equal(saved['v2w:' + fakeDocument.body.dataset.lesson + ':player'], '1');
+press('v', { tagName: 'INPUT' });
+assert.ok(player.classes.has('collapsed'), 'typing does not change player visibility');
+press('V');
+assert.ok(!player.classes.has('collapsed') && !player.classes.has('focus'), 'v reopens the floating size');
+press('v', {}, { repeat: true });
+press('v', {}, { ctrlKey: true });
+assert.ok(!player.classes.has('collapsed'), 'holding v or using a browser shortcut does not toggle it');
+press('v');
+assert.ok(player.classes.has('collapsed'), 'v also collapses from the floating size');
+press('v');
+assert.equal(saved['v2w:' + fakeDocument.body.dataset.lesson + ':player'], '0');
+press('f');
+
 // 9. There is a cursor over the steps, and it starts at the first one.
 // How j and k move it through tall steps is covered in 15 to 17.
 assert.ok(step.classes.has('current'), 'the first step starts as the cursor');
 
 // 10. Marking a step done and moving on is one key, whatever the step's height.
+press('Enter', { tagName: 'A' });
+press('Enter', { tagName: 'BUTTON' });
+press('Enter', { tagName: 'SUMMARY' });
+press('x', { tagName: 'A', closest: selector => selector === '.course-contents' });
+assert.ok(!step.classes.has('done'), 'Enter on navigation links and buttons keeps their native action');
 press('Enter');
 assert.ok(step.classes.has('done'), 'Enter marks the step done');
 assert.ok(stepTwo.classes.has('current'), 'and advances to the next');

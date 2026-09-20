@@ -13,11 +13,13 @@ import time
 import uuid
 from pathlib import Path
 
+from .chapters import lesson_numbering
 from .pipeline import discover_courses
 from .progress import STAGE_LABELS
 from .util import digest_file, digest_json, file_lock, natural_key, slugify
+from .work_progress import progress_snapshot
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 PIPELINE_VERSION = "1"
 ACTIVE = ("queued", "running")
 
@@ -71,10 +73,34 @@ class Catalog:
                 db.execute("ALTER TABLE lessons ADD COLUMN title TEXT")
                 db.execute("ALTER TABLE lessons ADD COLUMN position INTEGER")
                 db.execute("PRAGMA user_version=2")
+                version = 2
+            if version == 2:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                db.execute("""CREATE TABLE build_progress (
+                    build_id TEXT PRIMARY KEY REFERENCES builds(id),
+                    stage TEXT NOT NULL, started REAL NOT NULL, payload TEXT NOT NULL)""")
+                db.execute("PRAGMA user_version=3")
+                version = 3
+            if version == 3:
+                from .worker_store import SCHEMA
+
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+                db.execute("PRAGMA user_version=4")
+                version = 4
+            if version == 4:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                db.execute("ALTER TABLE workers ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+                db.execute("PRAGMA user_version=5")
 
     @contextlib.contextmanager
-    def connect(self):
-        db = sqlite3.connect(self.path, timeout=30)
+    def connect(self, *, timeout: float = 30):
+        db = sqlite3.connect(self.path, timeout=timeout)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         try:
@@ -92,47 +118,98 @@ class Catalog:
 
     def _library(self, db) -> dict:
         courses = []
-        for course in sorted([dict(r) for r in db.execute("SELECT * FROM courses")], key=self.order_key):
-            rows = [dict(r) for r in db.execute("""SELECT l.*,b.state FROM lessons l
-                LEFT JOIN builds b ON b.id=l.desired_build WHERE l.course_id=? AND l.deleted=0""", (course["id"],))]
+        for course in sorted(
+            [dict(r) for r in db.execute("SELECT * FROM courses")], key=self.order_key
+        ):
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    """SELECT l.*,b.state FROM lessons l
+                LEFT JOIN builds b ON b.id=l.desired_build WHERE l.course_id=? AND l.deleted=0""",
+                    (course["id"],),
+                )
+            ]
             videos = []
             for row in sorted(rows, key=self.order_key):
                 published = json.loads(row["published"]) if row["published"] else {}
-                videos.append({
-                    "id": row["id"], "title": row["title"] or Path(row["path"]).stem,
-                    "source_title": Path(row["path"]).stem,
-                    "source_name": Path(row["path"]).name, "source_path": row["path"],
-                    "custom_title": row["title"] is not None, "position": row["position"],
-                    "description": published.get("title", ""), "bytes": row["size"],
-                    "state": row["state"] or "queued", "duration": published.get("duration"),
-                    "href": f"{course['slug']}/{row['slug']}.html" if published else None,
-                })
+                videos.append(
+                    {
+                        "id": row["id"],
+                        "title": row["title"] or Path(row["path"]).stem,
+                        "source_title": Path(row["path"]).stem,
+                        "source_name": Path(row["path"]).name,
+                        "source_path": row["path"],
+                        "custom_title": row["title"] is not None,
+                        "position": row["position"],
+                        "description": published.get("title", ""),
+                        "bytes": row["size"],
+                        "state": row["state"] or "queued",
+                        "duration": published.get("duration"),
+                        "numbering": lesson_numbering({
+                            "display_title": row["title"], "source_name": Path(row["path"]).name,
+                        }),
+                        "href": f"{course['slug']}/{row['slug']}.html"
+                        if published
+                        else None,
+                    }
+                )
             if videos:
-                courses.append({"id": course["id"], "title": course["title"], "source_path": course["path"],
-                                "position": course["position"], "href": f"{course['slug']}/index.html"
-                                if any(v["href"] for v in videos) else None, "videos": videos})
+                courses.append(
+                    {
+                        "id": course["id"],
+                        "title": course["title"],
+                        "source_path": course["path"],
+                        "position": course["position"],
+                        "href": f"{course['slug']}/index.html"
+                        if any(v["href"] for v in videos)
+                        else None,
+                        "videos": videos,
+                    }
+                )
         # Processing status is deliberately excluded: finishing a job does not
         # invalidate a user's edit, while moves/imports/other edits do.
-        revision = digest_json([
-            [c["id"], c["title"], c["source_path"], c["position"],
-             [[v["id"], v["title"], v["source_path"], v["position"], v["custom_title"]] for v in c["videos"]]]
-            for c in courses
-        ])
+        revision = digest_json(
+            [
+                [
+                    c["id"],
+                    c["title"],
+                    c["source_path"],
+                    c["position"],
+                    [
+                        [
+                            v["id"],
+                            v["title"],
+                            v["source_path"],
+                            v["position"],
+                            v["custom_title"],
+                        ]
+                        for v in c["videos"]
+                    ],
+                ]
+                for c in courses
+            ]
+        )
         return {"revision": revision, "courses": courses}
 
     def library(self) -> dict:
         with self.lock(), self.connect() as db:
             return self._library(db)
 
-    def edit_library(self, resource: str, item_id: str | None, action: str, body: dict) -> dict:
+    def edit_library(
+        self, resource: str, item_id: str | None, action: str, body: dict
+    ) -> dict:
         """Apply an entire title/order edit without touching files or build intent."""
         with self.lock(), self.connect() as db:
             current = self._library(db)
             if body.get("revision") != current["revision"]:
-                raise CatalogConflict("The library changed. Reload it before applying this change.")
+                raise CatalogConflict(
+                    "The library changed. Reload it before applying this change."
+                )
             courses = current["courses"]
             course = next((c for c in courses if c["id"] == item_id), None)
-            lesson = next((v for c in courses for v in c["videos"] if v["id"] == item_id), None)
+            lesson = next(
+                (v for c in courses for v in c["videos"] if v["id"] == item_id), None
+            )
             if action == "title":
                 if resource == "courses" and course:
                     table = "courses"
@@ -142,7 +219,11 @@ class Catalog:
                     raise KeyError(item_id)
                 title = body.get("title")
                 if title is not None or table == "courses":
-                    if not isinstance(title, str) or not title.strip() or len(title.strip()) > 240:
+                    if (
+                        not isinstance(title, str)
+                        or not title.strip()
+                        or len(title.strip()) > 240
+                    ):
                         raise ValueError("Use a title between 1 and 240 characters.")
                     title = title.strip()
                     if any(ord(char) < 32 for char in title):
@@ -158,15 +239,45 @@ class Catalog:
                 else:
                     raise KeyError(item_id)
                 wanted = body.get("ids")
-                if body.get("mode") == "source":
+                mode = body.get("mode")
+                if mode == "source":
                     wanted = [item["id"] for item in items]
                     positions = [None] * len(wanted)
                 else:
-                    if (not isinstance(wanted, list) or not all(isinstance(v, str) for v in wanted)
-                            or len(wanted) != len(items) or set(wanted) != {item["id"] for item in items}):
-                        raise ValueError("An order must contain every item exactly once.")
+                    if mode is not None:
+                        allowed = {"title", "heuristic", "filename", "shortest", "longest"} if course else {"title"}
+                        if not isinstance(mode, str) or mode not in allowed:
+                            raise ValueError("Unknown sorting method.")
+
+                        def sort_key(item):
+                            title = natural_key(item["title"])
+                            if mode == "heuristic":
+                                numbering = item["numbering"]
+                                return (numbering is None, tuple(numbering or (0, 0)), title)
+                            if mode == "filename":
+                                return natural_key(item["source_name"])
+                            if mode in {"shortest", "longest"}:
+                                duration = item["duration"]
+                                return (duration is None, (duration or 0) * (-1 if mode == "longest" else 1))
+                            return title
+
+                        # Stable ties keep their current relative order. Compute
+                        # against this locked snapshot, including unpublished
+                        # lessons; the client never sends a filtered subset.
+                        wanted = [item["id"] for item in sorted(items, key=sort_key)]
+                    if (
+                        not isinstance(wanted, list)
+                        or not all(isinstance(v, str) for v in wanted)
+                        or len(wanted) != len(items)
+                        or set(wanted) != {item["id"] for item in items}
+                    ):
+                        raise ValueError(
+                            "An order must contain every item exactly once."
+                        )
                     positions = range(len(wanted))
-                db.executemany(f"UPDATE {table} SET position=? WHERE id=?", zip(positions, wanted))
+                db.executemany(
+                    f"UPDATE {table} SET position=? WHERE id=?", zip(positions, wanted)
+                )
             else:
                 raise ValueError("Unknown library action.")
             return self._library(db)
@@ -197,6 +308,15 @@ class Catalog:
                 WHERE id=? AND state NOT IN ('cancelled','superseded','ready')""",
                 (state, stage, error, time.time(), build_id),
             )
+
+    def update_progress(self, build_id: str, stage: str, payload: dict):
+        with self.connect(timeout=.1) as db:
+            db.execute("""INSERT INTO build_progress (build_id,stage,started,payload)
+                SELECT ?,?,?,? WHERE EXISTS (
+                    SELECT 1 FROM builds WHERE id=? AND state='running' AND stage=?)
+                ON CONFLICT(build_id) DO UPDATE SET stage=excluded.stage,
+                    started=excluded.started,payload=excluded.payload""",
+                (build_id, stage, payload["stage_started"], json.dumps(payload), build_id, stage))
 
     def reconcile(self, library: Path, options: dict) -> None:
         """Import a settled filesystem snapshot, recording build intents atomically.
@@ -273,9 +393,19 @@ class Catalog:
                     )
                     if previous:
                         db.execute(
-                            """UPDATE lessons SET course_id=?,path=?,digest=?,size=?,mtime=?,deleted=0
+                            """UPDATE lessons SET course_id=?,path=?,digest=?,size=?,mtime=?,deleted=0,position=?
                             WHERE id=?""",
-                            (course_id, relative, digest, size, mtime, lesson_id),
+                            (
+                                course_id,
+                                relative,
+                                digest,
+                                size,
+                                mtime,
+                                previous["position"]
+                                if previous["course_id"] == course_id
+                                else None,
+                                lesson_id,
+                            ),
                         )
                     else:
                         db.execute(
@@ -420,9 +550,11 @@ class Catalog:
         return courses
 
     def status(self) -> dict:
-        rows = self.rows("""SELECT l.id,l.path,l.slug,l.title,l.published,c.title AS course,c.slug AS course_slug,
-            b.id AS build_id,b.state,b.stage,b.error,b.created,b.updated
+        rows = self.rows("""SELECT l.id,l.course_id,l.path,l.slug,l.title,l.published,c.title AS course,c.slug AS course_slug,
+            b.id AS build_id,b.state,b.stage,b.error,b.created,b.updated,
+            p.stage AS progress_stage,p.started AS stage_started,p.payload AS progress_payload
             FROM lessons l JOIN courses c ON c.id=l.course_id LEFT JOIN builds b ON b.id=l.desired_build
+            LEFT JOIN build_progress p ON p.build_id=b.id
             WHERE l.deleted=0 ORDER BY b.created,b.id,l.id""")
         videos = []
         queue_position = 0
@@ -433,18 +565,47 @@ class Catalog:
             )
             if state == "queued":
                 queue_position += 1
+            measured = None
+            if state == "working" and row["progress_stage"] == row["stage"] and row["progress_payload"]:
+                measured = progress_snapshot(json.loads(row["progress_payload"]))
+            stage_started = row["stage_started"] if measured else row["updated"]
+            execution = None
+            executions = []
+            if state == "working":
+                query = """SELECT t.id AS task_id,t.kind,t.state,t.error,t.spec,a.id AS attempt_id,
+                    a.worker_id,w.name AS worker_name,a.progress
+                    FROM compute_tasks t LEFT JOIN compute_attempts a ON a.id=t.current_attempt
+                    LEFT JOIN workers w ON w.id=a.worker_id
+                    WHERE t.build_id=? AND t.stage=? """
+                activity = self.rows(query + """AND t.state IN ('running','pending','fallback','failed')
+                    ORDER BY t.state='running' DESC,t.created,t.id""", (row["build_id"], row["stage"]))
+                for entry in activity:
+                    detail = {key: entry[key] for key in ("task_id", "kind", "state", "error", "attempt_id", "worker_id", "worker_name")}
+                    detail["description"] = json.loads(entry["spec"]).get("description", "")
+                    executions.append(detail)
+                execution = {"worker_id": "server", "worker_name": "Library server", "state": "running"}
+                if executions:
+                    execution = executions[0]
+                else:
+                    recent = self.rows(query + "ORDER BY t.updated DESC,t.created DESC,t.id DESC LIMIT 1", (row["build_id"], row["stage"]))
+                    if recent:
+                        execution = {key: recent[0][key] for key in ("task_id", "kind", "state", "error", "attempt_id", "worker_id", "worker_name")}
             videos.append(
                 {
                     "id": row["id"],
                     "build_id": row["build_id"],
                     "course": row["course"],
+                    "course_id": row["course_id"],
+                    "course_slug": row["course_slug"],
                     "title": row["title"] or Path(row["path"]).stem,
                     "source_name": Path(row["path"]).name,
                     "source_path": row["path"],
                     "queue_position": queue_position if state == "queued" else None,
                     "created": row["created"],
                     "updated": row["updated"],
-                    "lesson_href": f"{row['course_slug']}/{row['slug']}.html" if row["published"] else None,
+                    "lesson_href": f"{row['course_slug']}/{row['slug']}.html"
+                    if row["published"]
+                    else None,
                     "state": state,
                     "stage": row["stage"],
                     "label": row["error"]
@@ -467,7 +628,11 @@ class Catalog:
                     if row["stage"] in stages
                     else 0,
                     "steps": len(stages),
-                    "elapsed": round(time.time() - (row["updated"] or time.time()), 1),
+                    "stage_started": stage_started,
+                    "progress": measured,
+                    "execution": execution,
+                    "executions": executions,
+                    "elapsed": round(time.time() - (stage_started or time.time()), 1),
                     "error": row["error"],
                 }
             )

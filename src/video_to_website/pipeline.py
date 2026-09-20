@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import media, render, whisper
 from . import steps as steps_mod
+from .media_batch import MediaJob, run_media_jobs
 from .progress import Progress
 from .util import (
     VIDEO_SUFFIXES,
@@ -25,6 +26,7 @@ from .util import (
     warn,
     write_stage,
 )
+from .work_progress import report_work, track_work
 
 # Bump when the prompt or step schema changes, so cached steps are recomputed.
 PROMPT_VERSION = 4
@@ -55,6 +57,7 @@ class BuildOptions:
     clip_max_seconds: float = 45.0
     clip_width: int = 1920
     clip_crf: int = 24
+    clip_encoder: str = "auto"
     clip_fps: int = 30
     clip_max_still: float = 1.5
     shots_with_clip: str = "one"
@@ -144,7 +147,11 @@ def process_video(
     default runner executes directly, preserving the standalone build command.
     """
     progress = progress or Progress(None)
-    execute = run_stage or (lambda name, fn: fn())
+    def direct_stage(name, function):
+        with track_work(progress.detail):
+            return function()
+
+    execute = run_stage or direct_stage
     fallback_title = title_from_filename(Path(source_name or video.name))
 
     def source():
@@ -188,7 +195,7 @@ def process_video(
         if segments is None:
             log("  transcribing with whisper.cpp")
             audio = work_dir / "audio.wav"
-            media.extract_audio(video, audio)
+            media.extract_audio(video, audio, duration=duration)
             try:
                 segments = whisper.transcribe(
                     audio,
@@ -204,6 +211,7 @@ def process_video(
             write_stage(work_dir / "transcript.json", fingerprint, transcribe_params, segments)
         else:
             log(f"  transcript cached ({len(segments)} segments)")
+            report_work("cached", "Using cached transcript", completed=1, total=1, estimate=False)
         return segments
 
     segments = execute("transcribe", transcribe_audio)
@@ -229,8 +237,11 @@ def process_video(
                 video,
                 floor=options.scene_floor,
                 analysis_width=options.scene_analysis_width,
+                duration=duration,
             )
             write_stage(work_dir / "scenes.json", fingerprint, scene_params, scene_pairs)
+        else:
+            report_work("cached", "Using cached visual analysis", completed=1, total=1, estimate=False)
         return scene_pairs
 
     scene_pairs = execute("scenes", find_scenes)
@@ -280,6 +291,7 @@ def process_video(
             write_stage(work_dir / "steps.json", fingerprint, steps_params, lesson)
         else:
             log(f"  steps cached ({len(lesson['steps'])})")
+            report_work("cached", "Using cached instructions", completed=1, total=1, estimate=False)
         return lesson
 
     lesson = execute("steps", write_steps)
@@ -330,6 +342,7 @@ def process_video(
             "frame_width": options.frame_width,
             "frame_quality": options.frame_quality,
             "clip_crf": options.clip_crf,
+            "clip_encoding_profile": {"policy": options.clip_encoder, "version": 1},
             "clips": options.clips,
             "clip_max_seconds": options.clip_max_seconds,
             "clip_width": options.clip_width,
@@ -341,121 +354,140 @@ def process_video(
             "transcript": digest_json(segments),
             "scenes": digest_json(scene_pairs),
         }
+        def make_frames(step):
+            step_frames: list[dict] = []
+            cap = shot_cap(step)
+            if cap:
+                times = steps_mod.frames_for_step(
+                    step,
+                    entries,
+                    duration=duration,
+                    cap=cap,
+                    seconds_per_frame=options.seconds_per_frame,
+                )
+                # Two scene changes can show the same screen; a perceptual hash
+                # keeps the gallery from repeating itself.
+                seen_hashes: list[int] = []
+                for shot_number, time in enumerate(times, 1):
+                    report_work("screenshot", "Choosing screenshots", detail=f"Candidate {shot_number} of {len(times)}")
+                    digest = media.frame_hash(video, time)
+                    if digest is not None:
+                        if any(
+                            media.hamming(digest, prior) <= options.frame_dedup_distance
+                            for prior in seen_hashes
+                        ):
+                            continue
+                        seen_hashes.append(digest)
+                    name = f"step-{step['index']:03d}-{len(step_frames) + 1}.jpg"
+                    frame_path = frames_dir / name
+                    # Always re-extract: reaching here means the cache key
+                    # changed, and a file of the same name from a previous
+                    # build was made with the settings that just changed.
+                    try:
+                        media.extract_frame(
+                            video,
+                            time,
+                            frame_path,
+                            width=options.frame_width,
+                            quality=options.frame_quality,
+                        )
+                    except CommandError as exc:
+                        if run_stage is not None:
+                            raise
+                        warn(f"  could not grab a frame at {hms(time)}: {exc}")
+                        continue
+                    step_frames.append(
+                        {
+                            "time": round(time, 2),
+                            "src": f"frames/{slug}/{name}",
+                            "width": shot_width,
+                            "height": shot_height,
+                        }
+                    )
+            return step_frames
+
+        def make_clip(step):
+            clip_record = None
+            clip_start, clip_end = steps_mod.clip_window(
+                step,
+                segments,
+                duration=duration,
+                max_seconds=options.clip_max_seconds,
+            )
+            name = f"step-{step['index']:03d}.mp4"
+            clip_path = clips_dir / name
+            span = clip_end - clip_start
+            keep = None
+            if options.clip_max_still > 0:
+                keep = steps_mod.trim_still_ranges(
+                    media.frame_activity(video, clip_start, span),
+                    duration=span,
+                    max_still=options.clip_max_still,
+                )
+            try:
+                media.extract_clip(
+                    video,
+                    clip_start,
+                    clip_path,
+                    duration=span,
+                    width=options.clip_width,
+                    fps=options.clip_fps,
+                    crf=options.clip_crf,
+                    keep=keep,
+                    encoder=options.clip_encoder,
+                )
+                # Trimming re-times the clip, so ask the file how long it is
+                # rather than assuming.
+                length = media.duration_of(clip_path) or span
+                clip_record = {
+                    "src": f"clips/{slug}/{name}",
+                    "time": clip_start,
+                    "seconds": round(length, 2),
+                    "source_seconds": round(span, 2),
+                    "width": clip_width,
+                    "height": clip_height,
+                }
+            except CommandError as exc:
+                if run_stage is not None:
+                    raise
+                warn(f"  could not cut a clip at {hms(clip_start)}: {exc}")
+            return clip_record
+
         cached = (
             None if options.forced("frames") else read_stage(work_dir / "assets.json", fingerprint, assets_params)
         )
-        usable = cached is not None and all(
+        usable = cached is not None and len(cached) == len(lesson["steps"]) and all(
             (course_dir / entry["src"]).exists()
             for record in cached
             for entry in (record.get("frames") or []) + ([record["clip"]] if record.get("clip") else [])
         )
 
         if usable:
+            report_work("cached", "Using cached lesson media", completed=1, total=1, estimate=False)
             for step, record in zip(lesson["steps"], cached):
                 step["frames"] = record.get("frames") or []
                 if record.get("clip"):
                     step["clip"] = record["clip"]
         else:
-            records: list[dict] = []
-            for step in lesson["steps"]:
-                step_frames: list[dict] = []
-                cap = shot_cap(step)
-                if cap:
-                    times = steps_mod.frames_for_step(
-                        step,
-                        entries,
-                        duration=duration,
-                        cap=cap,
-                        seconds_per_frame=options.seconds_per_frame,
-                    )
-                    # Two scene changes can show the same screen; a perceptual hash
-                    # keeps the gallery from repeating itself.
-                    seen_hashes: list[int] = []
-                    for time in times:
-                        digest = media.frame_hash(video, time)
-                        if digest is not None:
-                            if any(
-                                media.hamming(digest, prior) <= options.frame_dedup_distance
-                                for prior in seen_hashes
-                            ):
-                                continue
-                            seen_hashes.append(digest)
-                        name = f"step-{step['index']:03d}-{len(step_frames) + 1}.jpg"
-                        frame_path = frames_dir / name
-                        # Always re-extract: reaching here means the cache key
-                        # changed, and a file of the same name from a previous
-                        # build was made with the settings that just changed.
-                        try:
-                            media.extract_frame(
-                                video,
-                                time,
-                                frame_path,
-                                width=options.frame_width,
-                                quality=options.frame_quality,
-                            )
-                        except CommandError as exc:
-                            if run_stage is not None:
-                                raise
-                            warn(f"  could not grab a frame at {hms(time)}: {exc}")
-                            continue
-                        step_frames.append(
-                            {
-                                "time": round(time, 2),
-                                "src": f"frames/{slug}/{name}",
-                                "width": shot_width,
-                                "height": shot_height,
-                            }
-                        )
-                step["frames"] = step_frames
-
-                clip_record = None
+            jobs = []
+            for number, step in enumerate(lesson["steps"]):
+                if shot_cap(step):
+                    jobs.append(MediaJob((number, "frames"), f"Step {step['index']} · Screenshots",
+                                         lambda step=step: make_frames(step)))
                 if wants_clip(step):
-                    clip_start, clip_end = steps_mod.clip_window(
-                        step,
-                        segments,
-                        duration=duration,
-                        max_seconds=options.clip_max_seconds,
-                    )
-                    name = f"step-{step['index']:03d}.mp4"
-                    clip_path = clips_dir / name
-                    span = clip_end - clip_start
-                    keep = None
-                    if options.clip_max_still > 0:
-                        keep = steps_mod.trim_still_ranges(
-                            media.frame_activity(video, clip_start, span),
-                            duration=span,
-                            max_still=options.clip_max_still,
-                        )
-                    try:
-                        media.extract_clip(
-                            video,
-                            clip_start,
-                            clip_path,
-                            duration=span,
-                            width=options.clip_width,
-                            fps=options.clip_fps,
-                            crf=options.clip_crf,
-                            keep=keep,
-                        )
-                        # Trimming re-times the clip, so ask the file how long it is
-                        # rather than assuming.
-                        length = media.duration_of(clip_path) or span
-                        clip_record = {
-                            "src": f"clips/{slug}/{name}",
-                            "time": clip_start,
-                            "seconds": round(length, 2),
-                            "source_seconds": round(span, 2),
-                            "width": clip_width,
-                            "height": clip_height,
-                        }
-                    except CommandError as exc:
-                        if run_stage is not None:
-                            raise
-                        warn(f"  could not cut a clip at {hms(clip_start)}: {exc}")
-                if clip_record:
-                    step["clip"] = clip_record
-
-                records.append({"frames": step_frames, "clip": clip_record})
+                    jobs.append(MediaJob((number, "clip"), f"Step {step['index']} · Clip",
+                                         lambda step=step: make_clip(step)))
+            completed = run_media_jobs(jobs)
+            records = []
+            # Completion order affects scheduling, never the lesson's reading order.
+            for number, step in enumerate(lesson["steps"]):
+                step["frames"] = completed.get((number, "frames"), [])
+                clip = completed.get((number, "clip"))
+                if clip:
+                    step["clip"] = clip
+                else:
+                    step.pop("clip", None)
+                records.append({"frames": step["frames"], "clip": clip})
 
             # These directories are entirely ours, so anything not referenced now is
             # left over from an earlier set of settings.

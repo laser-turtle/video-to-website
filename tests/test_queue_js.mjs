@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const source = readFileSync(process.argv[2], 'utf8');
+const source = readFileSync(new URL('../src/video_to_website/assets/progress.js', import.meta.url), 'utf8') + '\n' + readFileSync(process.argv[2], 'utf8');
 function element(tag) {
   return {
     tagName: tag, children: [], dataset: {}, style: {}, listeners: {}, attributes: {},
@@ -16,7 +16,7 @@ function element(tag) {
   };
 }
 const ids = {};
-for (const id of ['job-list', 'queue-summary', 'job-filter', 'job-search', 'queue-empty', 'queue-notice', 'queue-updated']) {
+for (const id of ['job-list', 'queue-summary', 'job-filter', 'job-search', 'queue-empty', 'queue-notice', 'queue-updated', 'queue-course', 'queue-course-name', 'queue-all-courses']) {
   ids[id] = element('div');
 }
 const list = ids['job-list'];
@@ -63,7 +63,7 @@ const search = value => { ids['job-search'].value = value; ids['job-search'].fir
 new Function('document', 'fetch', 'setInterval', source)(document, fetch, fn => { tick = fn; });
 await flush();
 
-assert.equal(list.children.length, 10, 'every queued lesson is visible, beyond the compact preview');
+assert.equal(list.children.length, 10, 'every queued lesson is visible');
 assert.equal(list.children[0].className, 'job working', 'running lesson appears first');
 assert.ok(list.children[0].textContent.includes('Transcribing the audio'));
 assert.ok(list.children[0].textContent.includes('1m 30s'));
@@ -72,6 +72,34 @@ assert.ok(list.children[9].textContent.includes('#9 in queue'));
 assert.ok(ids['queue-summary'].textContent.includes('1 running · 9 waiting · 1 failed · 1 ready'));
 assert.equal(buttons().length, 10, 'each active lesson can be cancelled');
 assert.equal(ids['queue-notice'].hidden, true);
+
+running.progress = {phase: 'speech', label: 'Transcribing audio', fraction: .45,
+  completed: 45, total: 100, unit: 'percent', eta_seconds: 120, updated: Date.now() / 1000};
+tick(); await flush();
+assert.ok(list.children[0].textContent.includes('45%'));
+assert.ok(list.children[0].textContent.includes('About 2m left for transcription'));
+assert.equal(list.children[0].children.find(n => n.className === 'bar').attributes['aria-valuenow'], '45');
+running.progress.updated -= 180;
+tick(); await flush();
+assert.ok(list.children[0].textContent.includes('Estimate paused'));
+assert.ok(!list.children[0].textContent.includes('left for transcription'));
+delete running.progress;
+
+running.executions = [
+  {state: 'running', worker_id: id(41), worker_name: 'RTX 3090', description: 'Step 3 · Clip', kind: 'clip'},
+  {state: 'running', worker_id: id(42), worker_name: 'MacBook Air', description: 'Step 4 · Screenshots', kind: 'frame'},
+  {state: 'pending', description: 'Step 5 · Clip', kind: 'clip'},
+  {state: 'fallback', description: 'Step 6 · Clip', kind: 'clip'},
+];
+tick(); await flush();
+assert.match(list.children[0].textContent, /RTX 3090/);
+assert.match(list.children[0].textContent, /MacBook Air/);
+assert.match(list.children[0].textContent, /Step 3 · Clip/);
+assert.match(list.children[0].textContent, /1 operation ready for a processor/);
+assert.match(list.children[0].textContent, /1 operation waiting for server fallback/);
+assert.ok(links().some(link => link.href === 'workers.html#worker-' + id(41)));
+assert.ok(links().some(link => link.href === 'workers.html#worker-' + id(42)));
+delete running.executions;
 
 search('drawing');
 assert.equal(list.children.length, 1, 'search includes course names');
@@ -148,4 +176,26 @@ tick(); await flush();
 assert.equal(list.children.length, 0);
 assert.ok(ids['queue-empty'].textContent.includes('Upload videos'));
 assert.equal(ids['queue-notice'].hidden, true, 'connection recovery clears the notice');
+
+// Home-page counts link to a stable course scope, independently of names.
+payload = {videos: [
+  {...running, course_id: 'course-a', course_slug: 'a', course: 'Same name'},
+  {...failed, state: 'failed', course_id: 'course-a', course_slug: 'a', course: 'Same name'},
+  {...queued[0], state: 'queued', course_id: 'course-b', course_slug: 'b', course: 'Same name'},
+]};
+filter.value = 'active';
+new Function('document', 'fetch', 'setInterval', 'location', source)(document, fetch, fn => { tick = fn; }, {search: '?course=course-a&state=all'});
+await flush();
+assert.equal(list.children.length, 2);
+assert.equal(ids['queue-course'].hidden, false);
+assert.equal(ids['queue-course-name'].textContent, 'Course: Same name');
+assert.ok(ids['queue-summary'].textContent.includes('1 running · 0 waiting · 1 failed'));
+select('failed'); assert.equal(list.children.length, 1, 'state filter keeps the course scope');
+ids['queue-all-courses'].fire('click');
+assert.equal(ids['queue-course'].hidden, true);
+select('all'); assert.equal(list.children.length, 3, 'scope can be cleared');
+new Function('document', 'fetch', 'setInterval', 'location', source)(document, fetch, fn => { tick = fn; }, {search: '?q=Drawing&state=failed'});
+payload = {videos: [{...failed, state: 'failed'}, running]}; await flush(); tick(); await flush();
+assert.equal(ids['job-search'].value, 'Drawing');
+assert.equal(list.children.length, 1, 'legacy status links use visible search text');
 console.log('queue.js runtime checks passed');

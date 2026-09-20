@@ -8,6 +8,7 @@ from typing import Any
 
 from .llm import SYSTEM_PROMPT, LLMError, build_user_prompt, extract_json
 from .util import log, warn
+from .work_progress import report_work, work_group
 
 MAX_TITLE_CHARS = 90
 MAX_ACTION_CHARS = 400
@@ -45,6 +46,7 @@ def _ask(backend, system: str, user: str) -> dict:
         return extract_json(text)
     except LLMError as exc:
         warn(f"{exc}; retrying once")
+        report_work("model", "Retrying the model response", detail="The first response could not be parsed")
         repair = (
             user
             + "\n\nYour previous reply could not be parsed as JSON. "
@@ -64,7 +66,8 @@ def extract_lesson(
     overlap_seconds: float = 45.0,
 ) -> dict:
     """Ask the backend for a structured lesson, chunking long videos into windows."""
-    windows = _plan_windows(duration, chunk_minutes, overlap_seconds)
+    windows = [window for window in _plan_windows(duration, chunk_minutes, overlap_seconds)
+               if _window_segments(segments, *window)]
     promo_hints = detect_promo_ranges(segments)
     lesson: dict[str, Any] = {
         "title": "",
@@ -94,7 +97,13 @@ def extract_lesson(
                 if hint_end >= start and hint_start <= end
             ],
         )
-        result = _ask(backend, SYSTEM_PROMPT, user)
+        with work_group("sections", "Writing lesson instructions", completed=index,
+                        total=len(windows), unit="sections",
+                        detail=f"Section {index + 1} of {len(windows)}"):
+            report_work("model", "Waiting for the model response")
+            result = _ask(backend, SYSTEM_PROMPT, user)
+        report_work("sections", "Writing lesson instructions", completed=index + 1,
+                    total=len(windows), unit="sections", detail=f"{index + 1} sections completed")
 
         if index == 0:
             lesson["title"] = str(result.get("title") or "").strip()

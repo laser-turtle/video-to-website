@@ -123,6 +123,12 @@ in
       '';
     };
 
+    workers = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Allow paired processing helpers and expose the Workers management page's API. Works independently of browser uploads.";
+    };
+
     apiPort = mkOption {
       type = types.port;
       default = 8765;
@@ -136,6 +142,12 @@ in
       type = types.str;
       default = "lessons";
       description = "Virtual host name to serve the site as.";
+    };
+
+    minFreeGiB = mkOption {
+      type = types.ints.unsigned;
+      default = 1;
+      description = "Free space to preserve on the destination filesystem when accepting browser uploads, in GiB.";
     };
 
     openFirewall = mkOption { type = types.bool; default = true; };
@@ -219,16 +231,17 @@ in
     };
 
     # Uploads survive worker restarts and failures in native media tools.
-    systemd.services.video-to-website-api = mkIf cfg.uploads {
+    systemd.services.video-to-website-api = mkIf (cfg.uploads || cfg.workers) {
       description = "Manage the video-to-website library";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       serviceConfig = {
-        ExecStart = lib.escapeShellArgs [
+        ExecStart = lib.escapeShellArgs ([
           "${cfg.package}/bin/v2w" "api" "${cfg.stateDir}/library"
           "--state" "${cfg.stateDir}/state"
           "--port" (toString cfg.apiPort) "--bind" "127.0.0.1"
-        ];
+          "--min-free-gib" (toString cfg.minFreeGiB)
+        ] ++ lib.optional (!cfg.uploads) "--no-uploads" ++ lib.optional (!cfg.workers) "--no-workers");
         ExecStartPre = "-+${takeLibrary}/bin/v2w-take-library";
         User = cfg.user;
         Group = cfg.group;
@@ -258,7 +271,7 @@ in
         locations."/assets/".extraConfig = ''
           add_header Cache-Control "public, max-age=31536000, immutable";
         '';
-        locations."/api/" = mkIf cfg.uploads {
+        locations."/api/" = mkIf (cfg.uploads || cfg.workers) {
           proxyPass = "http://127.0.0.1:${toString cfg.apiPort}";
           extraConfig = ''
             # A lesson is a couple of gigabytes, so no cap on the body.

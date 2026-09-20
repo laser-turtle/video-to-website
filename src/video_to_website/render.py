@@ -8,9 +8,15 @@ import json
 import shutil
 from pathlib import Path
 
+from .chapters import chapter_runs, lesson_chapter, lesson_numbering
 from .util import atomic_write, hms, human_duration, log
 
-QUEUE_SCRIPT = (Path(__file__).parent / "assets" / "queue.js").read_text(encoding="utf-8")
+PROGRESS_SCRIPT = (Path(__file__).parent / "assets" / "progress.js").read_text(encoding="utf-8")
+QUEUE_SCRIPT = PROGRESS_SCRIPT + "\n" + (Path(__file__).parent / "assets" / "queue.js").read_text(encoding="utf-8")
+STORAGE_SCRIPT = (Path(__file__).parent / "assets" / "storage.js").read_text(encoding="utf-8")
+LIBRARY_SCRIPT = STORAGE_SCRIPT + "\n" + (Path(__file__).parent / "assets" / "library.js").read_text(encoding="utf-8")
+WORKERS_SCRIPT = (Path(__file__).parent / "assets" / "workers.js").read_text(encoding="utf-8")
+COURSE_SCRIPT = (Path(__file__).parent / "assets" / "course.js").read_text(encoding="utf-8")
 
 STYLE = """\
 :root {
@@ -437,14 +443,144 @@ details.transcript summary { cursor: pointer; color: var(--muted); font-size: 14
 footer.site { color: var(--muted); font-size: 12.5px; padding: 26px 20px; text-align: center; }
 ul.cards { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
 @media (min-width: 720px) { ul.cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); } }
-ul.cards a {
-  display: flex; gap: 12px; text-decoration: none; color: inherit;
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; height: 100%;
+ul.cards > li {
+  display: flex; flex-direction: column; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
 }
-ul.cards a:hover { border-color: var(--accent); }
+ul.cards a.course-card-main {
+  display: flex; gap: 12px; text-decoration: none; color: inherit;
+  padding: 12px; flex: 1;
+}
+ul.cards > li:hover { border-color: var(--accent); }
+ul.cards .course-card-main > div { min-width: 0; overflow-wrap: anywhere; }
+ul.cards .course-activity { display: block; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 12.5px; text-decoration: none; }
+ul.cards .course-activity:hover { background: var(--accent-soft); }
+ul.cards .course-activity[hidden] { display: none; }
+ul.cards a:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 ul.cards img { width: 128px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); flex: none; background: var(--bg); }
 ul.cards .t { font-weight: 600; font-size: 15px; line-height: 1.3; }
 ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+.lesson-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 10px; }
+.lesson-list a {
+  display: flex; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--panel); color: inherit; text-decoration: none;
+}
+.lesson-list a:hover { border-color: var(--accent); }
+.lesson-number, .library-number { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; min-width: 1.5em; }
+.lesson-list img { width: 128px; height: 72px; object-fit: cover; border-radius: 6px; flex: none; }
+.lesson-list .t { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+.lesson-list .s, .lesson-source { margin-top: 5px; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.lesson-description { margin: 5px 0; font-size: 14px; color: var(--muted); line-height: 1.45; }
+.lesson-nav { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding: 18px 0; }
+.lesson-nav a { color: var(--accent); max-width: 100%; overflow-wrap: anywhere; }
+.course-browser [hidden] { display: none !important; }
+.course-tools { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 12px; }
+.course-tools label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.course-tools .course-search-label { flex: 1 1 220px; }
+.course-tools input, .course-tools select, .course-browser button {
+  font: inherit; font-size: 14px; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-height: 40px;
+}
+.course-tools input { width: 100%; min-width: 0; }
+.course-browser button { cursor: pointer; color: var(--accent); }
+.course-browser button:hover { border-color: var(--accent); }
+.course-browser :is(a, button, input, select, summary):focus-visible, .course-contents > summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+.course-tools-note, .course-results { color: var(--muted); font-size: 12.5px; margin: 8px 0; }
+.course-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+.course-actions .course-results { flex: 1 1 140px; }
+.course-chapter { margin-bottom: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.course-chapter > summary { cursor: pointer; padding: 12px 16px; font-size: 15px; font-weight: 600; }
+.chapter-meta { display: inline-block; margin-left: 10px; color: var(--muted); font-weight: 400; font-size: 12.5px; }
+.course-chapter > .lesson-list { padding: 0 10px 10px; }
+.course-browser .lesson-list a > div { min-width: 0; flex: 1; }
+.course-browser .lesson-list a[aria-current="page"] { border-color: var(--accent); background: var(--accent-soft); }
+.course-browser .current-lesson { color: var(--accent); font-size: 12px; font-weight: 500; margin-left: 8px; }
+.course-browser[data-density="compact"] .lesson-list :is(img, .lesson-description, .lesson-source) { display: none; }
+.course-browser[data-density="compact"] .lesson-list { gap: 5px; }
+.course-browser[data-density="compact"] .lesson-list a { padding: 9px 12px; }
+.course-browser[data-density="compact"] .lesson-list .t { font-size: 14px; }
+.course-contents { margin-bottom: 22px; border-bottom: 1px solid var(--line); }
+.course-contents > summary { cursor: pointer; color: var(--accent); padding: 0 0 12px; font-size: 14px; }
+.course-contents .course-browser { padding-bottom: 14px; }
+.course-contents .course-groups { max-height: 60vh; overflow-y: auto; overscroll-behavior: contain; padding: 4px; }
+@media (max-width: 520px) {
+  .course-tools { gap: 8px; }
+  .course-tools .course-search-label { flex-basis: 100%; }
+  .course-tools label:not(.course-search-label) { flex: 1 1 85px; min-width: 0; }
+  .course-tools label.course-sort-label { flex: 1.4 1 115px; }
+  .course-tools select { width: 100%; padding-left: 6px; }
+  .course-chapter > summary { padding: 10px; }
+  .chapter-meta { font-size: 12px; }
+}
+.library-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 0 0 16px; }
+.library-toolbar label { display: grid; gap: 5px; flex: 1; min-width: 180px; font-size: 13px; }
+.library-toolbar input, .library-edit input {
+  width: 100%; font: inherit; font-size: 14px; color: var(--ink); padding: 8px 10px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
+}
+.library-toolbar select, .managed-sort select {
+  font: inherit; font-size: 14px; color: var(--ink); background: var(--panel);
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; min-height: 40px; max-width: 100%;
+}
+.library-toolbar label.library-view-choice { flex: 0 1 130px; min-width: 100px; }
+.library-toolbar button, .library-actions button, .library-actions a, .managed-order button, .managed-sort button, .library-edit button {
+  font: inherit; font-size: 13px; cursor: pointer; color: var(--accent); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; text-decoration: none;
+}
+.library-actions button:hover, .library-actions a:hover { border-color: var(--accent); }
+.library-actions button:disabled, .library-toolbar button:disabled, .managed-order button:disabled, .managed-sort button:disabled, .library-edit button:disabled { opacity: .45; cursor: default; }
+.library-message { margin: 0 0 16px; font-size: 14px; }
+.library-message.bad { color: #c0392b; }
+.storage-panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 14px 16px; margin: 0 0 18px; }
+.storage-panel h2 { margin: 0 0 12px; font-size: 14px; }
+.storage-location + .storage-location { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.storage-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; font-size: 14px; }
+.storage-meter { margin: 9px 0; }
+.storage-detail, .storage-note { margin: 5px 0 0; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+.storage-available { margin: 7px 0 0; font-size: 13px; font-weight: 600; }
+.storage-location.low .storage-available { color: var(--accent); }
+.storage-location.full .storage-available, #storage-message { color: #b03026; }
+.storage-location.full .storage-meter i { background: #b03026; }
+#library-courses { margin-top: 12px; }
+.managed-course { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin: 0 0 14px; }
+.managed-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 16px; }
+.managed-heading h2 { flex: 1; min-width: 160px; font-size: 17px; margin: 0; }
+.managed-heading h2 button { border: none; padding: 0; background: none; color: inherit; font: inherit; font-weight: 650; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.library-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.managed-contents { padding: 0 16px 6px; }
+.managed-order { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 0 0 12px; }
+.managed-order > .library-hint { flex: 1 1 180px; }
+.managed-sort { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding-bottom: 16px; }
+.managed-sort label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); min-width: 0; }
+.managed-sort > .library-hint { flex-basis: 100%; }
+.managed-sort button, .managed-order button { min-height: 36px; }
+.managed-chapter { border: 1px solid var(--line); border-radius: 7px; margin-bottom: 12px; }
+.managed-chapter > summary { cursor: pointer; padding: 10px 12px; font-weight: 600; font-size: 14px; }
+.managed-chapter > .managed-lessons { padding: 0 12px; }
+#library-courses[data-density="compact"] .lesson-description { display: none; }
+#library-courses[data-density="compact"] .managed-lesson { padding: 8px 0; }
+#library-courses [hidden] { display: none !important; }
+#library-courses :is(button, select, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.library-hint { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.managed-lessons { list-style: none; margin: 0; padding: 0; }
+.managed-lesson { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 6px 10px; align-items: baseline; padding: 14px 0; border-top: 1px solid var(--line); }
+.managed-copy h3 { margin: 0 0 5px; font-size: 15px; line-height: 1.45; overflow-wrap: anywhere; }
+.managed-lesson > .library-actions { grid-column: 2; }
+.library-edit { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 0 16px 14px; padding: 12px; border-radius: 7px; background: var(--bg); }
+.library-edit label { display: grid; gap: 5px; flex: 1; min-width: 140px; font-size: 13px; }
+.library-edit > p { flex-basis: 100%; }
+.managed-lesson > .library-edit { grid-column: 2; margin: 4px 0 0; }
+@media (max-width: 520px) {
+  .lesson-list a { gap: 10px; padding: 12px; }
+  .lesson-list img { width: 72px; height: 48px; }
+  .lesson-list .t { font-size: 14px; }
+  .lesson-list .lesson-number { display: none; }
+  .managed-heading > .library-actions { flex-basis: 100%; }
+  .library-toolbar label[for="library-search"] { flex-basis: 100%; }
+  .library-toolbar label.library-view-choice { flex: 1 1 100px; }
+}
 .building {
   margin: 0 0 18px;
   background: var(--panel);
@@ -469,6 +605,11 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .building .s { font-size: 12.5px; color: var(--muted); }
 .bar { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
 .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
+.bar.indeterminate i { width: 30%; animation: v2w-progress 1.8s ease-in-out infinite; }
+.bar.progress-paused i { animation: none; opacity: .5; }
+.job-estimate, .building .progress-estimate { font-size: 13px; font-weight: 600; color: var(--ink); margin: 0; }
+.job-work { font-size: 13px; color: var(--muted); line-height: 1.5; margin: 0; overflow-wrap: anywhere; }
+@keyframes v2w-progress { 0% { transform: translateX(-100%); } 100% { transform: translateX(435%); } }
 .building .dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   background: var(--line); margin-right: 7px; vertical-align: middle;
@@ -499,6 +640,9 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 }
 .job-source, .job-detail, .queue-updated { color: var(--muted); }
 .queue-notice { margin-bottom: 12px; }
+.queue-course { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; font-size: 13px; margin: 0 0 14px; }
+.queue-course[hidden] { display: none; }
+.queue-course button { font: inherit; color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
 .queue-updated { margin-top: 16px; font-size: 12px; }
 .job-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .job-actions button, .job-actions a, .building > ul > li > button {
@@ -512,6 +656,7 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 @media (prefers-reduced-motion: reduce) {
   .building li.working .dot { animation: none; }
   .bar i { transition: none; }
+  .bar.indeterminate i { animation: none; }
 }
 .upload { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; }
 .upload label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
@@ -566,6 +711,54 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 """
 
 
+STYLE += """
+#worker-list { list-style: none; padding: 0; }
+.worker-tools { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-bottom: 16px; }
+.worker-tools label { display: grid; gap: 4px; margin-left: auto; flex: 0 1 250px; font-size: 13px; color: var(--muted); }
+.worker-tools button, .worker-rename button, #worker-pairing button { font: inherit; font-size: 13px; background: var(--panel); color: var(--accent); border: 1px solid var(--line); border-radius: 6px; padding: 9px 12px; cursor: pointer; }
+.worker-tools button:disabled, .worker-rename button:disabled { opacity: .5; cursor: default; }
+.worker-tools select, .worker-rename input { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+#worker-connect:not(:disabled) { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+.worker-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin: 16px 0; }
+.worker-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.worker-heading h2 { font-size: 18px; margin: 0; overflow-wrap: anywhere; }
+.worker-state { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; }
+.worker-state.busy, .worker-state.available { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.worker-subtle { color: var(--muted); font-size: 13px; margin: 5px 0; overflow-wrap: anywhere; }
+.worker-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 16px 0; margin: 12px 0; border-block: 1px solid var(--line); }
+.worker-stats strong, .worker-stats span { display: block; }
+.worker-stats strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.worker-stats span { font-size: 12px; color: var(--muted); }
+.worker-tasks { list-style: none; padding: 0; }
+.worker-task { padding: 10px 0; overflow-wrap: anywhere; }
+.worker-task + .worker-task { border-top: 1px solid var(--line); }
+.worker-task p { margin: 5px 0; }
+.worker-history { margin-top: 16px; }
+.worker-history summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.worker-delete { padding: 12px; margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); font-size: 13px; }
+.worker-delete p { margin-top: 0; }
+.worker-delete button { font: inherit; border: 1px solid var(--line); border-radius: 6px; color: var(--accent); background: var(--panel); padding: 7px 10px; cursor: pointer; }
+.worker-delete button + button { margin-left: 10px; }
+.worker-delete button:disabled { opacity: .5; cursor: default; }
+.worker-rename { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.worker-rename label { display: grid; gap: 4px; flex: 1 1 180px; }
+.worker-rename input { width: 100%; min-width: 0; }
+.worker-command { width: 100%; padding: 12px; font: 13px/1.6 var(--mono); background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; resize: vertical; }
+#worker-pairing h2 { margin-top: 0; font-size: 18px; }
+#worker-pairing h3 { margin-top: 22px; font-size: 15px; }
+.worker-platform { display: grid; gap: 4px; max-width: 260px; font-size: 13px; }
+.worker-platform select { font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+.worker-download { display: inline-block; padding: 9px 12px; background: var(--accent); color: var(--panel); border-radius: 6px; text-decoration: none; }
+.worker-install { margin: 12px 0; font-size: 14px; }
+.worker-install summary { cursor: pointer; color: var(--accent); }
+.worker-install pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.worker-gpu { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+.worker-gpu[hidden] { display: none; }
+#worker-pairing button + button { margin-left: 10px; }
+@media (max-width: 600px) { .worker-stats { grid-template-columns: repeat(2, 1fr); } .worker-tools label { flex-basis: 100%; margin-left: 0; } }
+"""
+
+
 SCRIPT = """\
 (function () {
   var player = document.getElementById('player');
@@ -588,6 +781,7 @@ SCRIPT = """\
   // ---- the floating player --------------------------------------------------
   var setFocus = noop;
   var expandPlayer = noop;
+  var togglePlayer = noop;
   var isFocused = function () { return false; };
 
   function syncPlayerHeight() {
@@ -608,6 +802,7 @@ SCRIPT = """\
     var setCollapsed = function (collapsed) {
       player.classList.toggle('collapsed', collapsed);
       if (chevron) chevron.innerHTML = collapsed ? '&#9650;' : '&#9660;';
+      if (head) head.title = (collapsed ? 'Expand' : 'Collapse') + ' video (v)';
       try { localStorage.setItem(key + ':player', collapsed ? '1' : '0'); } catch (e) {}
       syncPlayerHeight();
     };
@@ -617,12 +812,6 @@ SCRIPT = """\
     // Collapsed until asked for: the steps are the page, and clicking any
     // timestamp opens the player anyway.
     setCollapsed(stored === null ? true : stored === '1');
-
-    if (head) {
-      head.addEventListener('click', function () {
-        setCollapsed(!player.classList.contains('collapsed'));
-      });
-    }
 
     isFocused = function () { return player.classList.contains('focus'); };
     setFocus = function (on) {
@@ -640,6 +829,12 @@ SCRIPT = """\
     expandPlayer = function () {
       if (player.classList.contains('collapsed')) setCollapsed(false);
     };
+    togglePlayer = function () {
+      var collapse = !player.classList.contains('collapsed');
+      if (collapse && isFocused()) setFocus(false);
+      setCollapsed(collapse);
+    };
+    if (head) head.addEventListener('click', togglePlayer);
 
     if (sizeButton) {
       sizeButton.addEventListener('click', function (event) {
@@ -1233,6 +1428,7 @@ SCRIPT = """\
     var target = event.target || {};
     var tag = target.tagName || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
+    if (target.closest && target.closest('.course-contents')) return;
     var stop = function () { if (event.preventDefault) event.preventDefault(); };
 
     switch (event.key) {
@@ -1274,6 +1470,7 @@ SCRIPT = """\
         nudgeRate(1);
         return;
       case 'Enter':
+        if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY') return;
         stop();
         setDone(cursor, true);
         following = false;
@@ -1308,6 +1505,12 @@ SCRIPT = """\
       case 'F':
         stop();
         setFocus(!isFocused());
+        return;
+      case 'v':
+      case 'V':
+        if (!player) return;
+        stop();
+        if (!event.repeat) togglePlayer();
         return;
       case ' ':
         if (tag === 'BUTTON' || tag === 'LABEL') return;  // space activates those
@@ -1355,164 +1558,10 @@ SCRIPT = """\
 """
 
 
-STATUS_SCRIPT = """\
-(function () {
-  'use strict';
-
-  var panel = document.getElementById('build-status');
-  var list = document.getElementById('build-list');
-  var count = document.getElementById('build-count');
-  if (!panel || !list) { return; }
-
-  var POLL_MS = 3000;
-  var QUEUE_SHOWN = 6;
-  // The 'built' stamp as of the first poll. When the builder finishes a course
-  // it moves, and the page reloads itself so the new course actually appears.
-  var builtAtLoad = null;
-
-  function elapsed(seconds) {
-    var s = Math.round(seconds || 0);
-    if (s < 60) { return s + 's'; }
-    var m = Math.floor(s / 60);
-    if (m < 60) { return m + 'm ' + (s % 60) + 's'; }
-    return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
-  }
-
-  function row(entry, updated) {
-    var li = document.createElement('li');
-    li.className = entry.state;
-
-    var title = document.createElement('div');
-    title.className = 't';
-    var dot = document.createElement('span');
-    dot.className = 'dot';
-    title.appendChild(dot);
-    title.appendChild(document.createTextNode(entry.title));
-    li.appendChild(title);
-
-    var parts = [entry.course, entry.label];
-    if (entry.queue_position) { parts.push('#' + entry.queue_position + ' in queue'); }
-    if (entry.state === 'working' && updated && Date.now() / 1000 - updated > 120) {
-      parts.push('No recent update from the worker');
-    }
-    if (entry.state === 'working' && entry.elapsed) { parts.push(elapsed(entry.elapsed)); }
-    var sub = document.createElement('div');
-    sub.className = 's';
-    sub.textContent = parts.filter(Boolean).join(' \u00b7 ');
-    li.appendChild(sub);
-
-    if (entry.state === 'working' && entry.steps) {
-      var bar = document.createElement('div');
-      bar.className = 'bar';
-      var fill = document.createElement('i');
-      // A stage is only finished once the next one starts, so a stage that is
-      // under way counts as half of one. Better than a bar that sits still
-      // through the minutes whisper takes.
-      fill.style.width = (100 * Math.max(0, entry.step - 0.5) / entry.steps) + '%';
-      bar.appendChild(fill);
-      li.appendChild(bar);
-    }
-    if (/^[a-f0-9]{32}$/.test(entry.id || '') &&
-        ['working', 'queued', 'failed', 'cancelled'].indexOf(entry.state) >= 0) {
-      var action = entry.state === 'failed' || entry.state === 'cancelled' ? 'retry' : 'cancel';
-      var control = document.createElement('button');
-      control.type = 'button';
-      control.textContent = action === 'retry' ? 'Retry' : 'Cancel';
-      control.addEventListener('click', function () {
-        control.disabled = true;
-        fetch('api/lessons/' + entry.id + '/' + action, { method: 'POST' }).then(function (res) {
-          if (!res.ok) { throw new Error('Request failed (' + res.status + ')'); }
-          poll();
-        }).catch(function (err) {
-          control.disabled = false;
-          control.textContent = err.message + ' — try again';
-        });
-      });
-      li.appendChild(control);
-    }
-    return li;
-  }
-
-  function errorRow(data) {
-    var li = document.createElement('li');
-    li.className = 'failed';
-    var title = document.createElement('div');
-    title.className = 't';
-    var dot = document.createElement('span');
-    dot.className = 'dot';
-    title.appendChild(dot);
-    title.appendChild(document.createTextNode('Build stopped'));
-    var sub = document.createElement('div');
-    sub.className = 's';
-    sub.textContent = data.retry_in
-      ? data.error + ' \u00b7 retrying in ' + elapsed(data.retry_in)
-      : data.error;
-    li.appendChild(title);
-    li.appendChild(sub);
-    return li;
-  }
-
-  function render(data) {
-    var videos = data.videos || [];
-    var active = videos.filter(function (v) { return v.state === 'working'; });
-    var queued = videos.filter(function (v) { return v.state === 'queued'; });
-    var failed = videos.filter(function (v) { return v.state === 'failed' || v.state === 'cancelled'; });
-
-    var shown = active.concat(failed, queued.slice(0, QUEUE_SHOWN));
-    if (!shown.length && !data.error) { panel.hidden = true; return; }
-
-    list.textContent = '';
-    // A build that stopped part way is the one thing worth saying out loud:
-    // the pages on disk are last build's, and nothing else on the page says so.
-    if (data.error) { list.appendChild(errorRow(data)); }
-    shown.forEach(function (entry) { list.appendChild(row(entry, data.updated)); });
-
-    var hidden = queued.length - Math.min(queued.length, QUEUE_SHOWN);
-    if (hidden > 0) {
-      var more = document.createElement('li');
-      more.className = 'more';
-      var link = document.createElement('a');
-      link.href = 'queue.html';
-      link.textContent = 'View all ' + queued.length + ' waiting lessons';
-      more.appendChild(link);
-      list.appendChild(more);
-    }
-    if (count) {
-      count.textContent = [active.length ? active.length + ' running' : '',
-        queued.length ? queued.length + ' waiting' : '',
-        failed.length ? failed.length + ' needing attention' : ''].filter(Boolean).join(' · ');
-    }
-    panel.hidden = false;
-  }
-
-  function poll() {
-    // Cache-busted by hand: this file is small, changes constantly, and is not
-    // worth trusting any proxy between here and the builder to revalidate.
-    fetch('status.json?t=' + Date.now(), { cache: 'no-store' }).then(function (res) {
-      if (!res.ok) { throw new Error(res.status); }
-      return res.json();
-    }).then(function (data) {
-      if (builtAtLoad === null) { builtAtLoad = data.built || 0; }
-      else if ((data.built || 0) > builtAtLoad) { location.reload(); return; }
-      render(data);
-    }).catch(function () {
-      // No status file yet, or the builder is mid-write. Try again shortly.
-      panel.hidden = true;
-    });
-  }
-
-  poll();
-  setInterval(poll, POLL_MS);
-  // Coming back to a tab that was hidden for an hour should not wait for the
-  // next tick to catch up.
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { poll(); }
-  });
-})();
-"""
+STATUS_SCRIPT = (Path(__file__).parent / "assets" / "status.js").read_text(encoding="utf-8")
 
 
-UPLOAD_SCRIPT = """\
+UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
 (function () {
   'use strict';
 
@@ -1595,7 +1644,7 @@ UPLOAD_SCRIPT = """\
       });
     }
 
-    var rename = button('Rename', '', function () {
+    var rename = button('Rename file', '', function () {
       var input = document.createElement('input');
       input.type = 'text';
       input.value = video.name;
@@ -1645,10 +1694,10 @@ UPLOAD_SCRIPT = """\
       var box = document.createElement('div');
       box.className = 'lib-course';
       var heading = document.createElement('h3');
-      heading.textContent = course.name;
+      heading.textContent = course.title || course.name;
       var hint = document.createElement('p');
       hint.className = 'hint';
-      hint.textContent = 'Lessons build in this order. Rename to change it.';
+      hint.textContent = 'Original source files. Edit displayed titles and reading order in Library.';
       box.appendChild(heading);
       box.appendChild(hint);
       course.videos.forEach(function (video, index) {
@@ -1662,6 +1711,7 @@ UPLOAD_SCRIPT = """\
   // The API is the only part of the site that is not a static file, so it can
   // be missing entirely -- a locally built copy, or a server with uploads off.
   function load(clearMessage) {
+    V2WStorage.refresh(course.value || '');
     return fetch('api/library').then(function (res) {
       if (!res.ok) { throw new Error(res.status); }
       return res.json();
@@ -1671,6 +1721,7 @@ UPLOAD_SCRIPT = """\
       courses.forEach(function (course) {
         var option = document.createElement('option');
         option.value = course.name;
+        if (course.title) { option.label = course.title; }
         list.appendChild(option);
       });
       if (library && libraryList) { renderLibrary(courses); }
@@ -1704,6 +1755,16 @@ UPLOAD_SCRIPT = """\
   }
 
   function send(job, overwrite) {
+    job.ui.status.textContent = size(job.file.size) + ' · checking free space';
+    V2WStorage.check(job.course, job.file.size).then(function () {
+      transfer(job, overwrite);
+    }).catch(function (error) {
+      fail(job, error.message, false);
+    });
+  }
+
+  function transfer(job, overwrite) {
+    job.ui.status.textContent = size(job.file.size) + ' · uploading';
     var name = job.file.name;
     var url = 'api/library/' + encodeURIComponent(job.course) + '/' + encodeURIComponent(name);
     if (overwrite) { url += '?overwrite=1'; }
@@ -1739,22 +1800,20 @@ UPLOAD_SCRIPT = """\
     job.ui.li.className = 'failed';
     job.ui.bar.hidden = true;
     job.ui.status.textContent = text;
-    if (offerReplace) {
-      var again = document.createElement('button');
-      again.type = 'button';
-      again.className = 'again';
-      again.textContent = 'Replace it';
-      again.addEventListener('click', function () {
-        again.remove();
-        job.ui.li.className = '';
-        job.ui.bar.hidden = false;
-        job.ui.status.textContent = size(job.file.size) + ' \u00b7 waiting';
-        job.overwrite = true;
-        pending.push(job);
-        if (!busy) { next(); }
-      });
-      job.ui.li.appendChild(again);
-    }
+    var again = document.createElement('button');
+    again.type = 'button';
+    again.className = 'again';
+    again.textContent = offerReplace ? 'Replace it' : 'Retry upload';
+    again.addEventListener('click', function () {
+      again.remove();
+      job.ui.li.className = '';
+      job.ui.bar.hidden = false;
+      job.ui.status.textContent = size(job.file.size) + ' \u00b7 waiting';
+      job.overwrite = offerReplace || !!job.overwrite;
+      pending.push(job);
+      if (!busy) { next(); }
+    });
+    job.ui.li.appendChild(again);
     next();
   }
 
@@ -1836,6 +1895,7 @@ SHORTCUTS = [
     ("z", "Enlarge this step's screenshot"),
     ("r", "Loop clips, or play them once"),
     ("f", "Larger video, centred"),
+    ("v", "Collapse or expand the floating video"),
     ("Esc", "Close the larger video or this list"),
     ("?", "Show this list"),
 ]
@@ -2005,6 +2065,89 @@ def _render_step(step: dict, *, has_video: bool) -> str:
 </article>"""
 
 
+def lesson_title(lesson: dict) -> str:
+    """Preserve source numbering; a catalog title is an explicit user override."""
+    return lesson.get("display_title") or (Path(lesson["source_name"]).stem if lesson.get("source_name") else lesson["title"])
+
+
+def lesson_description(lesson: dict) -> str:
+    description = lesson.get("description", lesson.get("title", ""))
+    return description if description != lesson_title(lesson) else ""
+
+
+def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
+    lessons = course["lessons"]
+    reader = current_slug is not None
+    runs = chapter_runs(lessons)
+    has_chapters = any(run["number"] is not None for run in runs)
+    positions = {lesson["slug"]: index for index, lesson in enumerate(lessons, 1)}
+
+    def card(lesson: dict) -> str:
+        position = positions[lesson["slug"]]
+        title = lesson_title(lesson)
+        source = lesson.get("source_name", "")
+        description = lesson_description(lesson)
+        chapter = lesson_chapter(lesson)
+        numbering = lesson_numbering(lesson)
+        current = lesson["slug"] == current_slug
+        thumb = (
+            f'<img src="{_esc(lesson["poster"])}" alt="" loading="lazy">'
+            if lesson.get("poster") and not reader else ""
+        )
+        description_html = f'<p class="lesson-description">{_esc(description)}</p>' if description else ""
+        source_html = f'<div class="lesson-source">{_esc(source)}</div>' if source and title != Path(source).stem else ""
+        current_html = '<span class="current-lesson">Current lesson</span>' if current else ""
+        chapter_label = f"Chapter {chapter}" if chapter is not None else "Other lessons"
+        search = " ".join((title, description, source, chapter_label))
+        return (
+            f'<li data-course-lesson="{_esc(lesson["slug"])}" data-position="{position}" '
+            f'data-title="{_esc(title)}" data-lesson-number="{numbering[1] if numbering else ""}" '
+            f'data-chapter="{chapter if chapter is not None else ""}" '
+            f'data-duration="{float(lesson["duration"])}" data-search="{_esc(search)}" '
+            f'data-current="{str(current).lower()}">'
+            f'<a href="{_esc(lesson["slug"])}.html"' + (' aria-current="page"' if current else '') + '>'
+            f'<span class="lesson-number" aria-label="Lesson {position}">{position}</span>{thumb}<div>'
+            f'<div class="t">{_esc(title)}{current_html}</div>{description_html}{source_html}'
+            f'<div class="s">{len(lesson["steps"])} steps &middot; {human_duration(lesson["duration"])}</div>'
+            '</div></a></li>'
+        )
+
+    groups = []
+    if has_chapters:
+        for index, run in enumerate(runs):
+            opened = any(item["slug"] == current_slug for item in run["lessons"]) if reader else index == 0
+            count = len(run["lessons"])
+            duration = human_duration(sum(item["duration"] for item in run["lessons"]))
+            groups.append(
+                f'<details class="course-chapter" data-chapter-key="{run["key"]}"' + (' open' if opened else '') + '>'
+                f'<summary><span>{run["label"]}</span><span class="chapter-meta">'
+                f'{count} {"lesson" if count == 1 else "lessons"} &middot; {duration}</span></summary>'
+                f'<ol class="lesson-list">{"".join(card(item) for item in run["lessons"])}</ol></details>'
+            )
+    else:
+        groups.append(f'<ol class="lesson-list">{"".join(card(item) for item in lessons)}</ol>')
+
+    course_id = _esc(course.get("id") or course["slug"])
+    return f'''<nav class="course-browser" aria-label="Course lessons" data-course="{course_id}"
+  data-context="{"reader" if reader else "course"}" data-density="{"compact" if reader else "detailed"}">
+  <div class="course-tools" data-course-controls hidden>
+    <label class="course-search-label">Find a lesson<input type="search" data-course-search placeholder="Title, description, or chapter" autocomplete="off"></label>
+    <label class="course-sort-label">Sort view<select data-course-sort><option value="saved">Saved order</option><option value="number">Lesson number</option><option value="title">Title A–Z</option><option value="shortest">Shortest first</option></select></label>
+    <label>Group<select data-course-view><option value="chapters">Chapters</option><option value="flat">All lessons</option></select></label>
+    <label>Rows<select data-course-density><option value="detailed">Detailed</option><option value="compact">Compact</option></select></label>
+  </div>
+  <p class="course-tools-note" data-course-controls hidden>View settings stay in this browser. <a href="../library.html?course={course_id}">Edit reading order in Library</a>.</p>
+  <div class="course-actions" data-course-controls hidden>
+    <span class="course-results" role="status" aria-live="polite"></span>
+    <button type="button" data-course-clear hidden>Clear search</button>
+    <button type="button" data-course-expand>Expand all</button>
+    <button type="button" data-course-collapse>Collapse all</button>
+  </div>
+  <div class="course-groups">{"".join(groups)}</div>
+  <p class="course-empty" hidden>No lessons match your search.</p>
+</nav>'''
+
+
 def render_lesson_page(lesson: dict, course: dict) -> str:
     has_video = bool(lesson.get("video_href"))
     steps_html = "\n".join(_render_step(step, has_video=has_video) for step in lesson["steps"])
@@ -2039,6 +2182,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
             f'<video controls preload="metadata" playsinline '
             f'src="{_esc(lesson["video_href"])}"></video>'
             '<p class="hint">Click a timestamp to jump here, again to pause. '
+            'Press <kbd>v</kbd> to collapse or expand. '
             '<span class="focus-hint">Press <kbd>f</kbd> for a larger view.</span></p>'
             "</div>"
         )
@@ -2057,51 +2201,60 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
             f"<div>{lines}</div></details>"
         )
 
+    neighbours = []
+    course_lessons = course.get("lessons", [])
+    current = next((i for i, item in enumerate(course_lessons) if item["slug"] == lesson["slug"]), None)
+    if current is not None:
+        for index, label in ((current - 1, "Previous"), (current + 1, "Next")):
+            if 0 <= index < len(course_lessons):
+                other = course_lessons[index]
+                neighbours.append(f'<a href="{_esc(other["slug"])}.html">{label}: {_esc(lesson_title(other))}</a>')
+    navigation = '<nav class="lesson-nav" aria-label="Lesson navigation">' + "".join(neighbours) + '</nav>' if neighbours else ""
+    contents = ""
+    if current is not None:
+        chapter = lesson_chapter(lesson)
+        chapter_label = f" &middot; Chapter {chapter}" if chapter is not None else ""
+        contents = (
+            '<details class="course-contents"><summary>Course contents'
+            f'{chapter_label} &middot; Lesson {current + 1} of {len(course_lessons)}</summary>'
+            f'{_course_browser(course, current_slug=lesson["slug"])}</details>'
+        )
+    description = f'<p class="lesson-description">{_esc(lesson_description(lesson))}</p>' if lesson_description(lesson) else ""
     body = f"""<header class="top">
   <div class="crumbs"><a href="../index.html">All courses</a> / <a href="index.html">{_esc(course["title"])}</a></div>
-  <h1>{_esc(lesson["title"])}</h1>
+  <h1>{_esc(lesson_title(lesson))}</h1>
+  {description}
   <div class="meta">{len(lesson["steps"])} steps &middot; {human_duration(lesson["duration"])} of video &middot; {_esc(lesson["source_name"])}<button class="keyhint" type="button" id="keyhint">? keys</button></div>
 </header>
 <div class="wrap">
+  {contents}
   <main>
     {summary_html}
     <div class="progress"></div>
     {steps_html}
     {transcript_html}
+    {navigation}
   </main>
 </div>
 {player}
 {_lightbox()}
 {_shortcut_overlay()}"""
     return _page(
-        lesson["title"], body, depth=1,
+        lesson_title(lesson), body, depth=1,
         lesson_slug=lesson.get("reading_key") or lesson.get("id") or course["slug"] + ":" + lesson["slug"],
-        scripts=(("app.js", SCRIPT),)
+        scripts=(("app.js", SCRIPT), ("course.js", COURSE_SCRIPT))
     )
 
 
 def render_course_page(course: dict) -> str:
-    cards = []
-    for lesson in course["lessons"]:
-        thumb = (
-            f'<img src="{_esc(lesson["poster"])}" alt="" loading="lazy">'
-            if lesson.get("poster")
-            else ""
-        )
-        cards.append(
-            f'<li><a href="{_esc(lesson["slug"])}.html">{thumb}<div>'
-            f'<div class="t">{_esc(lesson["title"])}</div>'
-            f'<div class="s">{len(lesson["steps"])} steps &middot; {human_duration(lesson["duration"])}</div>'
-            f"</div></a></li>"
-        )
     total = sum(lesson["duration"] for lesson in course["lessons"])
     body = f"""<header class="top">
-  <div class="crumbs"><a href="../index.html">All courses</a></div>
+  <div class="crumbs"><a href="../index.html">All courses</a> / <a href="../library.html?course={_esc(course.get('id') or course['slug'])}">Organize course</a></div>
   <h1>{_esc(course["title"])}</h1>
   <div class="meta">{len(course["lessons"])} lessons &middot; {human_duration(total)}</div>
 </header>
-<div class="wrap"><ul class="cards">{"".join(cards)}</ul></div>"""
-    return _page(course["title"], body, depth=1)
+<main class="wrap">{_course_browser(course)}</main>"""
+    return _page(course["title"], body, depth=1, scripts=(("course.js", COURSE_SCRIPT),))
 
 
 def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
@@ -2116,36 +2269,66 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
         )
         total = sum(lesson["duration"] for lesson in lessons)
         cards.append(
-            f'<li><a href="{_esc(course["slug"])}/index.html">{thumb}<div>'
+            f'<li data-course-id="{_esc(course.get("id", ""))}" data-course-slug="{_esc(course["slug"])}" '
+            f'data-course-title="{_esc(course["title"])}"><a class="course-card-main" href="{_esc(course["slug"])}/index.html">{thumb}<div>'
             f'<div class="t">{_esc(course["title"])}</div>'
             f'<div class="s">{len(lessons)} lessons &middot; {human_duration(total)}</div>'
-            f"</div></a></li>"
+            '</div></a><a class="course-activity" href="queue.html" hidden></a></li>'
         )
     meta = note if note and not courses else f"{len(courses)} courses"
-    # Filled in by status.js from status.json, which the builder keeps current.
-    # Static markup so the page is not blank for the length of the first poll.
-    status = """<section class="building" id="build-status" hidden>
-  <h2><a href="queue.html">Task queue</a><span class="count" id="build-count"></span></h2>
-  <ul id="build-list"></ul>
-</section>"""
     body = f"""<header class="top">
-  <div class="crumbs"><a href="upload.html">Manage videos</a> / <a href="queue.html">Task queue</a></div>
+  <div class="crumbs"><a href="library.html">Manage library</a> / <a href="upload.html">Add videos</a> / <a href="queue.html">Task queue</a> / <a href="workers.html">Workers</a></div>
   <h1>Courses</h1>
-  <div class="meta">{_esc(meta)}</div>
+  <div class="meta" id="course-count">{_esc(meta)}</div>
 </header>
-<div class="wrap">{status}<ul class="cards">{"".join(cards)}</ul></div>"""
+<main class="wrap"><ul class="cards" id="course-cards">{"".join(cards)}</ul></main>"""
     return _page("Courses", body, depth=0, scripts=(("status.js", STATUS_SCRIPT),))
+
+
+def _storage_panel() -> str:
+    return """<section class="storage-panel" id="storage-panel" aria-label="Library disk space">
+  <h2>Storage</h2>
+  <div id="storage-locations"></div>
+  <p id="storage-message" class="storage-detail" role="status">Checking available disk space…</p>
+  <p class="storage-note">Capacity is shared by all files on this disk. Processing needs additional space for snapshots and generated media.</p>
+</section>"""
+
+
+def render_library_page() -> str:
+    body = f"""<header class="top">
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="upload.html">Add videos</a> / <a href="queue.html">Task queue</a> / <a href="workers.html">Workers</a></div>
+  <h1>Library</h1>
+  <div class="meta" id="library-count">Loading your courses…</div>
+</header>
+<main class="wrap">
+  {_storage_panel()}
+  <div class="library-toolbar">
+    <label for="library-search">Find a course or lesson<input id="library-search" type="search" placeholder="Title, filename, description, or chapter" autocomplete="off"></label>
+    <label class="library-view-choice">Group lessons<select id="library-group"><option value="chapters">Chapters</option><option value="flat">All lessons</option></select></label>
+    <label class="library-view-choice">Rows<select id="library-density"><option value="detailed">Detailed</option><option value="compact">Compact</option></select></label>
+    <button id="library-refresh" type="button">Refresh</button>
+    <button id="library-sort-courses" type="button" disabled>Sort courses by name</button>
+    <button id="library-reset" type="button" disabled>Use folder order</button>
+  </div>
+  <p class="library-hint">Sorting here saves reading order for everyone. New lessons are added after a custom order; sort again to place them by name.</p>
+  <p id="library-message" class="library-message" role="status" aria-live="polite" hidden></p>
+  <div id="library-courses"></div>
+  <p id="library-empty" hidden></p>
+  <noscript>Enable JavaScript to organize your library.</noscript>
+</main>"""
+    return _page("Library", body, depth=0, scripts=(("library.js", LIBRARY_SCRIPT),))
 
 
 def render_queue_page() -> str:
     body = """<header class="top">
-  <div class="crumbs"><a href="index.html">All courses</a> / <a href="upload.html">Manage videos</a></div>
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="library.html">Manage library</a> / <a href="upload.html">Add videos</a> / <a href="workers.html">Workers</a></div>
   <h1>Task queue</h1>
   <div class="meta">See what's processing and what's coming next. Cancelling keeps your source video.</div>
 </header>
 <main class="wrap">
   <section class="building task-queue" aria-label="Processing queue">
     <p id="queue-summary" class="queue-summary" role="status" aria-live="polite">Loading the queue…</p>
+    <div id="queue-course" class="queue-course" hidden><span id="queue-course-name"></span><button id="queue-all-courses" type="button">Show all courses</button></div>
     <div class="queue-tools">
       <label for="job-filter">Show
         <select id="job-filter">
@@ -2171,13 +2354,37 @@ def render_queue_page() -> str:
     return _page("Task queue", body, depth=0, scripts=(("queue.js", QUEUE_SCRIPT),))
 
 
-def render_upload_page() -> str:
+def render_workers_page() -> str:
     body = """<header class="top">
-  <div class="crumbs"><a href="index.html">All courses</a> / <a href="queue.html">Task queue</a></div>
-  <h1>Videos</h1>
-  <div class="meta">What the builder works from. Anything changed here rebuilds the site.</div>
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="library.html">Manage library</a> / <a href="queue.html">Task queue</a> / <a href="workers.html">Workers</a></div>
+  <h1>Processing workers</h1>
+  <div class="meta">Use your other computers to speed up processing. Your library stays on the server.</div>
+</header>
+<main class="wrap">
+  <div class="worker-tools">
+    <button id="worker-connect" type="button" disabled>Connect a computer</button>
+    <button id="worker-refresh" type="button">Refresh</button>
+    <label for="worker-filter">Show <select id="worker-filter"><option value="current">Current computers</option><option value="connected">Connected computers</option><option value="archived">Archived computers</option><option value="all">All computers including archived</option></select></label>
+  </div>
+  <p id="worker-summary" class="queue-summary" role="status">Loading worker status…</p>
+  <p id="worker-notice" class="queue-notice" role="status" aria-live="polite"></p>
+  <section id="worker-pairing" class="summary" aria-label="Connect a processing helper" hidden></section>
+  <p id="worker-empty" class="summary" hidden>No helpers paired yet. The server continues processing locally. Connect a computer whenever you want extra processing capacity.</p>
+  <ul id="worker-list" aria-label="Processing computers"></ul>
+  <p class="worker-subtle">Contributions count accepted tasks once. A lesson can use several computers. Interrupted attempts are listed separately; processing time is not an estimate of time saved.</p>
+  <noscript>Enable JavaScript to view workers and manage connections.</noscript>
+</main>"""
+    return _page("Processing workers", body, depth=0, scripts=(("workers.js", WORKERS_SCRIPT),))
+
+
+def render_upload_page() -> str:
+    body = f"""<header class="top">
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="library.html">Manage library</a> / <a href="queue.html">Task queue</a> / <a href="workers.html">Workers</a></div>
+  <h1>Add videos</h1>
+  <div class="meta">Upload source videos to a course. Organize titles and lesson order in <a href="library.html">Library</a>.</div>
 </header>
 <div class="wrap">
+  {_storage_panel()}
   <div class="upload">
     <label for="course">Course</label>
     <input type="text" id="course" list="courses" autocomplete="off" spellcheck="false"
@@ -2193,7 +2400,7 @@ def render_upload_page() -> str:
     <p class="message" id="message" hidden></p>
   </div>
   <section class="library" id="library" hidden>
-    <h2>Library</h2>
+    <h2>Source files</h2>
     <p class="hint">Deleting removes the library source. Processing snapshots and previous versions are retained.</p>
     <div id="library-list"></div>
   </section>
@@ -2202,7 +2409,9 @@ def render_upload_page() -> str:
 
 
 def render_lesson_markdown(lesson: dict) -> str:
-    out = [f"# {lesson['title']}", ""]
+    out = [f"# {lesson_title(lesson)}", ""]
+    if lesson_description(lesson):
+        out += [lesson_description(lesson), ""]
     if lesson.get("summary"):
         out += [lesson["summary"], ""]
     if lesson.get("prerequisites"):
@@ -2233,6 +2442,9 @@ def write_assets(site_dir: Path) -> None:
     atomic_write(assets / "status.js", STATUS_SCRIPT)
     atomic_write(assets / "upload.js", UPLOAD_SCRIPT)
     atomic_write(assets / "queue.js", QUEUE_SCRIPT)
+    atomic_write(assets / "library.js", LIBRARY_SCRIPT)
+    atomic_write(assets / "workers.js", WORKERS_SCRIPT)
+    atomic_write(assets / "course.js", COURSE_SCRIPT)
 
 
 def write_placeholder(site_dir: Path, note: str) -> None:
@@ -2247,6 +2459,8 @@ def write_placeholder(site_dir: Path, note: str) -> None:
     atomic_write(site_dir / "index.html", render_root_index([], note=note))
     atomic_write(site_dir / "upload.html", render_upload_page())
     atomic_write(site_dir / "queue.html", render_queue_page())
+    atomic_write(site_dir / "library.html", render_library_page())
+    atomic_write(site_dir / "workers.html", render_workers_page())
 
 
 def _prune_course(course_dir: Path, lessons: set[str]) -> int:
@@ -2333,10 +2547,15 @@ def write_site(
 
     # The root index goes last. Until the pages it links to are on disk, a
     # reader who follows one gets a 404.
+    atomic_write(site_dir / "library.html", render_library_page())
     atomic_write(site_dir / "queue.html", render_queue_page())
     atomic_write(site_dir / "index.html", render_root_index(courses))
+    atomic_write(site_dir / "workers.html", render_workers_page())
     atomic_write(site_dir / "upload.html", render_upload_page())
-    atomic_write(site_dir / "site.json", json.dumps(courses, indent=2))
+    exported_courses = [dict(course, lessons=[
+        dict(lesson, numbering=lesson_numbering(lesson)) for lesson in course["lessons"]
+    ]) for course in courses]
+    atomic_write(site_dir / "site.json", json.dumps(exported_courses, indent=2))
     log(f"site written to {site_dir}")
 
 

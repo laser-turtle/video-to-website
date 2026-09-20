@@ -46,6 +46,11 @@ test:
 	  && node --check status.js && node tests/test_status_js.mjs status.js \
 	  && node --check upload.js && node tests/test_upload_js.mjs upload.js \
 	  && node --check src/video_to_website/assets/queue.js && node tests/test_queue_js.mjs src/video_to_website/assets/queue.js \
+	  && node --check src/video_to_website/assets/progress.js && node tests/test_work_progress_js.mjs src/video_to_website/assets/progress.js \
+	  && node --check src/video_to_website/assets/library.js && node tests/test_library_js.mjs src/video_to_website/assets/library.js \
+	  && node --check src/video_to_website/assets/course.js && node tests/test_course_js.mjs src/video_to_website/assets/course.js \
+	  && node --check src/video_to_website/assets/storage.js && node tests/test_storage_js.mjs src/video_to_website/assets/storage.js \
+	  && node --check src/video_to_website/assets/workers.js && node tests/test_workers_js.mjs src/video_to_website/assets/workers.js \
 	  && rm -f app.js status.js upload.js'
 
 check:

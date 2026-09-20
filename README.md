@@ -4,8 +4,9 @@ Turn tutorial videos into a static website you can read at your own pace: conden
 steps, a screenshot of the expected result after each step, and a click on any step
 jumps the embedded video to that moment.
 
-Built for screen-recorded course videos (Blender, DAWs, IDEs, CAD). Nothing is
-uploaded except the transcript text, and even that is optional.
+Built for screen-recorded course videos (Blender, DAWs, IDEs, CAD). LLM providers
+receive transcript text only, and even that is optional. Paired processing
+helpers receive the audio/video inputs needed for their assigned tasks.
 
 [ROADMAP.md](ROADMAP.md) has what is not built yet, and the decisions behind
 what is.
@@ -16,6 +17,16 @@ media revisions protect published lessons. The upload API and worker run as
 separate NixOS services. [ARCHITECTURE.md](ARCHITECTURE.md) describes commands,
 migration, recovery, storage retention, and the remaining management features.
 The standalone `v2w build` command remains available for one-off static exports.
+
+Optional **distributed workers** let other computers contribute transcription and
+media processing. The server keeps the library and both databases, and falls back
+to local processing when helpers disconnect. The **Workers** page shows connected
+computers, active tasks, controls and contribution history; queue entries show
+where work is running. See [DISTRIBUTED_WORKERS.md](DISTRIBUTED_WORKERS.md) for
+Windows/NVIDIA and macOS setup, limits and recovery behavior.
+Helpers can be downloaded directly from **Workers → Connect a computer** and run
+with Python 3.11+. No Git checkout or pip installation is needed on the helper;
+the page includes a check and setup instructions for native FFmpeg/Whisper tools.
 
 ## What it produces
 
@@ -96,7 +107,7 @@ subscription works with no API key. Pick the model with `--llm-model opus|sonnet
 `V2W_CLAUDE_MODEL`. Note that it deliberately does not pass `--bare`: that flag skips
 keychain reads, which is where a subscription login lives.
 
-Only transcript text is sent, never audio or video. Roughly 8k tokens go out per
+Only transcript text is sent to the LLM provider, never audio or video. Roughly 8k tokens go out per
 30-minute lesson. Server-side refusal fallbacks are enabled by default on the
 `anthropic` backend; turn them off with `--no-llm-fallbacks`.
 
@@ -198,7 +209,8 @@ When the model does not label a step, a keyword scan over the step's own wording
 
 The steps and their screenshots get the full column, because that is what you read. The
 video is reference material, so it lives in a small player floating in the corner that
-starts collapsed and opens by itself the moment you click a timestamp. Its header
+starts collapsed and opens by itself the moment you click a timestamp. Press `v`
+to collapse or reopen it without changing playback. Its header
 collapses it again, and that choice is remembered.
 
 Playback speed steps through 0.75x up to 3x with `,` and `.`, and is remembered under a
@@ -433,18 +445,45 @@ an `index.html` sitting in that directory, then it really is permissions: nginx
 has to be able to traverse `/var/lib/video-to-website` and read `site/`.
 
 **Watching a build from the page.** The builder keeps `status.json` next to the
-site, and the index page polls it every few seconds: each video shows the stage
-it is in, how long it has been there, and a bar across the five per-video
-stages. Copy a file in and it appears within a poll, first as waiting for the
-copy to settle, then working through probe, transcribe, scenes, steps and
-frames. When a build finishes the page reloads itself, so a course that has
-just finished turns up without a manual refresh.
+site, and the index page polls it every few seconds. All courses shows a compact
+processing/waiting/failed count on each affected course card, including courses
+whose first lesson is not ready yet. Click the count to open that course's queue;
+**Show all courses** clears the course filter. The Task queue shows individual
+jobs, retry/cancel controls and measured progress within the current operation:
 
-Whisper is most of the wall time, so a lesson sits on *Transcribing the audio*
-for minutes. That is normal; `journalctl -fu video-to-website` has the detail if
-you want it.
+- Audio extraction and visual analysis show the video time processed.
+- Transcription shows the percentage reported by whisper.cpp. The same progress
+  continues to appear in `journalctl -fu video-to-website`.
+- Instruction writing shows completed transcript sections. With the Anthropic
+  backend it also shows characters arriving from the model; other backends show
+  the section being processed while waiting for their response.
+- Media generation shows illustrated steps, screenshot/clip counts, and progress
+  within the current clip's analysis or encoding.
+
+After enough measured work, a scoped estimate appears—for example, “About 2m left
+for transcription.” Estimates use the rate observed in the current operation;
+they do not predict completion of the entire lesson or queue. Model calls with no
+known output length remain indeterminate. Two minutes without a new progress
+report pauses the estimate until another report arrives.
+
+Copy a file in and it appears after the library settles. When a lesson finishes,
+the home page reloads to show it; the Task queue updates in place.
 
 ### Uploading from a browser
+
+The Library and Add videos pages show free disk space, the free-space buffer,
+space reserved for active transfers, and how much is available for new uploads.
+The browser checks capacity before sending each file. The server independently
+reserves space at admission and rechecks it while receiving data; insufficient
+capacity returns HTTP 507 and leaves the existing source intact.
+
+The default buffer is **1 GiB**. Configure it with
+`services.video-to-website.minFreeGiB = 5` in NixOS, or pass `--min-free-gib 5`
+to `v2w api`, `v2w serve`, or `v2w watch --api-port ...`. This is based on free
+space on the destination filesystem, not a fixed library-size quota. Other files
+on that disk count too. Processing snapshots and generated media need additional
+space after an upload completes; the buffer is configurable working room, not a
+prediction of their final size.
 
 The **Task queue** link on the home and management pages opens `queue.html`.
 It lists every running and waiting lesson, with its course, filename, queue
@@ -473,23 +512,63 @@ spool first.
 
 ### Renaming, reordering and deleting
 
-The same page lists the library underneath. Each course shows its direct-child lessons **in
-the order the builder will take them**, numbered, which is usually enough to
-spot why a course came out in the wrong order -- `4.02 - Reference Board.mp4`
-sorts after `10 - ...` but before `5 - ...` only once you read it as a number.
+Open **Manage library** from the home page, or **Organize course** from a course.
+The Library page lists courses and all their lessons, including nested sources.
+Search by course, filename, displayed title, or lesson description.
 
-*Rename* edits the filename in place, which currently controls lesson order.
-The generated title remains the model-authored title. The durable service keeps
-lesson identity, published media, reading state, and reusable caches across the
-rename. Explicit ordering and editable titles are planned.
+Lesson titles default to the source filename without its extension, retaining
+prefixes such as `4.02 - Reference Board`. The generated title appears underneath
+as a short description. Course lessons list vertically, with collapsible chapters
+inferred from leading numbers such as `4.01`, `4-02`, `4_03`, or
+`Chapter 4 - Lesson 2`. Numbered title overrides take precedence; unnumbered renames
+fall back to the source filename. Embedded version numbers and full date prefixes
+are ignored. Unnumbered lessons stay available under **Other lessons**. Groups
+preserve the saved sequence; a later return to a chapter is marked **continued**.
 
-*Delete* takes two clicks and removes the original library file; there is no
+Use **Find a lesson** to search titles, generated descriptions, original filenames,
+and chapter numbers. Search opens matching chapters temporarily; clearing it
+restores their previous state. **Expand all / Collapse all**, **Chapters / All
+lessons**, and **Detailed / Compact** rows help with longer courses. **Sort view**
+offers saved order, lesson number, title, or shortest first. These preferences stay
+in this browser per course and do not edit the library's reading order.
+
+The reader has a collapsible **Course contents** menu with the same controls and
+the current lesson highlighted and its chapter open. It starts with compact rows;
+its row density is remembered separately from the course index. Previous/next
+links always follow the saved order. Chapters and lesson links also work in static
+exports without JavaScript. These are viewing changes: existing videos do not need
+to be reprocessed.
+
+Use **Rename** to edit a course or lesson's displayed title. These edits preserve
+source filenames, URLs, reading state, and cached processing results. **Use
+filename** removes a lesson-title override. Use the up/down controls or **Move
+to…** to arrange courses and lessons; **Reset to source order** restores a course's
+natural folder/filename order, and **Use folder order** resets course order. New imports
+append after a saved custom order. Clear a search before reordering so hidden
+items cannot be accidentally displaced.
+
+Library management also has chapter groups, expand/collapse controls, and compact
+rows. These view preferences are remembered in this browser. Under each course,
+choose **Sort lessons**, then **Save sorted order** to update its reading order
+for everyone, including Previous/Next in the reader. **Name (smart numbering)**
+uses the same chapter/lesson prefix rules as the reader and sorts `4.2` before
+`4.10`, even when separators differ; unnumbered names follow in natural order.
+Other choices are displayed title, original filename (across subfolders), shortest
+first, and longest first. Unknown durations go last in either direction; ties keep
+their existing order. **Sort courses by name** applies natural title order to the
+course list. Sorting includes unpublished lessons too, and can be reapplied after
+an out-of-order upload. Selecting a method alone does not change anything; saving
+uses the catalog revision to guard against concurrent library edits.
+
+Metadata edits update published pages immediately, independently of the media
+worker. They do not create processing jobs. Concurrent edits and imports are
+checked against the revision loaded by the page; a stale edit asks you to refresh
+instead of overwriting someone else's organization.
+
+The Add videos page retains **Rename file** and **Delete** for direct-child source
+files. Delete takes two clicks and removes the original library file; there is no
 restore action yet. Reconciliation removes its current page and navigation entry.
-Stage caches, historical media revisions, and processing snapshots are retained.
-
-Only videos sitting directly in a course folder are listed. Ones nested deeper
-still build -- they are flattened into the same lesson list -- but they are not
-something this page can meaningfully rename.
+Stage caches, historical revisions, and processing snapshots are retained.
 
 **There is no authentication.** Anyone who can reach the site can add a course
 or replace a lesson -- or now delete one. That is the right trade on a home
@@ -519,7 +598,7 @@ its execution history. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
 Each lesson has an independent DBOS workflow. Completed stages are checkpointed;
 a restart recovers interrupted workflows, while a repeatedly crashing workflow is
 limited to three recovery attempts. Retryable network/API failures get bounded
-step retries. Other processing errors remain visible on the home page with Retry,
+step retries. Other processing errors remain visible in the Task queue with Retry,
 and the worker continues to later lessons.
 
 Rebuilding a lesson creates a new media revision. Its previous revision remains

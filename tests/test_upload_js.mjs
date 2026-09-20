@@ -73,6 +73,7 @@ let libraryPayload = {
   ],
 };
 let apiOk = true;
+let availableSpace = 8 * 1024 ** 3;
 let mutationError = null;
 const apiCalls = [];
 const fakeFetch = (url, init) => {
@@ -80,6 +81,12 @@ const fakeFetch = (url, init) => {
   apiCalls.push({ method, url, body: init && init.body });
   if (!apiOk) {
     return Promise.resolve({ ok: false, status: 503, json: () => Promise.reject(new Error('nope')) });
+  }
+  if (url.startsWith('api/storage') && apiOk) {
+    const storage = {id: 'library', label: 'Library', filesystem_id: 'disk', total_bytes: 100 * 1024 ** 3,
+      free_bytes: availableSpace + 1024 ** 3, used_bytes: 0, buffer_bytes: 1024 ** 3,
+      reserved_bytes: 0, available_bytes: availableSpace, max_upload_bytes: 16 * 1024 ** 3, accepting_uploads: availableSpace > 0};
+    return Promise.resolve({ok: true, status: 200, json: () => Promise.resolve({locations: [storage], destination: storage})});
   }
   if (method === 'GET') {
     return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(libraryPayload) });
@@ -136,7 +143,7 @@ assert.deepEqual(list.children.map((o) => o.value), ['course_a', 'course_b'],
 assert.equal(library.hidden, false, 'the library section shows');
 assert.equal(libraryList.children.length, 2, 'one box per course');
 assert.equal(libraryList.children[0].children[0].textContent, 'course_a');
-assert.ok(libraryList.children[0].children[1].textContent.includes('build in this order'),
+assert.ok(libraryList.children[0].children[1].textContent.includes('reading order in Library'),
   'and says why the order matters');
 assert.deepEqual(rows().map((r) => r.children[0].textContent), ['1.', '2.', '1.'],
   'lessons are numbered within their course');
@@ -145,6 +152,7 @@ assert.ok(rows()[1].children[1].textContent.includes('4.02'), 'and named');
 // 3. Nothing uploads without somewhere to put it.
 picker.files = [file('a.mp4', 1048576)];
 picker.fire('change');
+await flush();
 assert.equal(sent.length, 0, 'no course name means no upload');
 assert.ok(message.textContent.includes('name'), 'and it says why');
 assert.equal(message.className, 'message bad');
@@ -154,6 +162,7 @@ assert.ok(course.focused, 'and puts the cursor where the fix is');
 course.value = 'cgboost launch pad 2';
 picker.files = [file('01 car body.mp4', 2147483648), file('02 wheels.mp4', 1048576)];
 picker.fire('change');
+await flush();
 assert.equal(sent.length, 1, 'only the first upload starts');
 assert.equal(queue.children.length, 2, 'but both are listed');
 assert.equal(sent[0].method, 'PUT');
@@ -170,6 +179,7 @@ assert.ok(firstRow.children[1].textContent.includes('50%'));
 
 // 6. Finishing one starts the next, and only then.
 sent[0].finish(201);
+await flush();
 assert.equal(sent.length, 2, 'the second upload follows the first');
 assert.ok(firstRow.children[1].textContent.includes('uploaded to cgboost launch pad 2'));
 
@@ -182,6 +192,7 @@ const again = secondRow.children.find((c) => c.className === 'again');
 assert.ok(again, 'and a way to go ahead anyway');
 
 again.click();
+await flush();
 assert.equal(sent.length, 3, 'which retries');
 assert.ok(sent[2].url.endsWith('?overwrite=1'), 'this time saying to overwrite');
 assert.equal(secondRow.className, '', 'and the row stops looking failed');
@@ -192,6 +203,7 @@ assert.ok(message.textContent.includes('builder'), 'finishing points at the home
 course.value = 'c';
 picker.files = [file('x.mp4', 10)];
 picker.fire('change');
+await flush();
 sent[3].fire('error');
 assert.equal(queue.children[2].className, 'failed');
 assert.ok(queue.children[2].textContent.includes('connection'));
@@ -205,7 +217,7 @@ assert.ok(!drop.classes.has('over'));
 // 10. Renaming asks the server to move the file, which is how ordering is fixed.
 apiCalls.length = 0;
 const target = rows()[1];
-buttonIn(target, 'Rename').click();
+buttonIn(target, 'Rename file').click();
 const input = target.children[1].children[0];
 assert.equal(input.tagName, 'input', 'the name turns into a field');
 assert.equal(input.value, '4.02 - reference board.mp4', 'pre-filled with the current name');
@@ -237,7 +249,7 @@ assert.equal(deleted.url, 'api/library/course_a/01%20intro.mp4');
 // 12. A refused change says why and leaves the row alone.
 mutationError = 'course_a/taken.mp4 is already there';
 const clash = rows()[0];
-buttonIn(clash, 'Rename').click();
+buttonIn(clash, 'Rename file').click();
 clash.children[1].children[0].value = 'taken.mp4';
 buttonIn(clash, 'Save').click();
 await flush();
@@ -253,10 +265,13 @@ const rowStart = queue.children.length;
 course.value = 'course';
 picker.files = [file('existing.mp4', 100), file('next.mp4', 100)];
 picker.fire('change');
+await flush();
 sent[requestStart].finish(409);
+await flush();
 queue.children[rowStart].children.find(c => c.className === 'again').click();
 assert.equal(sent.length, requestStart + 2, 'replacement is queued behind the next file');
 sent[requestStart + 1].finish(201);
+await flush();
 assert.equal(sent.length, requestStart + 3, 'replacement starts when the active file finishes');
 let guarded = false;
 fakeWindow.listeners.beforeunload({preventDefault() { guarded = true; }});
@@ -264,6 +279,19 @@ assert.equal(guarded, true, 'replacement is included in the navigation guard');
 sent[requestStart + 2].finish(201);
 await flush(); await flush();
 assert.equal(message.hidden, false, 'library refresh preserves the outcome message');
+
+// Insufficient space is rejected before an XHR sends any video bytes.
+const beforeCapacityCheck = sent.length;
+availableSpace = 5;
+picker.files = [file('too-large.mp4', 10)];
+picker.fire('change'); await flush();
+assert.equal(sent.length, beforeCapacityCheck, 'no transfer starts when preflight fails');
+const rejected = queue.children[queue.children.length - 1];
+assert.ok(rejected.textContent.includes('Not enough disk space'));
+availableSpace = 100;
+rejected.children.find(c => c.className === 'again').click(); await flush();
+assert.equal(sent.length, beforeCapacityCheck + 1, 'retry checks the newly available space');
+sent[sent.length - 1].finish(201); await flush();
 
 // 13. A site with no API behind it says so rather than failing silently.
 apiOk = false;

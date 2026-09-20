@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .util import title_from_filename
+from .work_progress import progress_snapshot
 
 STATUS_NAME = "status.json"
 
@@ -84,9 +85,16 @@ class Progress:
         if self.current is None:
             return
         self.current["stage"] = name
+        self.current["stage_started"] = time.time()
+        self.current["progress"] = None
         self.current["label"] = STAGE_LABELS.get(name, name)
         self.current["step"] = self.stages.index(name) + 1 if name in self.stages else 0
         self.write()
+
+    def detail(self, payload: dict) -> None:
+        if self.current is not None:
+            self.current["progress"] = payload
+            self.write()
 
     def finish(self, state: str = "done") -> None:
         if self.current is not None:
@@ -133,7 +141,9 @@ class Progress:
         for video in self.videos:
             entry = dict(video)
             if entry["started"] and entry["state"] == "working":
-                entry["elapsed"] = round(now - entry["started"], 1)
+                entry["elapsed"] = round(now - (entry.get("stage_started") or entry["started"]), 1)
+                if entry.get("progress"):
+                    entry["progress"] = progress_snapshot(entry["progress"], now=now)
             videos.append(entry)
         return {
             "updated": now,

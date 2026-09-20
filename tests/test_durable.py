@@ -228,6 +228,30 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(len(worker.catalog.published_courses()[0]["lessons"]), 1)
 
+    def test_live_transcription_progress_is_visible_before_stage_finishes(self):
+        entered = threading.Event()
+        release = threading.Event()
+        segments = self.transcribe.return_value
+
+        def slow_transcribe(*args, **kwargs):
+            whisper._report_progress("whisper_print_progress_callback: progress = 25%")
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("progress test gate timed out")
+            return segments
+
+        self.transcribe.side_effect = slow_transcribe
+        with DurableWorker(self.library, self.options, self.root / "state") as worker:
+            try:
+                self.wait(worker, entered.is_set)
+                status = worker.catalog.status()["videos"][0]
+                self.assertEqual(status["state"], "working")
+                self.assertEqual(status["progress"]["fraction"], .25)
+                self.assertEqual(status["progress"]["phase"], "speech")
+            finally:
+                release.set()
+            self.wait(worker, lambda: bool(worker.catalog.published_courses()))
+
     def test_stopping_an_active_media_step_leaves_it_recoverable(self):
         entered = threading.Event()
 

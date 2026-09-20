@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -16,8 +17,12 @@ from dbos import DBOS, SetWorkflowID
 
 from . import render, whisper
 from .catalog import PIPELINE_VERSION, Catalog
+from .compute import compute_with
+from .distributed import LLM_SLOT, PREPARE_SLOT, ComputeExecutor, acquire
 from .llm import LLMError, make_backend
 from .pipeline import BuildOptions, process_video
+from .publication import refresh_site
+from .storage import DEFAULT_BUFFER
 from .util import (
     BuildCancelled,
     atomic_write,
@@ -28,6 +33,8 @@ from .util import (
     process_control,
     warn,
 )
+from .work_progress import report_work, track_work
+from .worker_store import WorkerStore
 
 QUEUE = "lessons"
 _stopping = threading.Event()
@@ -42,6 +49,10 @@ def serialize_options(options: BuildOptions) -> dict:
     result["out"] = str(options.out.resolve())
     result["work"] = str((options.work or options.out / ".work").resolve())
     result["force"] = sorted(options.force)
+    # Legacy CPU assets are valid under the default automatic policy. Adding
+    # helper support alone must not change every existing lesson's build intent.
+    if result["clip_encoder"] == "auto":
+        result.pop("clip_encoder")
     return result
 
 
@@ -114,46 +125,9 @@ class LazyBackend:
         self.name, self.model, self.fallbacks = name, model, fallbacks
 
     def complete(self, system, user):
-        return make_backend(self.name, self.model, fallbacks=self.fallbacks).complete(
-            system, user
-        )
-
-
-def refresh_site(catalog: Catalog, out: Path, *, markdown=True):
-    """Materialize catalog state. Caller holds the catalog's publication lock."""
-    courses = catalog.published_courses()
-    render.write_site(out, courses, write_markdown=markdown)
-    # Only remove pages previously owned by this catalog. Legacy pages and
-    # immutable revisions are retained for open readers and manual migration.
-    manifest = out / ".catalog-pages.json"
-    try:
-        previous = set(json.loads(manifest.read_text()))
-    except (OSError, ValueError):
-        previous = set()
-    current = {f"{course['slug']}/index.html" for course in courses}
-    current |= {
-        f"{course['slug']}/{lesson['slug']}.html"
-        for course in courses
-        for lesson in course["lessons"]
-    }
-    for name in previous - current:
-        target = out / name
-        if target.resolve().is_relative_to(out.resolve()):
-            target.unlink(missing_ok=True)
-    atomic_write(manifest, json.dumps(sorted(current)))
-    with catalog.connect() as db:
-        previous_hash = db.execute(
-            "SELECT value FROM settings WHERE key='publication_hash'"
-        ).fetchone()
-        current_hash = digest_json(courses)
-        if previous_hash is None or previous_hash[0] != current_hash:
-            db.execute(
-                "INSERT OR REPLACE INTO settings VALUES ('publication_hash',?)",
-                (current_hash,),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO settings VALUES ('publication_at',?)",
-                (str(time.time()),),
+        with acquire(LLM_SLOT):
+            return make_backend(self.name, self.model, fallbacks=self.fallbacks).complete(
+                system, user
             )
 
 
@@ -217,6 +191,8 @@ def retryable(exc: BaseException) -> bool:
 
 @DBOS.workflow(name="v2w.lesson.v1", max_recovery_attempts=3)
 def lesson_workflow(spec: dict) -> str:
+    digest_cache = {}
+
     def stage(name, function):
         def execute():
             stopping = _stopping
@@ -230,8 +206,15 @@ def lesson_workflow(spec: dict) -> str:
             check()
             catalog.update_build(spec["build_id"], "running", stage=name)
             try:
-                with process_control(check):
-                    result = function()
+                executor = ComputeExecutor(catalog, spec["build_id"], name, digest_cache=digest_cache,
+                    source_directory=Path(spec["options"]["out"]) / "_sources" / spec["digest"], source_digest=spec["digest"])
+                with process_control(check), compute_with(executor), track_work(lambda payload: catalog.update_progress(spec["build_id"], name, payload)):
+                    report_work("starting", "Starting this stage", estimate=False)
+                    if name == "prepare":
+                        with acquire(PREPARE_SLOT):
+                            result = function()
+                    else:
+                        result = function()
                     check()
                     return result
             except SystemExit as exc:
@@ -298,6 +281,10 @@ class DurableWorker:
         self.serialized = serialize_options(options)
         self.seen = self.reconciled = None
         self.last_publication = None
+        self.workers = WorkerStore(self.catalog)
+        self.concurrency = 1
+        self.next_worker_cleanup = 0
+        self.heartbeat_thread = None
 
     def __enter__(self):
         global _stopping
@@ -317,8 +304,21 @@ class DurableWorker:
                     "log_level": "WARNING",
                 }
             )
+            # Launch can immediately resume workflows. Retire the previous
+            # process's local assignments first, so startup cleanup cannot
+            # invalidate a fresh attempt created by recovery.
+            self.workers.server_heartbeat()
+            self.workers.expire(restart=True)
             DBOS.launch()
             DBOS.register_queue(QUEUE, worker_concurrency=1, polling_interval_sec=0.2)
+            def heartbeat():
+                while not self.stopping.wait(5):
+                    try:
+                        self.workers.server_heartbeat()
+                    except (OSError, sqlite3.Error) as exc:
+                        warn(f"Could not record the server heartbeat: {exc}")
+            self.heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name="v2w-server-heartbeat")
+            self.heartbeat_thread.start()
             # Repair a crash between the catalog commit and writing public pages.
             if self.catalog.rows("SELECT 1 FROM lessons LIMIT 1"):
                 with self.catalog.lock():
@@ -331,12 +331,24 @@ class DurableWorker:
                 )
             return self
         except BaseException:
+            self.stopping.set()
+            if self.heartbeat_thread:
+                self.heartbeat_thread.join(timeout=1)
             self.lock.__exit__(None, None, None)
             raise
 
     def tick(self, *, scan=True):
         from .cli import _library_state
 
+        self.workers.server_heartbeat()
+        self.workers.expire()
+        if time.monotonic() >= self.next_worker_cleanup:
+            self.workers.cleanup()
+            self.next_worker_cleanup = time.monotonic() + 60
+        concurrency = min(4, 1 + len(self.workers.available()))
+        if concurrency != self.concurrency:
+            DBOS.retrieve_queue(QUEUE).set_worker_concurrency(concurrency)
+            self.concurrency = concurrency
         if scan:
             state = _library_state(self.library)
             if state == self.seen and state != self.reconciled:
@@ -384,6 +396,8 @@ class DurableWorker:
 
     def __exit__(self, *exc):
         self.stopping.set()
+        if self.heartbeat_thread:
+            self.heartbeat_thread.join(timeout=1)
         try:
             DBOS.destroy(workflow_completion_timeout_sec=5)
         finally:
@@ -398,13 +412,16 @@ def watch(
     interval: float,
     api_port=None,
     api_bind="127.0.0.1",
+    min_free_bytes=DEFAULT_BUFFER,
 ):
     with DurableWorker(library, options, state) as worker:
+        with worker.catalog.connect() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES('min_free_bytes',?)", (str(min_free_bytes),))
         if api_port:
             from .cli import _start_api
 
             _start_api(
-                library.resolve(), api_bind, api_port, options.work, worker.catalog
+                library.resolve(), api_bind, api_port, options.work, worker.catalog, min_free_bytes
             )
         log(f"watching {library}; SQLite state in {state}; DBOS lesson worker ready")
         next_scan = 0

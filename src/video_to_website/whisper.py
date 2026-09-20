@@ -5,11 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
+from .compute import operation
 
 from .util import CommandError, die, log, run, warn, which_or_die
+from .work_progress import report_work
+
+_PROGRESS_RE = re.compile(r"whisper_print_progress_callback:\s*progress\s*=\s*(\d+)%")
+
+
+def _report_progress(line: str) -> None:
+    match = _PROGRESS_RE.search(line)
+    if match and 0 <= int(match[1]) <= 100:
+        report_work("speech", "Transcribing audio", completed=int(match[1]), total=100, unit="percent")
 
 HF_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin"
 
@@ -139,7 +150,7 @@ def fetch_model(name: str, *, dest_dir: Path | None = None) -> Path:
 
 def _parse_whisper_json(path: Path) -> list[dict]:
     """whisper.cpp JSON -> [{start, end, text}] with times in seconds."""
-    blob = json.loads(path.read_text())
+    blob = json.loads(path.read_text(encoding="utf-8"))
     segments: list[dict] = []
     for item in blob.get("transcription", []):
         offsets = item.get("offsets") or {}
@@ -155,6 +166,7 @@ def _parse_whisper_json(path: Path) -> list[dict]:
     return segments
 
 
+@operation("transcribe", source="audio", output="out_prefix")
 def transcribe(
     audio: Path,
     model_path: Path,
@@ -185,8 +197,10 @@ def transcribe(
     cmd += extra_args or []
 
     try:
+        report_work("speech", "Transcribing audio", completed=0, total=100, unit="percent",
+                    detail="Loading the model; waiting for the first progress report")
         # stderr streams through: transcription is the slow stage and progress helps.
-        run(cmd, capture_stdout=True, capture_stderr=False)
+        run(cmd, capture_stdout=True, capture_stderr=False, on_stderr=_report_progress, tee_stderr=True)
     except CommandError as exc:
         raise CommandError(f"whisper.cpp failed.\n  {exc}") from exc
 
@@ -198,6 +212,7 @@ def transcribe(
         raise CommandError(f"whisper.cpp produced no JSON at {json_path}")
 
     segments = _parse_whisper_json(json_path)
+    report_work("speech", "Transcribing audio", completed=100, total=100, unit="percent")
     if not segments:
         warn(f"no speech found in {audio.name}")
     return segments

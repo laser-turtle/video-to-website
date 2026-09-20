@@ -792,13 +792,19 @@ class RenderTests(unittest.TestCase):
 
     def test_markdown_export(self):
         text = render.render_lesson_markdown(self.lesson)
-        self.assertIn("# Lesson One", text)
+        self.assertIn("# 01\n\nLesson One", text)
         self.assertIn("## 1. Delete the <default> cube", text)
         self.assertIn("`0:12`", text)
 
     def test_indexes_render(self):
         self.assertIn("A Course", render.render_course_page(self.course))
-        self.assertIn("course/index.html", render.render_root_index([self.course]))
+        page = render.render_root_index([dict(self.course, id="stable-course")])
+        self.assertIn("course/index.html", page)
+        self.assertIn('data-course-id="stable-course"', page)
+        self.assertIn('data-course-slug="course"', page)
+        self.assertIn('class="course-activity" href="queue.html" hidden', page)
+        self.assertNotIn('id="build-list"', page)
+        self.assertNotIn('id="build-status"', page)
 
     def test_placeholder_index_explains_an_empty_site(self):
         """Without this the server answers an unbuilt site with a bare 403."""
@@ -940,6 +946,25 @@ class SafeComponentTests(unittest.TestCase):
     def test_ordinary_names_come_through_intact(self):
         self.assertEqual(ingest.safe_component("01_car_body.mp4"), "01_car_body.mp4")
         self.assertEqual(ingest.safe_component("Lesson 3 - Wheels.mp4"), "Lesson 3 - Wheels.mp4")
+        self.assertEqual(ingest.safe_component("_ Café 日本語.mp4"), "_ Café 日本語.mp4")
+
+    def test_invisible_download_markers_do_not_become_underscores(self):
+        expected = "4.08 - Car Body - Base Shape.mp4"
+        for name in [
+            "\ufe0f " + expected,
+            "%EF%B8%8F%20" + expected,
+            " \ufeff\u200b\ufe0f " + expected,
+            "\u200e" + expected + "\u200f",
+            expected + "\U000e0100",
+            "4.08 - Car\u200b Body - Base Shape.mp4",
+        ]:
+            with self.subTest(name=name):
+                self.assertEqual(ingest.safe_component(name), expected)
+
+    def test_invisible_markers_do_not_bypass_path_validation(self):
+        for name in ["\ufe0f", "\ufeff \u200b", "\ufe0f ..", "\u200b..%2fetc", "\ufe0f..\\etc"]:
+            with self.subTest(name=name):
+                self.assertIsNone(ingest.safe_component(name))
 
     def test_url_encoding_is_undone_before_checking(self):
         self.assertIsNone(ingest.safe_component("..%2f..%2fetc"))
@@ -1018,6 +1043,24 @@ class UploadServerTests(unittest.TestCase):
         self.assertEqual(payload["bytes"], 6)
         landed = self.library / "my_course" / "lesson_one.mp4"
         self.assertEqual(landed.read_bytes(), b"abc123")
+
+    def test_invisible_prefix_is_removed_and_name_collisions_are_refused(self):
+        path = "/api/library/course/%EF%B8%8F%204.08%20-%20Car%20Body.mp4"
+        status, payload = self.put(path, b"original")
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["name"], "4.08 - Car Body.mp4")
+        landed = self.library / "course" / payload["name"]
+        self.assertEqual(landed.read_bytes(), b"original")
+        status, _ = self.put("/api/library/course/4.08%20-%20Car%20Body.mp4", b"replacement")
+        self.assertEqual(status, 409)
+        self.assertEqual(landed.read_bytes(), b"original")
+
+    def test_existing_invisible_names_are_still_looked_up_exactly(self):
+        self.lesson("course", "\ufe0f source.mp4", b"imported")
+        self.lesson("course", "source.mp4", b"other")
+        status, _ = self.request("DELETE", "/api/library/course/%EF%B8%8F%20source.mp4")
+        self.assertEqual(status, 200)
+        self.assertEqual((self.library / "course" / "source.mp4").read_bytes(), b"other")
 
     def test_nothing_partial_is_left_behind(self):
         self.put("/api/library/my_course/lesson_one.mp4")
