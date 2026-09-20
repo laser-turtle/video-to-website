@@ -7,6 +7,9 @@ jumps the embedded video to that moment.
 Built for screen-recorded course videos (Blender, DAWs, IDEs, CAD). Nothing is
 uploaded except the transcript text, and even that is optional.
 
+[ROADMAP.md](ROADMAP.md) has what is not built yet, and the decisions behind
+what is.
+
 ## What it produces
 
 For every video, one page containing:
