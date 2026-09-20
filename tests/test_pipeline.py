@@ -816,6 +816,102 @@ class RenderTests(unittest.TestCase):
         self.assertIn("1 courses", html)
 
 
+class RetryDelayTests(unittest.TestCase):
+    def delay(self, failures, interval=30.0):
+        from video_to_website.cli import _retry_delay
+
+        return _retry_delay(failures, interval)
+
+    def test_it_backs_off_rather_than_hammering(self):
+        self.assertEqual(self.delay(1), 60.0)
+        self.assertEqual(self.delay(2), 120.0)
+        self.assertEqual(self.delay(3), 240.0)
+
+    def test_it_stops_at_an_hour(self):
+        self.assertEqual(self.delay(50), 3600.0)
+
+    def test_it_always_waits_at_least_one_gap(self):
+        """A retry on the very next poll is the thing being avoided."""
+        self.assertGreater(self.delay(0), 30.0)
+
+
+class PruneTests(unittest.TestCase):
+    """Renaming a course must not leave the old one on the site forever."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.site = Path(self.tmp.name) / "site"
+        for course, lessons in [("old-course", ["one", "two"]), ("keeper", ["three"])]:
+            base = self.site / course
+            (base / "md").mkdir(parents=True)
+            (base / "videos").mkdir(parents=True)
+            (base / "index.html").write_text("course")
+            for lesson in lessons:
+                (base / f"{lesson}.html").write_text("lesson")
+                (base / "md" / f"{lesson}.md").write_text("lesson")
+                (base / "videos" / f"{lesson}.mp4").write_text("video")
+                for kind in ("frames", "clips"):
+                    (base / kind / lesson).mkdir(parents=True)
+                    (base / kind / lesson / "a.jpg").write_text("asset")
+        (self.site / "assets").mkdir()
+        (self.site / "assets" / "app.js").write_text("js")
+        (self.site / ".work").mkdir()
+        (self.site / ".work" / "cache.json").write_text("{}")
+        (self.site / "index.html").write_text("root")
+
+    def test_a_course_the_library_no_longer_has_is_removed(self):
+        render.prune_site(self.site, {"keeper": {"three"}})
+        self.assertFalse((self.site / "old-course").exists())
+        self.assertTrue((self.site / "keeper" / "three.html").exists())
+
+    def test_the_cache_and_assets_are_left_alone(self):
+        """Pruning walks the output tree, and .work is not output."""
+        render.prune_site(self.site, {})
+        self.assertTrue((self.site / ".work" / "cache.json").exists())
+        self.assertTrue((self.site / "assets" / "app.js").exists())
+        self.assertTrue((self.site / "index.html").exists())
+
+    def test_a_removed_lesson_takes_its_assets_with_it(self):
+        render.prune_site(self.site, {"old-course": {"one"}, "keeper": {"three"}})
+        base = self.site / "old-course"
+        self.assertTrue((base / "one.html").exists())
+        self.assertFalse((base / "two.html").exists())
+        self.assertFalse((base / "md" / "two.md").exists())
+        self.assertFalse((base / "frames" / "two").exists())
+        self.assertFalse((base / "clips" / "two").exists())
+        self.assertFalse((base / "videos" / "two.mp4").exists())
+        self.assertTrue((base / "frames" / "one" / "a.jpg").exists())
+        self.assertTrue((base / "index.html").exists())
+
+    def test_a_course_that_failed_this_time_keeps_its_pages(self):
+        """`keep` is what the build looked at, not what it managed to render."""
+        render.write_site(self.site, [], keep={"old-course": {"one", "two"}, "keeper": {"three"}})
+        self.assertTrue((self.site / "old-course" / "one.html").exists())
+        self.assertTrue((self.site / "keeper" / "three.html").exists())
+
+    def test_nothing_is_pruned_unless_asked(self):
+        render.write_site(self.site, [])
+        self.assertTrue((self.site / "old-course").exists())
+
+    def test_this_builds_own_output_is_never_pruned(self):
+        """A bug in the bookkeeping must not delete what was just written."""
+        course = {
+            "slug": "fresh",
+            "title": "Fresh",
+            "lessons": [
+                {
+                    "slug": "lesson-a", "title": "A", "duration": 10.0, "steps": [],
+                    "summary": "", "prerequisites": [], "poster": None,
+                    "video_href": None, "source_name": "a.mp4",
+                }
+            ],
+        }
+        render.write_site(self.site, [course], keep={})
+        self.assertTrue((self.site / "fresh" / "lesson-a.html").exists())
+        self.assertFalse((self.site / "old-course").exists())
+
+
 class SafeComponentTests(unittest.TestCase):
     """Every upload name arrives from a browser, so this is the boundary."""
 
@@ -1039,6 +1135,32 @@ class ProgressTests(unittest.TestCase):
         self.assertGreater(after["built"], before)
         self.assertFalse(after["building"])
         self.assertEqual([v["state"] for v in after["videos"]], ["done", "done"])
+
+    def test_a_failed_build_does_not_move_the_stamp(self):
+        """Otherwise every open page reloads to show the same pages as before."""
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        p.finish_build()
+        good = self.status()["built"]
+        p.plan(self.courses)
+        p.start(Path("/lib/car_body.mp4"))
+        p.fail_build("the API returned 529", retry_in=60)
+        after = self.status()
+        self.assertEqual(after["built"], good)
+        self.assertFalse(after["building"])
+        self.assertEqual(after["error"], "the API returned 529")
+        self.assertEqual(after["retry_in"], 60)
+        self.assertEqual(after["videos"][0]["state"], "failed")
+        # The one that never started is still owed a run.
+        self.assertEqual(after["videos"][1]["state"], "queued")
+
+    def test_a_new_build_clears_the_last_failure(self):
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        p.fail_build("boom", retry_in=30)
+        p.plan(self.courses)
+        self.assertIsNone(self.status()["error"])
+        self.assertIsNone(self.status()["retry_in"])
 
     def test_the_stamp_survives_a_restart(self):
         """Otherwise every service restart reloads every open browser."""

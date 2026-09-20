@@ -1360,6 +1360,25 @@ STATUS_SCRIPT = """\
     return li;
   }
 
+  function errorRow(data) {
+    var li = document.createElement('li');
+    li.className = 'failed';
+    var title = document.createElement('div');
+    title.className = 't';
+    var dot = document.createElement('span');
+    dot.className = 'dot';
+    title.appendChild(dot);
+    title.appendChild(document.createTextNode('Build stopped'));
+    var sub = document.createElement('div');
+    sub.className = 's';
+    sub.textContent = data.retry_in
+      ? data.error + ' \u00b7 retrying in ' + elapsed(data.retry_in)
+      : data.error;
+    li.appendChild(title);
+    li.appendChild(sub);
+    return li;
+  }
+
   function render(data) {
     var videos = data.videos || [];
     var active = videos.filter(function (v) { return v.state === 'working'; });
@@ -1368,9 +1387,12 @@ STATUS_SCRIPT = """\
     var done = videos.filter(function (v) { return v.state === 'done' || v.state === 'skipped'; });
 
     var shown = active.concat(failed, queued.slice(0, QUEUE_SHOWN));
-    if (!shown.length) { panel.hidden = true; return; }
+    if (!shown.length && !data.error) { panel.hidden = true; return; }
 
     list.textContent = '';
+    // A build that stopped part way is the one thing worth saying out loud:
+    // the pages on disk are last build's, and nothing else on the page says so.
+    if (data.error) { list.appendChild(errorRow(data)); }
     shown.forEach(function (entry) { list.appendChild(row(entry)); });
 
     var hidden = queued.length - Math.min(queued.length, QUEUE_SHOWN);
@@ -1975,11 +1997,65 @@ def write_placeholder(site_dir: Path, note: str) -> None:
     (site_dir / "upload.html").write_text(render_upload_page())
 
 
-def write_site(site_dir: Path, courses: list[dict], *, write_markdown: bool = True) -> None:
+def _prune_course(course_dir: Path, lessons: set[str]) -> int:
+    removed = 0
+    for page in course_dir.glob("*.html"):
+        if page.name != "index.html" and page.stem not in lessons:
+            page.unlink()
+            removed += 1
+    md_dir = course_dir / "md"
+    if md_dir.is_dir():
+        for doc in md_dir.glob("*.md"):
+            if doc.stem not in lessons:
+                doc.unlink()
+                removed += 1
+    for kind in ("frames", "clips"):
+        parent = course_dir / kind
+        if parent.is_dir():
+            for sub in parent.iterdir():
+                if sub.is_dir() and sub.name not in lessons:
+                    shutil.rmtree(sub)
+                    removed += 1
+    videos = course_dir / "videos"
+    if videos.is_dir():
+        for item in videos.iterdir():
+            if item.stem not in lessons:
+                item.unlink()
+                removed += 1
+    return removed
+
+
+def prune_site(site_dir: Path, keep: dict[str, set[str]]) -> int:
+    """Remove output for courses and lessons the library no longer has.
+
+    `keep` is what the build *looked at*, not what it managed to render: a
+    lesson that failed this time keeps the page it had last time rather than
+    disappearing from the site over a transient error.
+
+    Only ever called for a build that covered the whole library. A build over
+    one course knows nothing about the others and must not tidy them away.
+    """
+    removed = 0
+    for entry in sorted(site_dir.iterdir()):
+        if entry.is_file() or entry.name.startswith(".") or entry.name == "assets":
+            continue
+        if entry.name not in keep:
+            shutil.rmtree(entry)
+            removed += 1
+            continue
+        removed += _prune_course(entry, keep[entry.name])
+    return removed
+
+
+def write_site(
+    site_dir: Path,
+    courses: list[dict],
+    *,
+    write_markdown: bool = True,
+    keep: dict[str, set[str]] | None = None,
+) -> None:
     site_dir.mkdir(parents=True, exist_ok=True)
     write_assets(site_dir)
-    (site_dir / "index.html").write_text(render_root_index(courses))
-    (site_dir / "upload.html").write_text(render_upload_page())
 
     for course in courses:
         course_dir = site_dir / course["slug"]
@@ -1992,6 +2068,21 @@ def write_site(site_dir: Path, courses: list[dict], *, write_markdown: bool = Tr
                 md_dir.mkdir(parents=True, exist_ok=True)
                 (md_dir / f"{lesson['slug']}.md").write_text(render_lesson_markdown(lesson))
 
+    if keep is not None:
+        # Whatever was just written stays, whatever the caller said: a bug in
+        # the bookkeeping should not be able to delete this build's own output.
+        safe = dict(keep)
+        for course in courses:
+            safe.setdefault(course["slug"], set())
+            safe[course["slug"]] |= {lesson["slug"] for lesson in course["lessons"]}
+        gone = prune_site(site_dir, safe)
+        if gone:
+            log(f"removed {gone} leftover path(s) from an earlier library layout")
+
+    # The root index goes last. Until the pages it links to are on disk, a
+    # reader who follows one gets a 404.
+    (site_dir / "index.html").write_text(render_root_index(courses))
+    (site_dir / "upload.html").write_text(render_upload_page())
     (site_dir / "site.json").write_text(json.dumps(courses, indent=2))
     log(f"site written to {site_dir}")
 

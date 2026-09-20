@@ -146,14 +146,32 @@ await flush();
 await flush();
 assert.equal(reloads, 1, 'a finished build reloads the page');
 
-// 8. A missing or half-written status file is a normal state, not an error.
+// 8. A build that stopped part way says so, and says when it will try again.
+payload = {
+  // fail_build leaves `built` where it was -- the pages on disk are still the
+  // last good build's, so an open page has no reason to reload.
+  updated: 6, building: false, built: 0,
+  error: 'the API returned 529', retry_in: 120,
+  videos: [video({ id: 'bad', state: 'failed', label: 'Failed' }), video({ id: 'q' })],
+};
+tick();
+await flush();
+await flush();
+assert.equal(panel.hidden, false, 'a stopped build still shows the panel');
+assert.equal(list.children[0].className, 'failed');
+assert.ok(list.children[0].textContent.includes('Build stopped'));
+assert.ok(list.children[0].textContent.includes('the API returned 529'), 'with the reason');
+assert.ok(list.children[0].textContent.includes('retrying in 2m 0s'), 'and when it retries');
+assert.equal(reloads, 1, 'and nothing reloads: the pages on disk did not change');
+
+// 9. A missing or half-written status file is a normal state, not an error.
 responseOk = false;
 tick();
 await flush();
 await flush();
 assert.equal(panel.hidden, true, 'no status file just means no panel');
 
-// 9. Returning to a backgrounded tab polls immediately.
+// 10. Returning to a backgrounded tab polls immediately.
 responseOk = true;
 payload = { updated: 7, building: true, built: 1758300000, videos: [video({ state: 'working' })] };
 const before = fetched.length;

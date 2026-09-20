@@ -486,7 +486,14 @@ def process_video(
     }
 
 
-def build(paths: list[Path], options: BuildOptions, backend, progress: Progress | None = None) -> list[dict]:
+def build(
+    paths: list[Path],
+    options: BuildOptions,
+    backend,
+    progress: Progress | None = None,
+    *,
+    prune: bool = False,
+) -> list[dict]:
     courses_in = discover_courses(paths)
     if not courses_in:
         die("no video files found under the given paths")
@@ -501,9 +508,13 @@ def build(paths: list[Path], options: BuildOptions, backend, progress: Progress 
 
     course_slugs: set[str] = set()
     rendered: list[dict] = []
+    # Everything this build looked at, successful or not. Only meaningful when
+    # the build covers the whole library, which is what `prune` asserts.
+    attempted: dict[str, set[str]] = {}
 
     for course in courses_in:
         course_slug = _unique(slugify(course["title"]), course_slugs)
+        attempted[course_slug] = set()
         course_dir = options.out / course_slug
         work_root = (options.work or (options.out / ".work")) / course_slug
         log(f"course: {course['title']} ({len(course['videos'])} videos)")
@@ -512,6 +523,7 @@ def build(paths: list[Path], options: BuildOptions, backend, progress: Progress 
         lessons = []
         for video in course["videos"]:
             slug = _unique(slugify(video.stem), lesson_slugs)
+            attempted[course_slug].add(slug)
             progress.start(video)
             try:
                 lesson = process_video(
@@ -536,6 +548,11 @@ def build(paths: list[Path], options: BuildOptions, backend, progress: Progress 
             rendered.append({"slug": course_slug, "title": course["title"], "lessons": lessons})
 
     if rendered and options.wants("render"):
-        render.write_site(options.out, rendered, write_markdown=options.markdown)
+        render.write_site(
+            options.out,
+            rendered,
+            write_markdown=options.markdown,
+            keep=attempted if prune else None,
+        )
     progress.finish_build()
     return rendered

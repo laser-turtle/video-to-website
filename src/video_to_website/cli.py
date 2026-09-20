@@ -110,6 +110,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     build_cmd = sub.add_parser("build", help="build a site from video files or course folders")
     build_cmd.add_argument("paths", nargs="+", type=Path, help="video files, or folders of them")
+    build_cmd.add_argument(
+        "--prune",
+        action="store_true",
+        help="delete output for courses and lessons not named here (only safe when these paths are the whole library)",
+    )
     _add_build_options(build_cmd)
 
     watch_cmd = sub.add_parser(
@@ -188,7 +193,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
     options = _options_from(args)
     backend = _backend_for(options)
 
-    courses = build(args.paths, options, backend, Progress(options.out if options.wants("render") else None))
+    courses = build(
+        args.paths,
+        options,
+        backend,
+        Progress(options.out if options.wants("render") else None),
+        prune=args.prune,
+    )
     if not courses:
         # Stopping early on purpose is not a failure; it just produces no lessons.
         if options.stop_after and options.stop_after != "render":
@@ -233,6 +244,21 @@ def _watch_decision(state: tuple, seen: tuple | None, done: tuple | None) -> str
     return "idle"
 
 
+# An hour between attempts is often enough to catch a service coming back, and
+# rare enough to be no kind of load if it does not.
+_MAX_BACKOFF = 3600.0
+
+
+def _retry_delay(failures: int, interval: float) -> float:
+    """How long to wait before trying a failed build again.
+
+    Doubling, because what usually fails here is something that needs time --
+    an API refusing, a disk filling, a network down -- and hammering it every
+    poll neither helps nor is free when the backend charges per call.
+    """
+    return min(interval * 2**max(1, failures), _MAX_BACKOFF)
+
+
 def _start_api(library: Path, bind: str, port: int) -> None:
     """Take uploads on a side port while the watcher keeps polling.
 
@@ -273,6 +299,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     log(f"watching {library} every {args.interval:.0f}s, writing to {options.out}")
     seen: tuple | None = None
     done: tuple | None = None
+    failures = 0
+    retry_at = 0.0
 
     while True:
         state = _library_state(library)
@@ -282,16 +310,29 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             if state:
                 log(f"library changed: {len(state)} videos, waiting for it to settle")
                 progress.queue([Path(path) for path, _, _ in state], "Waiting for the copy to finish")
-        elif decision == "build":
+            # Whatever the library just did, give it another go straight away.
+            failures, retry_at = 0, 0.0
+        elif decision == "build" and time.time() >= retry_at:
             try:
-                build([library], options, backend, progress)
+                # The watcher always sees the whole library, so it is the one
+                # caller that can tell a removed course from an unmentioned one.
+                build([library], options, backend, progress, prune=True)
                 done = state
+                failures = 0
             except SystemExit:
                 raise
             except Exception as exc:  # a bad video must not take the service down
-                warn(f"build failed, will retry on the next change: {exc}")
-                progress.finish_build()
-                done = state
+                # `done` is deliberately not advanced: the build gets retried
+                # rather than waiting for someone to touch the library. Most of
+                # what fails here is transient -- the API, the network, the
+                # disk -- and the stage cache means a retry resumes rather than
+                # starting over. Backing off so a permanent failure is not an
+                # endless loop of API calls.
+                failures += 1
+                delay = _retry_delay(failures, args.interval)
+                retry_at = time.time() + delay
+                warn(f"build failed, retrying in {human_duration(delay)}: {exc}")
+                progress.fail_build(str(exc), retry_in=delay)
         try:
             time.sleep(args.interval)
         except KeyboardInterrupt:

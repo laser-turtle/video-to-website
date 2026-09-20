@@ -40,6 +40,8 @@ class Progress:
         self.videos: list[dict] = []
         self.current: dict | None = None
         self.building = False
+        self.error: str | None = None
+        self.retry_in: float | None = None
         # Epoch of the last finished build. The page reloads when this moves,
         # which is how a course that finishes appears without a manual refresh.
         # Read back from any existing file so a service restart does not look
@@ -56,6 +58,8 @@ class Progress:
             for video in course["videos"]
         ]
         self.building = True
+        self.error = None
+        self.retry_in = None
         self.write()
 
     def queue(self, videos: list[Path], label: str) -> None:
@@ -105,6 +109,22 @@ class Progress:
                 video["label"] = "Done"
         self.write()
 
+    def fail_build(self, message: str, *, retry_in: float | None = None) -> None:
+        """A build that stopped part way through, rather than one that finished.
+
+        Deliberately does not move `built`: the pages on disk are whatever the
+        last good build left, so nothing that is reading them should reload.
+        Videos still queued stay queued, because the retry will get to them.
+        """
+        self.building = False
+        self.error = message
+        self.retry_in = retry_in
+        if self.current is not None:
+            self.current["state"] = "failed"
+            self.current["label"] = "Failed"
+            self.current = None
+        self.write()
+
     # -- writing ------------------------------------------------------------
 
     def snapshot(self) -> dict:
@@ -119,6 +139,8 @@ class Progress:
             "updated": now,
             "building": self.building,
             "built": self.built,
+            "error": self.error,
+            "retry_in": self.retry_in,
             "videos": videos,
         }
 

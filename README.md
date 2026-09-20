@@ -455,6 +455,66 @@ or replace a lesson. That is the right trade on a home network and the wrong one
 anywhere else -- set `services.video-to-website.uploads = false` to turn the
 endpoint off and keep `scp`, or put the whole vhost behind auth.
 
+## Where the state lives
+
+Nothing is in a database, and nothing lives outside these two directories:
+
+```
+<stateDir>/library/                 the videos, exactly as you put them there
+<stateDir>/work/<course>/<lesson>/  the stage cache: probe, transcript,
+                                    scenes, steps, assets -- one JSON each
+<stateDir>/site/                    everything served, all of it generated
+<stateDir>/site/site.json           every course, lesson and step as data
+<stateDir>/site/status.json         what the builder is doing right now
+```
+
+`work/` is a cache: deleting it costs a re-transcription and nothing else.
+`site/` is output: deleting it costs a rebuild, which is cheap while `work/` is
+intact. The library is the only thing that is not reproducible, so it is the
+only thing to back up.
+
+Course and lesson names come from the directory and file names, read fresh on
+every build -- there is no stored title to get out of step with them. Renaming
+a course folder renames it on the site at the next build, and the old pages are
+removed with it.
+
+## What happens when things go wrong
+
+The design principle is that a video is only ever built from a file that is
+completely on disk, and that no failure is allowed to leave a half-written page
+where a whole one used to be.
+
+**A copy that is still in progress.** The watcher waits for the library to look
+identical for a full poll before it touches anything, so a file still being
+written is not picked up. Browser uploads go further: they arrive under a
+leading dot, which `find_videos` skips, and are renamed into place only when
+complete.
+
+**A truncated or corrupt video.** It fails at the probe stage, is logged, shows
+as *Failed* on the home page, and the rest of the course builds around it.
+Replacing the file changes its size or modification time, which is a library
+change, which starts a fresh build.
+
+**A build that dies part way.** Each stage writes its cache atomically and only
+once it has finished, so a restart resumes from the last completed stage rather
+than from the beginning. Screenshots and clips are re-cut whenever their stage
+is re-run, so a half-written JPEG from a killed ffmpeg is overwritten rather
+than kept.
+
+**A deploy in the middle of a build.** `nixos-rebuild` restarts the service,
+which is the case above. The page reloads itself only when a build *finishes*,
+so an interrupted one leaves open browsers alone.
+
+**A build that fails outright** -- the API refusing, the disk full -- keeps the
+last good site exactly as it was, says so on the home page, and retries with a
+doubling delay up to an hour rather than waiting for someone to notice. The
+stage cache means a retry resumes rather than starting over. Touching the
+library resets the backoff.
+
+**An upload that drops part way** leaves nothing behind and has to be started
+again; there is no resume. On a LAN that is a minute of lost time, which is why
+it has not been built.
+
 **The API key** goes in a file on the server rather than the Nix store, which is
 world readable:
 
