@@ -1,0 +1,12 @@
+# build artifacts
+result
+result-*
+__pycache__/
+*.pyc
+.direnv/
+
+# pipeline output + caches
+site/
+.v2w/
+.v2w-models/
+samples/

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "video-to-website"
+version = "0.1.0"
+description = "Turn tutorial videos into an illustrated, timestamp-linked, step-by-step website."
+requires-python = ">=3.11"
+# Runtime deps are intentionally empty: the core is pure stdlib.
+# ffmpeg/ffprobe and whisper-cli come from the flake (or your PATH).
+# The `anthropic` SDK is imported lazily and only needed for --llm anthropic.
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+
+[project.scripts]
+v2w = "video_to_website.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/video_to_website"]
