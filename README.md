@@ -313,6 +313,28 @@ Give the rootfs room for the videos, or bind-mount a dataset at
 container needs the uid mapping to line up, so the simple rootfs is the quieter
 option to start with.
 
+**Networking is owned by the flake, not by Proxmox.** The `proxmox-lxc` module
+defaults to letting Proxmox configure the container's network and hostname, but
+`--ostype unmanaged` above is exactly what stops Proxmox writing into the
+guest's `/etc`. Left alone, the two cancel out and the container boots with no
+IP address at all. `nix/lxc.nix` therefore sets `proxmoxLXC.manageNetwork` and
+`manageHostName` to true and declares the address itself -- **edit the address,
+gateway and nameserver there to match your LAN before building the image.** An
+IP set with `pct set ... -net0 ip=...` is ignored.
+
+If a container is already running with no address, configure it by hand just
+long enough to deploy the real config over it:
+
+```bash
+pct exec 200 -- /bin/sh -lc 'ip link set eth0 up
+  ip addr add 192.168.1.202/24 dev eth0
+  ip route add default via 192.168.1.1
+  echo nameserver 192.168.1.1 > /etc/resolv.conf'
+```
+
+That survives until the next reboot, which is long enough for `make deploy` to
+make it permanent.
+
 **There is no console login.** The container has no root password, so the
 Proxmox console sits at a prompt nothing will satisfy. That is deliberate --
 the way in is from the host, which needs no password at all:

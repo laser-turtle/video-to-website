@@ -9,8 +9,28 @@
     environmentFile = "/var/lib/secrets/v2w.env";
   };
 
+  # The proxmox-lxc module defaults manageNetwork and manageHostName to false,
+  # which hands both to Proxmox: it forces useNetworkd on and waits for Proxmox
+  # to drop a .network file in, and forces hostName to "". But the container is
+  # created with --ostype unmanaged precisely so Proxmox does not write into
+  # /etc, so nothing configures the interface and it comes up with no address.
+  # Own both here instead -- it is the reproducible half anyway.
+  proxmoxLXC.manageNetwork = true;
+  proxmoxLXC.manageHostName = true;
+
   networking.hostName = "lessons";
-  networking.useDHCP = lib.mkDefault true;
+
+  # Static, so the bookmark keeps working. Check these against your LAN.
+  networking.useDHCP = false;
+  networking.interfaces.eth0.ipv4.addresses = [
+    {
+      address = "192.168.1.202";
+      prefixLength = 24;
+    }
+  ];
+  networking.defaultGateway = "192.168.1.1";
+  networking.nameservers = [ "192.168.1.1" ];
+  # For DHCP instead, drop the four settings above and set useDHCP = true.
 
   # nixos-rebuild --target-host needs to get in, so this key has to be in the
   # image you build -- an image built before it was added here accepts no key
