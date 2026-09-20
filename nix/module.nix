@@ -8,6 +8,26 @@ let
   cfg = config.services.video-to-website;
   system = pkgs.stdenv.hostPlatform.system;
   inherit (lib) mkEnableOption mkIf mkOption optional optionals types;
+
+  # Videos arrive here by scp as root as often as through the upload page, and
+  # a root-owned course folder is one the service can read but not write: the
+  # build works and the next upload into it fails. Runs as root before the
+  # service drops privileges, so the library always belongs to it.
+  takeLibrary = pkgs.writeShellApplication {
+    name = "v2w-take-library";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+    text = ''
+      library=${cfg.stateDir}/library
+      install -d -m 0775 -o ${cfg.user} -g ${cfg.group} "$library" || exit 0
+      # Each step keeps going on failure and the unit ignores the result: a
+      # file this cannot chown should cost one upload, never the whole service.
+      chown -R ${cfg.user}:${cfg.group} "$library" || true
+      # Plain 0775, no setgid: RestrictSUIDSGID= is not among the settings a
+      # '+' prefix lifts, so a chmod setting the sgid bit may be refused by the
+      # seccomp filter. Ownership is what actually matters here anyway.
+      find "$library" -type d -exec chmod 0775 {} + || true
+    '';
+  };
 in
 {
   options.services.video-to-website = {
@@ -167,6 +187,11 @@ in
         ++ optionals (cfg.llmModel != null) [ "--llm-model" cfg.llmModel ]
         ++ optionals cfg.uploads [ "--api-port" (toString cfg.apiPort) "--api-bind" "127.0.0.1" ]
         ++ cfg.extraArgs);
+
+        # '+' runs it as root, before User= takes effect; '-' keeps a failure
+        # here from stopping the service, which would turn a permissions
+        # nuisance into an outage.
+        ExecStartPre = "-+${takeLibrary}/bin/v2w-take-library";
 
         User = cfg.user;
         Group = cfg.group;

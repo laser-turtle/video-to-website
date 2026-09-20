@@ -12,6 +12,7 @@ when cgi was removed in 3.13, so parsing one would mean writing it here.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from http.server import BaseHTTPRequestHandler
@@ -29,6 +30,16 @@ MAX_UPLOAD = 16 * 1024**3
 DISK_MARGIN = 1024**3
 
 _UNSAFE = re.compile(r"[^\w .\-]+")
+
+
+def service_user() -> str:
+    """Who this process is, for an error message that can be acted on."""
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError):
+        return f"uid {os.geteuid()}"
 
 
 def safe_component(name: str) -> str | None:
@@ -69,6 +80,21 @@ class IngestMixin:
     def log_message(self, fmt, *args):
         """Quiet: an upload logs itself, and journald does not need the rest."""
         return
+
+    def _denied(self, where: Path) -> str:
+        """Why a write was refused, in terms of something to go and do.
+
+        Worth the words: a course folder copied in over ssh belongs to root,
+        the builder can read it but not write it, so the course builds happily
+        and then every upload into it fails. '[Errno 13]' does not hint at any
+        of that.
+        """
+        user = service_user()
+        return (
+            f"the builder runs as {user} and cannot write into {where.name}/. "
+            f"That folder belongs to someone else -- usually a copy made as root. "
+            f"On the server: chown -R {user} {self.library}"
+        )
 
     def _json(self, code: int, payload: dict, *, close: bool = False) -> None:
         body = json.dumps(payload).encode()
@@ -142,6 +168,9 @@ class IngestMixin:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(target.parent).free
+        except PermissionError:
+            self._json(403, {"error": self._denied(target.parent)}, close=True)
+            return
         except OSError as exc:
             self._json(500, {"error": f"cannot write to the library: {exc}"}, close=True)
             return
@@ -162,6 +191,11 @@ class IngestMixin:
                     out.write(chunk)
                     received += len(chunk)
             partial.replace(target)
+        except PermissionError:
+            partial.unlink(missing_ok=True)
+            warn(f"upload of {course}/{name} refused: {target.parent} is not writable by {service_user()}")
+            self._json(403, {"error": self._denied(target.parent)}, close=True)
+            return
         except OSError as exc:
             partial.unlink(missing_ok=True)
             warn(f"upload of {course}/{name} failed after {received} bytes: {exc}")

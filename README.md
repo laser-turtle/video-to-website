@@ -515,6 +515,17 @@ library resets the backoff.
 again; there is no resume. On a LAN that is a minute of lost time, which is why
 it has not been built.
 
+**A course folder copied in as root.** `scp` and `mv` over ssh create folders
+owned by root, which the builder can read but not write -- so the course builds
+fine and then every upload into it is refused. The service takes ownership of
+the whole library at each start, so a `systemctl restart video-to-website` or
+any deploy fixes it. Between restarts the upload page says which folder and
+what to run:
+
+```bash
+chown -R v2w /var/lib/video-to-website/library
+```
+
 **The API key** goes in a file on the server rather than the Nix store, which is
 world readable:
 

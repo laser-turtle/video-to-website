@@ -1022,6 +1022,22 @@ class UploadServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["courses"], ["course_a", "course_b"])
 
+    def test_a_folder_it_cannot_write_says_what_to_do(self):
+        """The case a root scp leaves behind: readable, not writable."""
+        import os
+
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permissions this is about")
+        locked = self.library / "from_scp"
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        status, payload = self.put("/api/library/from_scp/lesson.mp4")
+        self.assertEqual(status, 403)
+        self.assertIn("cannot write into from_scp/", payload["error"])
+        self.assertIn("chown -R", payload["error"])
+        self.assertIn(str(self.library), payload["error"])
+
     def test_unknown_endpoints_say_so(self):
         self.assertEqual(self.request("GET", "/api/nope")[0], 404)
         self.assertEqual(self.put("/api/elsewhere/a/b.mp4")[0], 404)
