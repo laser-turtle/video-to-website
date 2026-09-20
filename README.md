@@ -404,6 +404,23 @@ ssh root@<ip> journalctl -fu video-to-website
 
 Then open `http://<ip>/`.
 
+**If the page is 403 Forbidden**, the site directory is almost certainly still
+empty. nginx answers a directory with no index file and no autoindex with 403,
+not 404, so an unbuilt site looks exactly like a permissions failure. A first
+build takes a while -- the library has to stay unchanged for a full poll before
+the service touches it, then every video gets transcribed -- so check the log
+rather than the page:
+
+```bash
+ssh root@<ip> 'ls -la /var/lib/video-to-website/site'
+ssh root@<ip> journalctl -u video-to-website -n 50
+```
+
+The service now writes a placeholder index at startup, so a box running a build
+of this or later answers with a page saying as much. If you still get 403 with
+an `index.html` sitting in that directory, then it really is permissions: nginx
+has to be able to traverse `/var/lib/video-to-website` and read `site/`.
+
 **The API key** goes in a file on the server rather than the Nix store, which is
 world readable:
 

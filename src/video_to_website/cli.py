@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, render
 from .pipeline import STAGE_ORDER, BuildOptions, build
 from .util import die, find_videos, human_duration, log, warn
 
@@ -231,6 +231,11 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     library.mkdir(parents=True, exist_ok=True)
     options = _options_from(args)
     backend = _backend_for(options)
+
+    # Before anything is built the site directory is empty, and a web server
+    # pointed at it serves 403 rather than anything explanatory. Say so.
+    if not (options.out / "index.html").exists():
+        render.write_placeholder(options.out, f"Nothing built yet. Drop a course folder in {library}.")
 
     log(f"watching {library} every {args.interval:.0f}s, writing to {options.out}")
     seen: tuple | None = None

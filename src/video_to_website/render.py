@@ -1509,7 +1509,7 @@ def render_course_page(course: dict) -> str:
     return _page(course["title"], body, depth=1)
 
 
-def render_root_index(courses: list[dict]) -> str:
+def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
     cards = []
     for course in courses:
         lessons = course["lessons"]
@@ -1526,9 +1526,10 @@ def render_root_index(courses: list[dict]) -> str:
             f'<div class="s">{len(lessons)} lessons &middot; {human_duration(total)}</div>'
             f"</div></a></li>"
         )
+    meta = note if note and not courses else f"{len(courses)} courses"
     body = f"""<header class="top">
   <h1>Courses</h1>
-  <div class="meta">{len(courses)} courses</div>
+  <div class="meta">{_esc(meta)}</div>
 </header>
 <div class="wrap"><ul class="cards">{"".join(cards)}</ul></div>"""
     return _page("Courses", body, depth=0)
@@ -1563,6 +1564,18 @@ def write_assets(site_dir: Path) -> None:
     assets.mkdir(parents=True, exist_ok=True)
     (assets / "style.css").write_text(STYLE)
     (assets / "app.js").write_text(SCRIPT)
+
+
+def write_placeholder(site_dir: Path, note: str) -> None:
+    """Give the web server something to serve before the first build lands.
+
+    An empty root is worse than it sounds: nginx answers a directory with no
+    index file and no autoindex with 403, which reads as a permissions problem
+    rather than as "nothing built yet". The first real build overwrites this.
+    """
+    site_dir.mkdir(parents=True, exist_ok=True)
+    write_assets(site_dir)
+    (site_dir / "index.html").write_text(render_root_index([], note=note))
 
 
 def write_site(site_dir: Path, courses: list[dict], *, write_markdown: bool = True) -> None:

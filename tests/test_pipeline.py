@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from video_to_website import render, steps as steps_mod
 from video_to_website.llm import LLMError, extract_json
@@ -789,6 +791,21 @@ class RenderTests(unittest.TestCase):
     def test_indexes_render(self):
         self.assertIn("A Course", render.render_course_page(self.course))
         self.assertIn("course/index.html", render.render_root_index([self.course]))
+
+    def test_placeholder_index_explains_an_empty_site(self):
+        """Without this the server answers an unbuilt site with a bare 403."""
+        with tempfile.TemporaryDirectory() as tmp:
+            site = Path(tmp) / "site"
+            render.write_placeholder(site, "Nothing built yet. Drop a course in /lib.")
+            html = (site / "index.html").read_text()
+            self.assertIn("Nothing built yet. Drop a course in /lib.", html)
+            self.assertTrue((site / "assets" / "style.css").exists())
+            self.assertTrue((site / "assets" / "app.js").exists())
+
+    def test_note_gives_way_to_the_course_count(self):
+        html = render.render_root_index([self.course], note="Nothing built yet.")
+        self.assertNotIn("Nothing built yet.", html)
+        self.assertIn("1 courses", html)
 
 
 class RangeRequestTests(unittest.TestCase):
