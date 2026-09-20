@@ -465,8 +465,8 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .building li { display: grid; gap: 5px; }
 .building .t { font-size: 14px; font-weight: 600; line-height: 1.3; }
 .building .s { font-size: 12.5px; color: var(--muted); }
-.building .bar { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
-.building .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
+.bar { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
 .building .dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   background: var(--line); margin-right: 7px; vertical-align: middle;
@@ -478,8 +478,38 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 @keyframes v2w-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) {
   .building li.working .dot { animation: none; }
-  .building .bar i { transition: none; }
+  .bar i { transition: none; }
 }
+.upload { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; }
+.upload label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.upload input[type="text"] {
+  width: 100%; font: inherit; font-size: 15px; color: inherit;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px;
+}
+.upload input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.upload .hint { font-size: 12.5px; color: var(--muted); margin: 6px 0 0; }
+.drop {
+  margin-top: 16px; padding: 24px 18px; text-align: center;
+  border: 1.5px dashed var(--line); border-radius: var(--radius); background: var(--bg);
+}
+.drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.drop button {
+  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  border-radius: 8px; padding: 9px 16px;
+}
+.drop button:disabled { opacity: .5; cursor: default; }
+.queue { list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 11px; }
+.queue li { display: grid; gap: 5px; }
+.queue .t { font-size: 14px; font-weight: 600; line-height: 1.3; word-break: break-word; }
+.queue .s { font-size: 12.5px; color: var(--muted); }
+.queue li.failed .s { color: #c0392b; }
+.queue .again {
+  justify-self: start; font: inherit; font-size: 12.5px; cursor: pointer;
+  color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px;
+}
+.upload .message { font-size: 13.5px; margin: 16px 0 0; }
+.upload .message.bad { color: #c0392b; }
 """
 
 
@@ -1385,6 +1415,180 @@ STATUS_SCRIPT = """\
 """
 
 
+UPLOAD_SCRIPT = """\
+(function () {
+  'use strict';
+
+  var course = document.getElementById('course');
+  var list = document.getElementById('courses');
+  var drop = document.getElementById('drop');
+  var picker = document.getElementById('picker');
+  var choose = document.getElementById('choose');
+  var queue = document.getElementById('queue');
+  var message = document.getElementById('message');
+  if (!course || !drop || !picker || !queue) { return; }
+
+  var pending = [];
+  var busy = false;
+
+  function say(text, bad) {
+    message.textContent = text;
+    message.className = bad ? 'message bad' : 'message';
+    message.hidden = !text;
+  }
+
+  function size(bytes) {
+    if (bytes >= 1073741824) { return (bytes / 1073741824).toFixed(1) + ' GB'; }
+    if (bytes >= 1048576) { return Math.round(bytes / 1048576) + ' MB'; }
+    return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+  }
+
+  // The API is the only part of the site that is not a static file, so it can
+  // be missing entirely -- a locally built copy, or a server with uploads off.
+  fetch('api/courses').then(function (res) {
+    if (!res.ok) { throw new Error(res.status); }
+    return res.json();
+  }).then(function (data) {
+    (data.courses || []).forEach(function (name) {
+      var option = document.createElement('option');
+      option.value = name;
+      list.appendChild(option);
+    });
+  }).catch(function () {
+    choose.disabled = true;
+    say('This copy of the site cannot take uploads. Add videos to the library folder directly.', true);
+  });
+
+  function row(file) {
+    var li = document.createElement('li');
+    var title = document.createElement('div');
+    title.className = 't';
+    title.textContent = file.name;
+    var status = document.createElement('div');
+    status.className = 's';
+    status.textContent = size(file.size) + ' \u00b7 waiting';
+    var bar = document.createElement('div');
+    bar.className = 'bar';
+    var fill = document.createElement('i');
+    bar.appendChild(fill);
+    li.appendChild(title);
+    li.appendChild(status);
+    li.appendChild(bar);
+    queue.appendChild(li);
+    return { li: li, status: status, fill: fill, bar: bar };
+  }
+
+  function send(job, overwrite) {
+    var name = job.file.name;
+    var url = 'api/library/' + encodeURIComponent(job.course) + '/' + encodeURIComponent(name);
+    if (overwrite) { url += '?overwrite=1'; }
+
+    // XHR rather than fetch: it is still the only one that reports upload
+    // progress, and a 2 GB lesson with no progress bar is unusable.
+    var xhr = new XMLHttpRequest();
+    xhr.open('PUT', url, true);
+    xhr.upload.addEventListener('progress', function (event) {
+      if (!event.lengthComputable) { return; }
+      var pct = Math.round(100 * event.loaded / event.total);
+      job.ui.fill.style.width = pct + '%';
+      job.ui.status.textContent = size(job.file.size) + ' \u00b7 ' + pct + '%';
+    });
+    xhr.addEventListener('load', function () {
+      if (xhr.status === 201) {
+        job.ui.fill.style.width = '100%';
+        job.ui.status.textContent = size(job.file.size) + ' \u00b7 uploaded to ' + job.course;
+        next();
+        return;
+      }
+      var detail = '';
+      try { detail = JSON.parse(xhr.responseText).error || ''; } catch (e) { detail = ''; }
+      fail(job, detail || ('upload failed (' + xhr.status + ')'), xhr.status === 409);
+    });
+    xhr.addEventListener('error', function () { fail(job, 'the connection dropped', false); });
+    xhr.addEventListener('abort', function () { fail(job, 'cancelled', false); });
+    xhr.send(job.file);
+  }
+
+  function fail(job, text, offerReplace) {
+    job.ui.li.className = 'failed';
+    job.ui.bar.hidden = true;
+    job.ui.status.textContent = text;
+    if (offerReplace) {
+      var again = document.createElement('button');
+      again.type = 'button';
+      again.className = 'again';
+      again.textContent = 'Replace it';
+      again.addEventListener('click', function () {
+        again.remove();
+        job.ui.li.className = '';
+        job.ui.bar.hidden = false;
+        job.ui.status.textContent = size(job.file.size) + ' \u00b7 waiting';
+        send(job, true);
+      });
+      job.ui.li.appendChild(again);
+    }
+    next();
+  }
+
+  function next() {
+    var job = pending.shift();
+    if (!job) {
+      busy = false;
+      if (queue.children.length) {
+        say('Done. The builder picks new videos up within a minute \u2014 watch it on the home page.');
+      }
+      return;
+    }
+    busy = true;
+    job.ui.status.textContent = size(job.file.size) + ' \u00b7 uploading';
+    send(job, false);
+  }
+
+  function add(files) {
+    var name = (course.value || '').trim();
+    if (!name) {
+      say('Give the course a name first.', true);
+      course.focus();
+      return;
+    }
+    // One at a time: these are gigabytes over a house network, and parallel
+    // uploads just make every one of them slower.
+    Array.prototype.forEach.call(files, function (file) {
+      pending.push({ file: file, course: name, ui: row(file) });
+    });
+    say('');
+    if (!busy) { next(); }
+  }
+
+  choose.addEventListener('click', function () { picker.click(); });
+  picker.addEventListener('change', function () { add(picker.files); picker.value = ''; });
+
+  ['dragenter', 'dragover'].forEach(function (type) {
+    drop.addEventListener(type, function (event) {
+      event.preventDefault();
+      drop.classList.add('over');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (type) {
+    drop.addEventListener(type, function (event) {
+      event.preventDefault();
+      drop.classList.remove('over');
+    });
+  });
+  drop.addEventListener('drop', function (event) {
+    if (event.dataTransfer && event.dataTransfer.files) { add(event.dataTransfer.files); }
+  });
+
+  // Losing a half-finished upload to a stray click is worth one confirmation.
+  window.addEventListener('beforeunload', function (event) {
+    if (!busy) { return; }
+    event.preventDefault();
+    event.returnValue = '';
+  });
+})();
+"""
+
+
 SHORTCUTS = [
     ("j / \u2193", "Further down this step, then the next one"),
     ("k / \u2191", "Back up this step, then the previous one"),
@@ -1692,11 +1896,37 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
   <ul id="build-list"></ul>
 </section>"""
     body = f"""<header class="top">
+  <div class="crumbs"><a href="upload.html">Add videos</a></div>
   <h1>Courses</h1>
   <div class="meta">{_esc(meta)}</div>
 </header>
 <div class="wrap">{status}<ul class="cards">{"".join(cards)}</ul></div>"""
     return _page("Courses", body, depth=0, scripts=(("status.js", STATUS_SCRIPT),))
+
+
+def render_upload_page() -> str:
+    body = """<header class="top">
+  <div class="crumbs"><a href="index.html">All courses</a></div>
+  <h1>Add videos</h1>
+  <div class="meta">They start building on their own once the upload finishes.</div>
+</header>
+<div class="wrap">
+  <div class="upload">
+    <label for="course">Course</label>
+    <input type="text" id="course" list="courses" autocomplete="off" spellcheck="false"
+           placeholder="cgboost_launch_pad_2">
+    <datalist id="courses"></datalist>
+    <p class="hint">Pick an existing course to add lessons to it, or type a new name to start one.</p>
+    <div class="drop" id="drop">
+      <input type="file" id="picker" accept="video/*" multiple hidden>
+      <button type="button" id="choose">Choose videos</button>
+      <p class="hint">or drop them here</p>
+    </div>
+    <ul class="queue" id="queue"></ul>
+    <p class="message" id="message" hidden></p>
+  </div>
+</div>"""
+    return _page("Add videos", body, depth=0, scripts=(("upload.js", UPLOAD_SCRIPT),))
 
 
 def render_lesson_markdown(lesson: dict) -> str:
@@ -1729,6 +1959,7 @@ def write_assets(site_dir: Path) -> None:
     (assets / "style.css").write_text(STYLE)
     (assets / "app.js").write_text(SCRIPT)
     (assets / "status.js").write_text(STATUS_SCRIPT)
+    (assets / "upload.js").write_text(UPLOAD_SCRIPT)
 
 
 def write_placeholder(site_dir: Path, note: str) -> None:
@@ -1741,12 +1972,14 @@ def write_placeholder(site_dir: Path, note: str) -> None:
     site_dir.mkdir(parents=True, exist_ok=True)
     write_assets(site_dir)
     (site_dir / "index.html").write_text(render_root_index([], note=note))
+    (site_dir / "upload.html").write_text(render_upload_page())
 
 
 def write_site(site_dir: Path, courses: list[dict], *, write_markdown: bool = True) -> None:
     site_dir.mkdir(parents=True, exist_ok=True)
     write_assets(site_dir)
     (site_dir / "index.html").write_text(render_root_index(courses))
+    (site_dir / "upload.html").write_text(render_upload_page())
 
     for course in courses:
         course_dir = site_dir / course["slug"]

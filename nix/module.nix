@@ -92,6 +92,26 @@ in
       description = "Serve the built site over HTTP.";
     };
 
+    uploads = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Offer the site's upload page, which PUTs videos straight into the
+        library. There is no authentication in front of it, so anyone who can
+        reach the site can add a course -- fine on a home network, not on one
+        you share.
+      '';
+    };
+
+    apiPort = mkOption {
+      type = types.port;
+      default = 8765;
+      description = ''
+        Loopback port the upload API listens on. nginx proxies /api/ to it;
+        nothing off the box talks to it directly.
+      '';
+    };
+
     hostName = mkOption {
       type = types.str;
       default = "lessons";
@@ -145,6 +165,7 @@ in
           cfg.llm
         ]
         ++ optionals (cfg.llmModel != null) [ "--llm-model" cfg.llmModel ]
+        ++ optionals cfg.uploads [ "--api-port" (toString cfg.apiPort) "--api-bind" "127.0.0.1" ]
         ++ cfg.extraArgs);
 
         User = cfg.user;
@@ -185,6 +206,20 @@ in
         locations."/assets/".extraConfig = ''
           add_header Cache-Control "public, max-age=31536000, immutable";
         '';
+        locations."/api/" = mkIf cfg.uploads {
+          proxyPass = "http://127.0.0.1:${toString cfg.apiPort}";
+          extraConfig = ''
+            # A lesson is a couple of gigabytes, so no cap on the body.
+            client_max_body_size 0;
+            # And stream it through rather than spooling the whole upload to
+            # nginx's disk first: buffered, the browser's progress bar would
+            # fill up long before the file had gone anywhere.
+            proxy_request_buffering off;
+            proxy_http_version 1.1;
+            proxy_read_timeout 2h;
+            proxy_send_timeout 2h;
+          '';
+        };
       };
     };
 

@@ -195,6 +195,10 @@
             python -c "from video_to_website.render import STATUS_SCRIPT; open('status.js','w').write(STATUS_SCRIPT)"
             node --check status.js
             node tests/test_status_js.mjs status.js
+
+            python -c "from video_to_website.render import UPLOAD_SCRIPT; open('upload.js','w').write(UPLOAD_SCRIPT)"
+            node --check upload.js
+            node tests/test_upload_js.mjs upload.js
             touch $out
           '';
         });

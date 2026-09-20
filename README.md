@@ -395,7 +395,8 @@ nothing to install; override `NIXOS_REBUILD` if you have your own.
 
 That is also how every later change goes out.
 
-**Add a course** and watch it work:
+**Add a course**, either from the browser -- *Add videos* at the top of the
+home page -- or over ssh:
 
 ```bash
 scp -r ~/courses/blender-donut root@<ip>:/var/lib/video-to-website/library/
@@ -432,6 +433,27 @@ just finished turns up without a manual refresh.
 Whisper is most of the wall time, so a lesson sits on *Transcribing the audio*
 for minutes. That is normal; `journalctl -fu video-to-website` has the detail if
 you want it.
+
+### Uploading from a browser
+
+*Add videos* on the home page takes a course name and however many files, and
+PUTs them into the library one at a time with a progress bar each. They land as
+ordinary files, so the watcher picks them up exactly as it would an `scp` --
+there is no separate queue, and nothing to go wrong between the two.
+
+A file is written under a leading dot while it arrives and renamed into place
+when it finishes, so a half-uploaded video can never start a build of itself. An
+upload onto an existing name is refused rather than guessed about; the page
+offers to replace it.
+
+The service listens on loopback only and nginx proxies `/api/` to it, with body
+buffering off so a 2 GB lesson streams through rather than filling nginx's
+spool first.
+
+**There is no authentication.** Anyone who can reach the site can add a course
+or replace a lesson. That is the right trade on a home network and the wrong one
+anywhere else -- set `services.video-to-website.uploads = false` to turn the
+endpoint off and keep `scp`, or put the whole vhost behind auth.
 
 **The API key** goes in a file on the server rather than the Nix store, which is
 world readable:

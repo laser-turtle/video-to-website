@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from video_to_website import progress as progress_mod, render, steps as steps_mod
+from video_to_website import ingest, progress as progress_mod, render, steps as steps_mod
 from video_to_website.llm import LLMError, extract_json
 from video_to_website.util import (
     file_fingerprint,
@@ -814,6 +814,126 @@ class RenderTests(unittest.TestCase):
         html = render.render_root_index([self.course], note="Nothing built yet.")
         self.assertNotIn("Nothing built yet.", html)
         self.assertIn("1 courses", html)
+
+
+class SafeComponentTests(unittest.TestCase):
+    """Every upload name arrives from a browser, so this is the boundary."""
+
+    def test_separators_and_traversal_are_refused(self):
+        for bad in ["..", ".", "", "   ", "a/b", "a\\b", "../../etc/passwd", "....", " . "]:
+            self.assertIsNone(ingest.safe_component(bad), bad)
+
+    def test_a_leading_dot_cannot_survive(self):
+        """A dotfile would hide the upload from the watcher that builds it."""
+        self.assertEqual(ingest.safe_component(".hidden.mp4"), "hidden.mp4")
+
+    def test_ordinary_names_come_through_intact(self):
+        self.assertEqual(ingest.safe_component("01_car_body.mp4"), "01_car_body.mp4")
+        self.assertEqual(ingest.safe_component("Lesson 3 - Wheels.mp4"), "Lesson 3 - Wheels.mp4")
+
+    def test_url_encoding_is_undone_before_checking(self):
+        self.assertIsNone(ingest.safe_component("..%2f..%2fetc"))
+
+    def test_awkward_characters_are_replaced_not_dropped(self):
+        self.assertEqual(ingest.safe_component("a:b*c?.mp4"), "a_b_c_.mp4")
+
+    def test_names_are_bounded(self):
+        self.assertEqual(len(ingest.safe_component("x" * 500)), 120)
+
+
+class UploadServerTests(unittest.TestCase):
+    """Driven over a real socket: the handler's job is mostly HTTP."""
+
+    def setUp(self):
+        import http.server
+        import threading
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.library = Path(self.tmp.name) / "library"
+        self.library.mkdir()
+
+        http.server.ThreadingHTTPServer.allow_reuse_address = True
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ingest.IngestHandler)
+        self.httpd.library = self.library
+        # A short poll interval only so shutdown() in teardown is not a half
+        # second of waiting per test.
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        self.thread.start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.port = self.httpd.server_address[1]
+
+    def request(self, method, path, body=None, headers=None):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            res = conn.getresponse()
+            return res.status, json.loads(res.read() or b"{}")
+        finally:
+            conn.close()
+
+    def put(self, path, body=b"video bytes"):
+        return self.request("PUT", path, body=body, headers={"Content-Length": str(len(body))})
+
+    def test_an_upload_lands_in_the_library(self):
+        status, payload = self.put("/api/library/my_course/lesson_one.mp4", b"abc123")
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["bytes"], 6)
+        landed = self.library / "my_course" / "lesson_one.mp4"
+        self.assertEqual(landed.read_bytes(), b"abc123")
+
+    def test_nothing_partial_is_left_behind(self):
+        self.put("/api/library/my_course/lesson_one.mp4")
+        leftovers = list((self.library / "my_course").glob(".incoming*"))
+        self.assertEqual(leftovers, [])
+
+    def test_traversal_cannot_escape_the_library(self):
+        status, _ = self.put("/api/library/..%2f..%2fetc/passwd.mp4")
+        self.assertEqual(status, 400)
+        self.assertEqual(list(self.library.iterdir()), [])
+
+    def test_only_video_files_are_accepted(self):
+        status, payload = self.put("/api/library/my_course/notes.txt")
+        self.assertEqual(status, 415)
+        self.assertIn(".txt", payload["error"])
+
+    def test_an_existing_lesson_is_not_silently_replaced(self):
+        self.put("/api/library/my_course/lesson_one.mp4", b"first")
+        status, _ = self.put("/api/library/my_course/lesson_one.mp4", b"second")
+        self.assertEqual(status, 409)
+        self.assertEqual((self.library / "my_course" / "lesson_one.mp4").read_bytes(), b"first")
+
+    def test_replacing_on_purpose_works(self):
+        self.put("/api/library/my_course/lesson_one.mp4", b"first")
+        status, _ = self.put("/api/library/my_course/lesson_one.mp4?overwrite=1", b"second")
+        self.assertEqual(status, 201)
+        self.assertEqual((self.library / "my_course" / "lesson_one.mp4").read_bytes(), b"second")
+
+    def test_an_empty_body_is_refused(self):
+        status, _ = self.put("/api/library/my_course/lesson_one.mp4", b"")
+        self.assertEqual(status, 413)
+
+    def test_the_course_list_is_offered_for_the_dropdown(self):
+        (self.library / "course_a").mkdir()
+        (self.library / "course_b").mkdir()
+        (self.library / ".hidden").mkdir()
+        status, payload = self.request("GET", "/api/courses")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["courses"], ["course_a", "course_b"])
+
+    def test_unknown_endpoints_say_so(self):
+        self.assertEqual(self.request("GET", "/api/nope")[0], 404)
+        self.assertEqual(self.put("/api/elsewhere/a/b.mp4")[0], 404)
+
+    def test_uploads_are_refused_when_no_library_is_mounted(self):
+        self.httpd.library = None
+        self.assertEqual(self.put("/api/library/c/a.mp4")[0], 503)
+        self.assertEqual(self.request("GET", "/api/courses")[0], 503)
 
 
 class StageCacheTests(unittest.TestCase):

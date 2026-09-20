@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from . import __version__, render
+from .ingest import IngestHandler, IngestMixin
 from .pipeline import STAGE_ORDER, BuildOptions, build
 from .progress import Progress
 from .util import die, find_videos, human_duration, log, warn
@@ -116,6 +117,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     watch_cmd.add_argument("library", type=Path, help="directory of course folders to watch")
     watch_cmd.add_argument("--interval", type=float, default=30.0, help="seconds between polls (default: 30)")
+    watch_cmd.add_argument(
+        "--api-port",
+        type=int,
+        help="also accept browser uploads into the library on this port",
+    )
+    watch_cmd.add_argument("--api-bind", default="127.0.0.1", help="address for --api-port (default: 127.0.0.1)")
     _add_build_options(watch_cmd)
 
     fetch_cmd = sub.add_parser("fetch-model", help="download a whisper.cpp model")
@@ -127,6 +134,11 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("directory", nargs="?", type=Path, default=Path("site"))
     serve_cmd.add_argument("-p", "--port", type=int, default=8000)
     serve_cmd.add_argument("--bind", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
+    serve_cmd.add_argument(
+        "--library",
+        type=Path,
+        help="accept browser uploads into this directory, as the service does",
+    )
 
     sub.add_parser("doctor", help="check that external tools and credentials are in place")
     return parser
@@ -221,6 +233,23 @@ def _watch_decision(state: tuple, seen: tuple | None, done: tuple | None) -> str
     return "idle"
 
 
+def _start_api(library: Path, bind: str, port: int) -> None:
+    """Take uploads on a side port while the watcher keeps polling.
+
+    A daemon thread rather than a second process: an upload is finished the
+    moment the file is in the library, and the loop in the main thread finds it
+    on its next pass with no coordination between the two at all.
+    """
+    import http.server
+    import threading
+
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    httpd = http.server.ThreadingHTTPServer((bind, port), IngestHandler)
+    httpd.library = library
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    log(f"accepting uploads on http://{bind}:{port}/api/")
+
+
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Rebuild whenever the library settles after a change.
 
@@ -238,6 +267,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     if not (options.out / "index.html").exists():
         render.write_placeholder(options.out, f"Nothing built yet. Drop a course folder in {library}.")
     progress = Progress(options.out)
+    if args.api_port:
+        _start_api(library, args.api_bind, args.api_port)
 
     log(f"watching {library} every {args.interval:.0f}s, writing to {options.out}")
     seen: tuple | None = None
@@ -371,13 +402,19 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if not (directory / "index.html").exists():
         die(f"no index.html in {directory}. Run `v2w build` first.")
 
-    class Handler(_RangeHandler, http.server.SimpleHTTPRequestHandler):
-        pass
+    class Handler(IngestMixin, _RangeHandler, http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if not self.api_get():
+                super().do_GET()
 
     handler = functools.partial(Handler, directory=str(directory))
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     with http.server.ThreadingHTTPServer((args.bind, args.port), handler) as httpd:
+        httpd.library = args.library.expanduser().resolve() if args.library else None
         log(f"serving {directory} at http://{args.bind}:{args.port}  (ctrl-c to stop)")
+        if httpd.library:
+            httpd.library.mkdir(parents=True, exist_ok=True)
+            log(f"uploads land in {httpd.library}")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
