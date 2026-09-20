@@ -421,6 +421,18 @@ of this or later answers with a page saying as much. If you still get 403 with
 an `index.html` sitting in that directory, then it really is permissions: nginx
 has to be able to traverse `/var/lib/video-to-website` and read `site/`.
 
+**Watching a build from the page.** The builder keeps `status.json` next to the
+site, and the index page polls it every few seconds: each video shows the stage
+it is in, how long it has been there, and a bar across the five per-video
+stages. Copy a file in and it appears within a poll, first as waiting for the
+copy to settle, then working through probe, transcribe, scenes, steps and
+frames. When a build finishes the page reloads itself, so a course that has
+just finished turns up without a manual refresh.
+
+Whisper is most of the wall time, so a lesson sits on *Transcribing the audio*
+for minutes. That is normal; `journalctl -fu video-to-website` has the detail if
+you want it.
+
 **The API key** goes in a file on the server rather than the Nix store, which is
 world readable:
 

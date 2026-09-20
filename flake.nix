@@ -187,10 +187,14 @@
             export PYTHONPATH=$PWD/src
             python -m unittest discover -s tests -v
 
-            # The page script only misbehaves at runtime, so check it against a DOM stub.
+            # The page scripts only misbehave at runtime, so check them against DOM stubs.
             python -c "from video_to_website.render import SCRIPT; open('app.js','w').write(SCRIPT)"
             node --check app.js
             node tests/test_app_js.mjs app.js
+
+            python -c "from video_to_website.render import STATUS_SCRIPT; open('status.js','w').write(STATUS_SCRIPT)"
+            node --check status.js
+            node tests/test_status_js.mjs status.js
             touch $out
           '';
         });

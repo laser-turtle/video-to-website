@@ -41,8 +41,10 @@ dev:
 # The flake check runs these too, in a sandbox; this is the fast loop.
 test:
 	nix develop -c sh -c 'PYTHONPATH=src python -m unittest discover -s tests -q \
-	  && python -c "from video_to_website.render import SCRIPT; open(\"app.js\",\"w\").write(SCRIPT)" \
-	  && node --check app.js && node tests/test_app_js.mjs app.js && rm -f app.js'
+	  && python -c "from video_to_website.render import SCRIPT, STATUS_SCRIPT; open(\"app.js\",\"w\").write(SCRIPT); open(\"status.js\",\"w\").write(STATUS_SCRIPT)" \
+	  && node --check app.js && node tests/test_app_js.mjs app.js \
+	  && node --check status.js && node tests/test_status_js.mjs status.js \
+	  && rm -f app.js status.js'
 
 check:
 	nix flake check

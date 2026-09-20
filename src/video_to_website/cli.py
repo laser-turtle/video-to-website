@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import __version__, render
 from .pipeline import STAGE_ORDER, BuildOptions, build
+from .progress import Progress
 from .util import die, find_videos, human_duration, log, warn
 
 
@@ -175,7 +176,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
     options = _options_from(args)
     backend = _backend_for(options)
 
-    courses = build(args.paths, options, backend)
+    courses = build(args.paths, options, backend, Progress(options.out if options.wants("render") else None))
     if not courses:
         # Stopping early on purpose is not a failure; it just produces no lessons.
         if options.stop_after and options.stop_after != "render":
@@ -236,6 +237,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     # pointed at it serves 403 rather than anything explanatory. Say so.
     if not (options.out / "index.html").exists():
         render.write_placeholder(options.out, f"Nothing built yet. Drop a course folder in {library}.")
+    progress = Progress(options.out)
 
     log(f"watching {library} every {args.interval:.0f}s, writing to {options.out}")
     seen: tuple | None = None
@@ -248,14 +250,16 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         if decision == "settle":
             if state:
                 log(f"library changed: {len(state)} videos, waiting for it to settle")
+                progress.queue([Path(path) for path, _, _ in state], "Waiting for the copy to finish")
         elif decision == "build":
             try:
-                build([library], options, backend)
+                build([library], options, backend, progress)
                 done = state
             except SystemExit:
                 raise
             except Exception as exc:  # a bad video must not take the service down
                 warn(f"build failed, will retry on the next change: {exc}")
+                progress.finish_build()
                 done = state
         try:
             time.sleep(args.interval)

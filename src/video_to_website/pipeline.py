@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import media, render, steps as steps_mod, whisper
+from .progress import Progress
 from .util import (
     CommandError,
     die,
@@ -131,12 +132,15 @@ def process_video(
     options: BuildOptions,
     backend,
     model_path: Path | None,
+    progress: Progress | None = None,
 ) -> dict | None:
     """Run every enabled stage for one video and return its lesson record."""
+    progress = progress or Progress(None)
     fingerprint = file_fingerprint(video)
     work_dir.mkdir(parents=True, exist_ok=True)
     fallback_title = title_from_filename(video)
 
+    progress.stage("probe")
     # --- probe -------------------------------------------------------------
     probe_params = {"stage": "probe"}
     info = None if options.forced("probe") else read_stage(work_dir / "probe.json", fingerprint, probe_params)
@@ -151,6 +155,7 @@ def process_video(
     if not options.wants("transcribe"):
         return None
 
+    progress.stage("transcribe")
     # --- transcribe --------------------------------------------------------
     if not info.get("has_audio"):
         warn(f"{video.name} has no audio track; skipping")
@@ -190,6 +195,7 @@ def process_video(
     if not options.wants("scenes"):
         return None
 
+    progress.stage("scenes")
     # --- scenes ------------------------------------------------------------
     # The threshold is deliberately absent from the cache key: scores are stored
     # once, so re-tuning --scene-threshold never re-decodes the video.
@@ -214,6 +220,7 @@ def process_video(
     if not options.wants("steps"):
         return None
 
+    progress.stage("steps")
     # --- steps -------------------------------------------------------------
     backend_name = backend.name if backend else "heuristic"
     steps_params = {
@@ -265,6 +272,7 @@ def process_video(
     if not options.wants("frames"):
         return None
 
+    progress.stage("frames")
     # --- frames and clips --------------------------------------------------
     # Emitting real dimensions stops the page reflowing as screenshots arrive,
     # which otherwise moves the step you are reading.
@@ -478,10 +486,13 @@ def process_video(
     }
 
 
-def build(paths: list[Path], options: BuildOptions, backend) -> list[dict]:
+def build(paths: list[Path], options: BuildOptions, backend, progress: Progress | None = None) -> list[dict]:
     courses_in = discover_courses(paths)
     if not courses_in:
         die("no video files found under the given paths")
+
+    progress = progress or Progress(None)
+    progress.plan(courses_in)
 
     model_path = None
     if options.wants("transcribe"):
@@ -501,6 +512,7 @@ def build(paths: list[Path], options: BuildOptions, backend) -> list[dict]:
         lessons = []
         for video in course["videos"]:
             slug = _unique(slugify(video.stem), lesson_slugs)
+            progress.start(video)
             try:
                 lesson = process_video(
                     video,
@@ -510,10 +522,13 @@ def build(paths: list[Path], options: BuildOptions, backend) -> list[dict]:
                     options=options,
                     backend=backend,
                     model_path=model_path,
+                    progress=progress,
                 )
             except CommandError as exc:
                 warn(f"{video.name}: {exc}")
+                progress.finish("failed")
                 continue
+            progress.finish("done" if lesson else "skipped")
             if lesson:
                 lessons.append(lesson)
 
@@ -522,4 +537,5 @@ def build(paths: list[Path], options: BuildOptions, backend) -> list[dict]:
 
     if rendered and options.wants("render"):
         render.write_site(options.out, rendered, write_markdown=options.markdown)
+    progress.finish_build()
     return rendered

@@ -443,6 +443,43 @@ ul.cards a:hover { border-color: var(--accent); }
 ul.cards img { width: 128px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); flex: none; background: var(--bg); }
 ul.cards .t { font-weight: 600; font-size: 15px; line-height: 1.3; }
 ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+.building {
+  margin: 0 0 18px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.building h2 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.building h2 .count { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.building ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 11px; }
+.building li { display: grid; gap: 5px; }
+.building .t { font-size: 14px; font-weight: 600; line-height: 1.3; }
+.building .s { font-size: 12.5px; color: var(--muted); }
+.building .bar { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.building .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
+.building .dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--line); margin-right: 7px; vertical-align: middle;
+}
+.building li.working .dot { background: var(--accent); animation: v2w-pulse 1.3s ease-in-out infinite; }
+.building li.failed .dot { background: #c0392b; }
+.building li.failed .s { color: #c0392b; }
+.building .more { font-size: 12.5px; color: var(--muted); }
+@keyframes v2w-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) {
+  .building li.working .dot { animation: none; }
+  .building .bar i { transition: none; }
+}
 """
 
 
@@ -1235,6 +1272,119 @@ SCRIPT = """\
 """
 
 
+STATUS_SCRIPT = """\
+(function () {
+  'use strict';
+
+  var panel = document.getElementById('build-status');
+  var list = document.getElementById('build-list');
+  var count = document.getElementById('build-count');
+  if (!panel || !list) { return; }
+
+  var POLL_MS = 3000;
+  var QUEUE_SHOWN = 6;
+  // The 'built' stamp as of the first poll. When the builder finishes a course
+  // it moves, and the page reloads itself so the new course actually appears.
+  var builtAtLoad = null;
+
+  function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+  function elapsed(seconds) {
+    var s = Math.round(seconds || 0);
+    if (s < 60) { return s + 's'; }
+    var m = Math.floor(s / 60);
+    if (m < 60) { return m + 'm ' + (s % 60) + 's'; }
+    return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  }
+
+  function row(entry) {
+    var li = document.createElement('li');
+    li.className = entry.state;
+
+    var title = document.createElement('div');
+    title.className = 't';
+    var dot = document.createElement('span');
+    dot.className = 'dot';
+    title.appendChild(dot);
+    title.appendChild(document.createTextNode(entry.title));
+    li.appendChild(title);
+
+    var parts = [entry.course, entry.label];
+    if (entry.state === 'working' && entry.elapsed) { parts.push(elapsed(entry.elapsed)); }
+    var sub = document.createElement('div');
+    sub.className = 's';
+    sub.textContent = parts.filter(Boolean).join(' \u00b7 ');
+    li.appendChild(sub);
+
+    if (entry.state === 'working' && entry.steps) {
+      var bar = document.createElement('div');
+      bar.className = 'bar';
+      var fill = document.createElement('i');
+      // A stage is only finished once the next one starts, so a stage that is
+      // under way counts as half of one. Better than a bar that sits still
+      // through the minutes whisper takes.
+      fill.style.width = (100 * Math.max(0, entry.step - 0.5) / entry.steps) + '%';
+      bar.appendChild(fill);
+      li.appendChild(bar);
+    }
+    return li;
+  }
+
+  function render(data) {
+    var videos = data.videos || [];
+    var active = videos.filter(function (v) { return v.state === 'working'; });
+    var queued = videos.filter(function (v) { return v.state === 'queued'; });
+    var failed = videos.filter(function (v) { return v.state === 'failed'; });
+    var done = videos.filter(function (v) { return v.state === 'done' || v.state === 'skipped'; });
+
+    var shown = active.concat(failed, queued.slice(0, QUEUE_SHOWN));
+    if (!shown.length) { panel.hidden = true; return; }
+
+    list.textContent = '';
+    shown.forEach(function (entry) { list.appendChild(row(entry)); });
+
+    var hidden = queued.length - Math.min(queued.length, QUEUE_SHOWN);
+    if (hidden > 0) {
+      var more = document.createElement('li');
+      more.className = 'more';
+      more.textContent = plural(hidden, 'more video') + ' waiting';
+      list.appendChild(more);
+    }
+    if (count) {
+      count.textContent = done.length && videos.length > 1
+        ? done.length + ' of ' + videos.length + ' done'
+        : '';
+    }
+    panel.hidden = false;
+  }
+
+  function poll() {
+    // Cache-busted by hand: this file is small, changes constantly, and is not
+    // worth trusting any proxy between here and the builder to revalidate.
+    fetch('status.json?t=' + Date.now(), { cache: 'no-store' }).then(function (res) {
+      if (!res.ok) { throw new Error(res.status); }
+      return res.json();
+    }).then(function (data) {
+      if (builtAtLoad === null) { builtAtLoad = data.built || 0; }
+      else if ((data.built || 0) > builtAtLoad) { location.reload(); return; }
+      render(data);
+    }).catch(function () {
+      // No status file yet, or the builder is mid-write. Try again shortly.
+      panel.hidden = true;
+    });
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+  // Coming back to a tab that was hidden for an hour should not wait for the
+  // next tick to catch up.
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { poll(); }
+  });
+})();
+"""
+
+
 SHORTCUTS = [
     ("j / \u2193", "Further down this step, then the next one"),
     ("k / \u2191", "Back up this step, then the previous one"),
@@ -1307,15 +1457,21 @@ def _esc(text: str) -> str:
     return html.escape(str(text or ""), quote=True)
 
 
-def _page(title: str, body: str, *, depth: int, lesson_slug: str | None = None) -> str:
+def _page(
+    title: str,
+    body: str,
+    *,
+    depth: int,
+    lesson_slug: str | None = None,
+    scripts: tuple[tuple[str, str], ...] = (),
+) -> str:
     up = "../" * depth
     body_attrs = f' data-lesson="{_esc(lesson_slug)}"' if lesson_slug else ""
     # The asset filenames never change, so without a content hash in the URL a
     # browser will happily keep running the script it cached last week.
-    script = (
-        f'<script src="{up}assets/app.js?v={_fingerprint(SCRIPT)}" defer></script>'
-        if lesson_slug
-        else ""
+    script = "\n".join(
+        f'<script src="{up}assets/{name}?v={_fingerprint(source)}" defer></script>'
+        for name, source in scripts
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -1482,7 +1638,9 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
 {player}
 {_lightbox()}
 {_shortcut_overlay()}"""
-    return _page(lesson["title"], body, depth=1, lesson_slug=lesson["slug"])
+    return _page(
+        lesson["title"], body, depth=1, lesson_slug=lesson["slug"], scripts=(("app.js", SCRIPT),)
+    )
 
 
 def render_course_page(course: dict) -> str:
@@ -1527,12 +1685,18 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
             f"</div></a></li>"
         )
     meta = note if note and not courses else f"{len(courses)} courses"
+    # Filled in by status.js from status.json, which the builder keeps current.
+    # Static markup so the page is not blank for the length of the first poll.
+    status = """<section class="building" id="build-status" hidden>
+  <h2>Processing<span class="count" id="build-count"></span></h2>
+  <ul id="build-list"></ul>
+</section>"""
     body = f"""<header class="top">
   <h1>Courses</h1>
   <div class="meta">{_esc(meta)}</div>
 </header>
-<div class="wrap"><ul class="cards">{"".join(cards)}</ul></div>"""
-    return _page("Courses", body, depth=0)
+<div class="wrap">{status}<ul class="cards">{"".join(cards)}</ul></div>"""
+    return _page("Courses", body, depth=0, scripts=(("status.js", STATUS_SCRIPT),))
 
 
 def render_lesson_markdown(lesson: dict) -> str:
@@ -1564,6 +1728,7 @@ def write_assets(site_dir: Path) -> None:
     assets.mkdir(parents=True, exist_ok=True)
     (assets / "style.css").write_text(STYLE)
     (assets / "app.js").write_text(SCRIPT)
+    (assets / "status.js").write_text(STATUS_SCRIPT)
 
 
 def write_placeholder(site_dir: Path, note: str) -> None:

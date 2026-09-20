@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from video_to_website import render, steps as steps_mod
+from video_to_website import progress as progress_mod, render, steps as steps_mod
 from video_to_website.llm import LLMError, extract_json
 from video_to_website.util import hms, natural_key, slugify, title_from_filename
 
@@ -806,6 +806,95 @@ class RenderTests(unittest.TestCase):
         html = render.render_root_index([self.course], note="Nothing built yet.")
         self.assertNotIn("Nothing built yet.", html)
         self.assertIn("1 courses", html)
+
+
+class ProgressTests(unittest.TestCase):
+    """The status file is the only thing the page can see a build through."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.site = Path(self.tmp.name) / "site"
+        self.courses = [
+            {"title": "A Course", "videos": [Path("/lib/car_body.mp4"), Path("/lib/b.mp4")]}
+        ]
+
+    def status(self) -> dict:
+        return json.loads((self.site / progress_mod.STATUS_NAME).read_text())
+
+    def test_plan_queues_every_video(self):
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        data = self.status()
+        self.assertTrue(data["building"])
+        self.assertEqual([v["state"] for v in data["videos"]], ["queued", "queued"])
+        self.assertEqual([v["course"] for v in data["videos"]], ["A Course", "A Course"])
+        self.assertEqual(data["videos"][0]["title"], "car body")
+
+    def test_stages_advance_the_current_video(self):
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        p.start(Path("/lib/car_body.mp4"))
+        p.stage("transcribe")
+        first = self.status()["videos"][0]
+        self.assertEqual(first["state"], "working")
+        self.assertEqual(first["label"], "Transcribing the audio")
+        self.assertEqual(first["step"], 2)
+        self.assertEqual(first["steps"], len(progress_mod.STAGE_LABELS))
+        # The one that has not started yet must not have moved.
+        self.assertEqual(self.status()["videos"][1]["state"], "queued")
+
+    def test_finish_records_the_outcome(self):
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        p.start(Path("/lib/car_body.mp4"))
+        p.finish("failed")
+        self.assertEqual(self.status()["videos"][0]["state"], "failed")
+        # A stage call after the video is done belongs to nobody, and is dropped
+        # rather than landing on the wrong row.
+        p.stage("frames")
+        self.assertEqual(self.status()["videos"][0]["stage"], None)
+
+    def test_finish_build_moves_the_stamp_the_page_watches(self):
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        before = self.status()["built"]
+        p.finish_build()
+        after = self.status()
+        self.assertGreater(after["built"], before)
+        self.assertFalse(after["building"])
+        self.assertEqual([v["state"] for v in after["videos"]], ["done", "done"])
+
+    def test_the_stamp_survives_a_restart(self):
+        """Otherwise every service restart reloads every open browser."""
+        first = progress_mod.Progress(self.site)
+        first.plan(self.courses)
+        first.finish_build()
+        stamp = self.status()["built"]
+        self.assertEqual(progress_mod.Progress(self.site).built, stamp)
+
+    def test_queue_labels_files_that_are_still_arriving(self):
+        p = progress_mod.Progress(self.site)
+        p.queue([Path("/lib/course/a.mp4")], "Waiting for the copy to finish")
+        entry = self.status()["videos"][0]
+        self.assertEqual(entry["state"], "queued")
+        self.assertEqual(entry["label"], "Waiting for the copy to finish")
+        self.assertEqual(entry["course"], "course")
+        self.assertFalse(self.status()["building"])
+
+    def test_no_site_directory_means_no_writing(self):
+        p = progress_mod.Progress(None)
+        p.plan(self.courses)
+        p.start(Path("/lib/car_body.mp4"))
+        p.stage("scenes")
+        p.finish_build()
+        self.assertFalse(self.site.exists())
+
+    def test_nothing_is_left_half_written(self):
+        p = progress_mod.Progress(self.site)
+        p.plan(self.courses)
+        p.finish_build()
+        self.assertEqual(list(self.site.glob("*.tmp")), [])
 
 
 class RangeRequestTests(unittest.TestCase):
