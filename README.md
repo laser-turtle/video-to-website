@@ -503,6 +503,24 @@ Point `v2w build` at a folder. If that folder holds videos, it is one course. If
 holds subfolders that hold videos, each subfolder becomes its own course. Files are
 ordered naturally, so `lesson 2` sorts before `lesson 10`.
 
+That descent is **one level only**, which matters for the service: the library is
+itself the folder of course folders, so a course goes directly inside it.
+
+```
+/var/lib/video-to-website/library/
+  cgboost_launch_pad_2/          <- a course
+    01_car_body.mp4              <- its lessons
+    02_wheels.mp4
+```
+
+Nest one deeper -- `library/courses/cgboost_launch_pad_2/` -- and the wrapper
+becomes the course instead: a single course named `courses` with every video
+under it flattened into one lesson list. Moving the course folder up one level
+fixes it, and costs no rebuilding: the stage cache identifies a video by its
+size and modification time rather than its path, so a course folder can be
+renamed or moved without re-transcribing it. Move its directory under `work/`
+to match the new course name and even that lookup stays warm.
+
 ```
 site/
   index.html                        all courses

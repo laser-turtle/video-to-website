@@ -136,8 +136,14 @@ def title_from_filename(path: Path) -> str:
 
 
 def file_fingerprint(path: Path) -> dict[str, Any]:
+    """Identify a video by its contents, not by where it sits.
+
+    Deliberately no path: the cache already lives in a directory of its own per
+    lesson, so the path adds nothing, and including it threw away hours of
+    transcription every time a course folder was renamed or moved.
+    """
     stat = path.stat()
-    return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
 def read_stage(cache_path: Path, fingerprint: dict, params: dict) -> Any | None:
@@ -150,7 +156,12 @@ def read_stage(cache_path: Path, fingerprint: dict, params: dict) -> Any | None:
         return None
     if blob.get("tool_version") != __version__:
         return None
-    if blob.get("fingerprint") != fingerprint or blob.get("params") != params:
+    if blob.get("params") != params:
+        return None
+    # Compared key by key rather than whole: a cache written by an older build
+    # carries fields this one no longer asks about, and is still valid.
+    stored = blob.get("fingerprint")
+    if not isinstance(stored, dict) or any(stored.get(k) != v for k, v in fingerprint.items()):
         return None
     return blob.get("data")
 

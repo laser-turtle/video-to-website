@@ -9,7 +9,15 @@ from pathlib import Path
 
 from video_to_website import progress as progress_mod, render, steps as steps_mod
 from video_to_website.llm import LLMError, extract_json
-from video_to_website.util import hms, natural_key, slugify, title_from_filename
+from video_to_website.util import (
+    file_fingerprint,
+    hms,
+    natural_key,
+    read_stage,
+    slugify,
+    title_from_filename,
+    write_stage,
+)
 
 
 class ExtractJsonTests(unittest.TestCase):
@@ -806,6 +814,53 @@ class RenderTests(unittest.TestCase):
         html = render.render_root_index([self.course], note="Nothing built yet.")
         self.assertNotIn("Nothing built yet.", html)
         self.assertIn("1 courses", html)
+
+
+class StageCacheTests(unittest.TestCase):
+    """Moving a course must not throw away the transcription work."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.video = self.root / "a.mp4"
+        self.video.write_bytes(b"pretend this is video")
+        self.cache = self.root / "probe.json"
+        self.params = {"stage": "probe"}
+
+    def test_a_moved_file_keeps_its_fingerprint(self):
+        before = file_fingerprint(self.video)
+        moved = self.root / "elsewhere" / "a.mp4"
+        moved.parent.mkdir()
+        self.video.rename(moved)
+        self.assertEqual(file_fingerprint(moved), before)
+
+    def test_the_cache_survives_the_move(self):
+        write_stage(self.cache, file_fingerprint(self.video), self.params, {"duration": 12})
+        moved = self.root / "elsewhere" / "a.mp4"
+        moved.parent.mkdir()
+        self.video.rename(moved)
+        self.assertEqual(
+            read_stage(self.cache, file_fingerprint(moved), self.params), {"duration": 12}
+        )
+
+    def test_a_cache_from_an_older_build_still_counts(self):
+        """Those carry a path field this build no longer asks about."""
+        legacy = dict(file_fingerprint(self.video), path=str(self.video))
+        write_stage(self.cache, legacy, self.params, {"duration": 12})
+        self.assertEqual(
+            read_stage(self.cache, file_fingerprint(self.video), self.params), {"duration": 12}
+        )
+
+    def test_edited_content_still_misses(self):
+        write_stage(self.cache, file_fingerprint(self.video), self.params, {"duration": 12})
+        self.video.write_bytes(b"a different video entirely")
+        self.assertIsNone(read_stage(self.cache, file_fingerprint(self.video), self.params))
+
+    def test_different_stage_params_still_miss(self):
+        write_stage(self.cache, file_fingerprint(self.video), self.params, {"duration": 12})
+        other = read_stage(self.cache, file_fingerprint(self.video), {"stage": "probe", "v": 2})
+        self.assertIsNone(other)
 
 
 class ProgressTests(unittest.TestCase):
