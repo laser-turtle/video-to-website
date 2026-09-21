@@ -16,6 +16,7 @@
     var expand = root.querySelector('[data-course-expand]');
     var collapse = root.querySelector('[data-course-collapse]');
     var progressFilter = root.querySelector('[data-course-progress]');
+    var hideCompleted = root.querySelector('[data-course-hide-completed]');
     var manage = root.querySelector('[data-manage-progress]');
     var bulk = root.querySelector('[data-reading-bulk]');
     var selected = new Set(), managing = false, lastChanges = [];
@@ -83,7 +84,12 @@
         row.querySelector('[data-lesson-progress]').textContent = V2WReading.label(row.reading);
         row.dataset.progress = V2WReading.stats(row.reading).status;
       });
-      groups.forEach(function (group) { group.progress.textContent = V2WReading.summary(group.rows.map(function (row) { return row.reading; })); });
+      groups.forEach(function (group) {
+        var lessons = group.rows.map(function (row) { return row.reading; });
+        var state = V2WReading.aggregate(lessons);
+        group.details.dataset.complete = String(state.total > 0 && state.done === state.total);
+        group.progress.textContent = V2WReading.summary(lessons);
+      });
       filter();
     }
     function textNode(tag, text, className) {
@@ -136,6 +142,7 @@
     function filter() {
       var terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
       var state = progressFilter.value;
+      hideCompleted.checked = state === 'unfinished';
       var filtered = terms.length || state !== 'all';
       var visible = 0;
       rows.forEach(function (row) {
@@ -210,6 +217,10 @@
     clear.addEventListener('click', function () { search.value = ''; progressFilter.value = 'all'; filter(); search.focus(); });
     progressFilter.value = 'all';
     progressFilter.addEventListener('change', filter);
+    hideCompleted.addEventListener('change', function () {
+      progressFilter.value = hideCompleted.checked ? 'unfinished' : 'all';
+      filter();
+    });
     if (manage) {
       manage.addEventListener('click', function () {
         managing = !managing; root.dataset.managing = String(managing); bulk.hidden = !managing;

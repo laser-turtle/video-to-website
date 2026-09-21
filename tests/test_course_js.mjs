@@ -52,6 +52,7 @@ function fixture({course = 'stable-course', reader = false, current = '', items}
   const view = node('select', '', {courseView: ''});
   const density = node('select', '', {courseDensity: ''});
   const progressFilter = node('select', '', {courseProgress: ''});
+  const hideCompleted = node('input', '', {courseHideCompleted: ''});
   const manage = reader ? null : node('button', '', {manageProgress: ''});
   const bulk = reader ? null : node('section', '', {readingBulk: ''});
   if (bulk) {
@@ -81,7 +82,7 @@ function fixture({course = 'stable-course', reader = false, current = '', items}
     row.append(new Element('span', {lessonProgress: ''}));
     container.append(row); return row;
   });
-  return {root, search, sort, view, density, progressFilter, manage, bulk, clear, expand, collapse, controls, count, empty, container, rows};
+  return {root, search, sort, view, density, progressFilter, hideCompleted, manage, bulk, clear, expand, collapse, controls, count, empty, container, rows};
 }
 const state = new Map();
 const storage = {getItem: key => state.get(key) || null, setItem: (key, value) => state.set(key, value)};

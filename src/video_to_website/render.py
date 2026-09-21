@@ -31,6 +31,8 @@ STYLE = """\
   --line: #e3e2de;
   --accent: #b4530a;
   --accent-soft: #fdf1e6;
+  --complete: #247347;
+  --complete-soft: #edf7ef;
   --radius: 10px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --player-h: 0px;
@@ -44,6 +46,8 @@ STYLE = """\
     --line: #32323a;
     --accent: #ff9e4a;
     --accent-soft: #2a2119;
+    --complete: #7bd39a;
+    --complete-soft: #1c2d23;
   }
 }
 * { box-sizing: border-box; }
@@ -497,6 +501,8 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .course-tools-note, .course-results { color: var(--muted); font-size: 12.5px; margin: 8px 0; }
 .course-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
 .course-actions .course-results { flex: 1 1 140px; }
+.course-hide-completed { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; min-height: 40px; }
+.course-hide-completed input { width: 18px; height: 18px; accent-color: var(--accent); }
 .course-chapter { margin-bottom: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 .course-chapter > summary { cursor: pointer; padding: 12px 16px; font-size: 15px; font-weight: 600; }
 .chapter-meta { display: inline-block; margin-left: 10px; color: var(--muted); font-weight: 400; font-size: 12.5px; }
@@ -528,6 +534,25 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 ul.cards .reading-summary { margin: 10px 0 0; }
 .lesson-reading { display: block; color: var(--accent); font-size: 12px; font-weight: 500; margin-top: 7px; }
 .chapter-reading { display: block; margin: 5px 0 0 15px; color: var(--accent); font-size: 12px; font-weight: 400; }
+.course-browser [data-progress="complete"] > a,
+.course-chapter[data-complete="true"],
+ul.cards > li[data-complete="true"],
+.reading-control[data-complete="true"] {
+  background: var(--complete-soft);
+  box-shadow: inset 4px 0 0 var(--complete);
+}
+.course-browser [data-progress="complete"] .lesson-reading,
+.course-chapter[data-complete="true"] > summary .chapter-reading,
+.reading-summary[data-complete="true"], .reading-control[data-complete="true"] { color: var(--complete); }
+.course-browser [data-progress="complete"] .lesson-reading::before,
+.course-chapter[data-complete="true"] > summary .chapter-reading::before,
+[data-complete="true"] > [data-reading-text]::before { content: "✓ "; }
+.reading-summary[data-complete="true"] progress,
+.reading-control[data-complete="true"] progress { accent-color: var(--complete); }
+.reading-summary[data-complete="true"] progress::-webkit-progress-value,
+.reading-control[data-complete="true"] progress::-webkit-progress-value { background: var(--complete); }
+.reading-summary[data-complete="true"] progress::-moz-progress-bar,
+.reading-control[data-complete="true"] progress::-moz-progress-bar { background: var(--complete); }
 .reading-bulk { padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 14px; }
 .reading-bulk .course-actions { margin: 0; }
 .reading-bulk button:disabled { opacity: .5; cursor: default; }
@@ -2401,6 +2426,7 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
   <div class="course-actions" data-course-controls hidden>
     <span class="course-results" role="status" aria-live="polite"></span>
     <button type="button" data-course-clear hidden>Clear search</button>
+    <label class="course-hide-completed"><input type="checkbox" data-course-hide-completed>Hide completed</label>
     <button type="button" data-course-expand>Expand all</button>
     <button type="button" data-course-collapse>Collapse all</button>
     {'' if reader else '<button type="button" data-manage-progress aria-expanded="false">Manage progress</button>'}

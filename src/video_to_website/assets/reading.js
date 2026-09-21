@@ -63,6 +63,9 @@ var V2WReading = (function () {
   }
   function paint(node, lessons) {
     var s = aggregate(lessons);
+    node.dataset.complete = String(s.total > 0 && s.done === s.total);
+    var card = node.closest('[data-course-id]');
+    if (card) card.dataset.complete = node.dataset.complete;
     node.querySelector('[data-reading-text]').textContent = summary(lessons);
     var bar = node.querySelector('progress');
     bar.value = percent(s.fraction);
@@ -93,6 +96,7 @@ var V2WReading = (function () {
     var changes = [];
     function refresh() {
       var s = V2WReading.stats(lesson);
+      node.dataset.complete = String(s.status === 'complete');
       node.querySelector('[data-reading-text]').textContent = V2WReading.label(lesson);
       node.querySelector('progress').value = V2WReading.percent(s.fraction);
       button.textContent = s.status === 'complete' ? 'Reset lesson progress' : 'Mark lesson complete';
