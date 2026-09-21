@@ -404,6 +404,8 @@ class LibraryTests(unittest.TestCase):
             db.execute("ALTER TABLE lessons DROP COLUMN chapter_override")
             db.execute("DROP TABLE reclaimed_sources")
             db.execute("PRAGMA user_version=5")
+            db.execute("DROP TABLE reading_state")
+            db.execute("DROP TABLE reader_preferences")
         migrated = Catalog(self.catalog.directory)
         self.assertEqual(migrated.library(), before)
         self.assertEqual(migrated.rows("PRAGMA user_version")[0]["user_version"], SCHEMA_VERSION)

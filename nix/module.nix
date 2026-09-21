@@ -129,6 +129,12 @@ in
       description = "Allow paired processing helpers and expose the Workers management page's API. Works independently of browser uploads.";
     };
 
+    readingState = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Synchronize reading progress and reader preferences through SQLite, using one shared reader profile.";
+    };
+
     apiPort = mkOption {
       type = types.port;
       default = 8765;
@@ -231,7 +237,7 @@ in
     };
 
     # Uploads survive worker restarts and failures in native media tools.
-    systemd.services.video-to-website-api = mkIf (cfg.uploads || cfg.workers) {
+    systemd.services.video-to-website-api = mkIf (cfg.uploads || cfg.workers || cfg.readingState) {
       description = "Manage the video-to-website library";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
@@ -241,7 +247,8 @@ in
           "--state" "${cfg.stateDir}/state"
           "--port" (toString cfg.apiPort) "--bind" "127.0.0.1"
           "--min-free-gib" (toString cfg.minFreeGiB)
-        ] ++ lib.optional (!cfg.uploads) "--no-uploads" ++ lib.optional (!cfg.workers) "--no-workers");
+        ] ++ lib.optional (!cfg.uploads) "--no-uploads" ++ lib.optional (!cfg.workers) "--no-workers"
+          ++ lib.optional (!cfg.readingState) "--no-reading-state");
         ExecStartPre = "-+${takeLibrary}/bin/v2w-take-library";
         User = cfg.user;
         Group = cfg.group;
@@ -271,7 +278,7 @@ in
         locations."/assets/".extraConfig = ''
           add_header Cache-Control "public, max-age=31536000, immutable";
         '';
-        locations."/api/" = mkIf (cfg.uploads || cfg.workers) {
+        locations."/api/" = mkIf (cfg.uploads || cfg.workers || cfg.readingState) {
           proxyPass = "http://127.0.0.1:${toString cfg.apiPort}";
           extraConfig = ''
             # A lesson is a couple of gigabytes, so no cap on the body.

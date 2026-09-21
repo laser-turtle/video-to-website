@@ -180,7 +180,7 @@ Saved snapshots and historical media are never garbage-collected by this action;
 
 ```text
 library/                         user-managed source videos
-state/catalog.sqlite             library metadata and build intent
+state/catalog.sqlite             library metadata, build intent, shared reading state
 state/workflows.sqlite           DBOS execution history and checkpoints
 state/*.lock                     process/publication coordination
 state/worker-results/            remote outputs retained for active builds/replay
@@ -201,8 +201,29 @@ previous published revision remains usable when its replacement fails.
 
 Reading state is namespaced by lesson identity and instruction content. A rename
 preserves it; changing instructions gives a new namespace so completion does not
-silently attach to unrelated steps. This does not yet implement cross-device sync
-or migrate ambiguous old slug-only localStorage keys.
+silently attach to unrelated steps. Schema v8 adds `reading_state` (namespace,
+lesson ID, step booleans, revision, update time) and `reader_preferences` (one
+shared profile, validated preferences and revision). `GET/POST /api/reading`
+serves them independently of upload and helper permissions. It uses short SQLite
+transactions, without DBOS workflows or the publication file lock.
+
+Every edit validates the currently published namespace and step IDs. Bulk edits
+use one `BEGIN IMMEDIATE` transaction and compare each lesson's revision, so one
+conflict rolls back the entire batch. Reader preferences use a separate revision.
+Undo retains before/after states and revisions in the page and refuses to replace
+later edits. Existing browser state is imported only when the namespace has no
+server row; resets keep rows so stale browsers cannot resurrect cleared progress.
+Historical namespaces stay in SQLite but only current, non-deleted lessons are
+returned. Ambiguous old slug-only localStorage keys are not migrated.
+
+`reader-state.js` owns synchronization, validated legacy preference import and
+local export fallback; `reading.js` computes the same completion fractions for
+all overviews and the reader. Visible pages refresh every ten seconds, on focus,
+and after conflicts or uncertain saves. Once a server is detected, an outage
+disables edits rather than creating an offline fork. The Settings page and reader
+shortcuts share playback preferences. Static exports use localStorage; view and
+disclosure preferences stay local in both modes. Separate user identities and an
+offline mutation queue are not implemented.
 
 **Library organization**
 
@@ -365,8 +386,9 @@ the home and queue pages and uses indeterminate bars when no percentage is known
   temporary file and a locked destination check, while exact existing-name lookup
   avoids rewriting the target of a rename/delete request. Library reconciliation
   and API mutations share the catalog lock.
-- Chapter editing, moving lessons between courses, bulk management, trash/restore,
-  resumable uploads, and synchronized reading state remain future UI work.
+- Custom chapter names, moving lessons between courses, trash/restore, resumable
+  uploads, and synchronized reading position remain future UI work. Chapter
+  assignment, bulk organization, completion and playback settings are built.
 
 Validation includes an actual DBOS worker killed after transcription, removal of
 its transcript file cache, and restart against the same SQLite state. The recorded

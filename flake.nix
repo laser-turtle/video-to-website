@@ -234,6 +234,10 @@
             node tests/test_library_js.mjs src/video_to_website/assets/library.js
             node --check src/video_to_website/assets/course.js
             node tests/test_course_js.mjs src/video_to_website/assets/course.js
+            node --check src/video_to_website/assets/reader-state.js
+            node --check src/video_to_website/assets/reading.js
+            node tests/test_reading_js.mjs
+            node --check src/video_to_website/assets/settings.js
             node --check src/video_to_website/assets/navigation.js
             node tests/test_navigation_js.mjs src/video_to_website/assets/navigation.js
             node --check src/video_to_website/assets/storage.js

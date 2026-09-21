@@ -4,7 +4,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const source = readFileSync(process.argv[2], 'utf8');
+const source = ['reader-state.js', 'reading.js'].map(name => readFileSync('src/video_to_website/assets/' + name, 'utf8')).join('\n') + '\n' + readFileSync(process.argv[2], 'utf8');
+const flush = () => new Promise(resolve => setImmediate(resolve));
 
 // A minimal scrollable document, so paging through a tall step can be checked.
 const page = { y: 0, viewport: 800, height: 6000 };
@@ -206,6 +207,7 @@ new Function('document', 'window', 'IntersectionObserver', 'history', 'location'
   { replaceState() {} }, { hash: '' },
   storage,
 );
+await flush();
 
 const click = (target) => documentListeners.click.forEach((fn) => fn({ target, preventDefault() {} }));
 const collapsedAtStart = player.classes.has('collapsed');
@@ -319,7 +321,7 @@ press('v');
 assert.ok(player.classes.has('collapsed'), 'v collapses the player');
 assert.ok(!player.classes.has('focus') && !backdrop.classes.has('on'), 'no backdrop remains over the lesson');
 assert.deepEqual([mainVideo.paused, mainVideo.currentTime], playbackBeforeHide);
-assert.equal(saved['v2w:' + fakeDocument.body.dataset.lesson + ':player'], '1');
+assert.ok(player.classes.has('collapsed'));
 press('v', { tagName: 'INPUT' });
 assert.ok(player.classes.has('collapsed'), 'typing does not change player visibility');
 press('V');
@@ -330,7 +332,7 @@ assert.ok(!player.classes.has('collapsed'), 'holding v or using a browser shortc
 press('v');
 assert.ok(player.classes.has('collapsed'), 'v also collapses from the floating size');
 press('v');
-assert.equal(saved['v2w:' + fakeDocument.body.dataset.lesson + ':player'], '0');
+assert.ok(!player.classes.has('collapsed'));
 press('f');
 
 // 9. There is a cursor over the steps, and it starts at the first one.
@@ -344,12 +346,15 @@ press('Enter', { tagName: 'SUMMARY' });
 press('x', { tagName: 'A', closest: selector => selector === '.course-contents' });
 assert.ok(!step.classes.has('done'), 'Enter on navigation links and buttons keeps their native action');
 press('Enter');
+await flush();
 assert.ok(step.classes.has('done'), 'Enter marks the step done');
 assert.ok(stepTwo.classes.has('current'), 'and advances to the next');
 assert.equal(progressMeter.textContent, '1 of 2 steps done', 'progress follows');
 press('x');
+await flush();
 assert.ok(stepTwo.classes.has('done'), 'x marks the cursor step done');
 press('x');
+await flush();
 assert.ok(!stepTwo.classes.has('done'), 'and x again undoes it');
 
 // 11. g plays the video from the current step.
@@ -463,6 +468,7 @@ assert.equal(clipVideo.playbackRate, 1.25, 'and clips follow the same speed');
 press('.');
 assert.equal(mainVideo.playbackRate, 1.5, 'and again');
 assert.equal(rateReadout.textContent, '1.5x', 'the player shows the speed');
+await flush();
 assert.equal(saved['v2w:rate'], '1.5', 'stored under a key with no lesson in it');
 press(',');
 assert.equal(mainVideo.playbackRate, 1.25, ', slows down');
@@ -571,12 +577,14 @@ assert.equal(loopButton.textContent, 'loop', 'and the control says so');
 assert.ok(loopButton.classes.has('on'), 'lit up');
 
 press('r');
+await flush();
 assert.equal(clipVideo.loop, false, 'r turns looping off');
 assert.equal(loopButton.textContent, 'once', 'the control follows');
 assert.ok(!loopButton.classes.has('on'), 'and dims');
 assert.equal(saved['v2w:loop'], '0', 'remembered across lessons, like the speed');
 
 loopButton.fire('click');
+await flush();
 assert.equal(clipVideo.loop, true, 'the control toggles it as well as the key');
 assert.equal(saved['v2w:loop'], '1', 'and is remembered either way');
 
@@ -633,6 +641,7 @@ assert.equal(clipVideo.paused, false, 'so c resumes the same clip');
 // 21. Last of all, because it runs the script a second time: a fresh page
 // picks the stored speed back up. Everything it touches keeps its listeners,
 // so nothing may rely on the page state after this point.
+await flush();
 saved['v2w:rate'] = '1.75';
 const second = new Function('document', 'window', 'IntersectionObserver', 'history', 'location', 'localStorage', source);
 const isolatedDocument = Object.assign({}, fakeDocument, { addEventListener() {} });

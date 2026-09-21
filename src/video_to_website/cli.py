@@ -179,6 +179,7 @@ def _build_parser() -> argparse.ArgumentParser:
     api_cmd.add_argument("--port", type=int, default=8765)
     api_cmd.add_argument("--no-uploads", action="store_true", help="disable library mutations while keeping worker endpoints available")
     api_cmd.add_argument("--no-workers", action="store_true", help="disable remote-helper endpoints")
+    api_cmd.add_argument("--no-reading-state", action="store_true", help="disable shared reading progress and preferences")
     _add_storage_options(api_cmd)
     jobs_cmd = sub.add_parser("jobs", help="inspect, retry, or cancel durable lesson builds")
     jobs_cmd.add_argument("action", choices=["list", "retry", "cancel"], default="list", nargs="?")
@@ -345,6 +346,7 @@ def _cmd_api(args: argparse.Namespace) -> int:
         server.min_free_bytes = args.min_free_bytes
         server.uploads_enabled = not args.no_uploads
         server.workers_enabled = not args.no_workers
+        server.reading_enabled = not args.no_reading_state
         with server.catalog.connect() as db:
             db.execute("INSERT OR REPLACE INTO settings VALUES('workers_enabled',?)", ("0" if args.no_workers else "1",))
             db.execute("INSERT OR REPLACE INTO settings VALUES('min_free_bytes',?)", (str(args.min_free_bytes),))

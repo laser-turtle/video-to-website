@@ -15,6 +15,23 @@
     var clear = root.querySelector('[data-course-clear]');
     var expand = root.querySelector('[data-course-expand]');
     var collapse = root.querySelector('[data-course-collapse]');
+    var progressFilter = root.querySelector('[data-course-progress]');
+    var manage = root.querySelector('[data-manage-progress]');
+    var bulk = root.querySelector('[data-reading-bulk]');
+    var selected = new Set(), managing = false, lastChanges = [];
+    rows.forEach(function (row) {
+      row.reading = JSON.parse(row.dataset.reading);
+      if (!manage) return;
+      var label = document.createElement('label'); label.className = 'reading-select';
+      var box = document.createElement('input'); box.type = 'checkbox';
+      box.setAttribute('aria-label', 'Select ' + row.dataset.title);
+      label.append(box);
+      row.prepend(label); row.selectionBox = box;
+      box.addEventListener('change', function () {
+        if (box.checked) selected.add(row); else selected.delete(row);
+        selection();
+      });
+    });
     var hasChapters = rows.some(function (row) { return row.dataset.chapter !== ''; });
     var reader = root.dataset.context === 'reader';
     var key = 'v2w:course:' + root.dataset.course + ':navigation';
@@ -46,6 +63,29 @@
         Math.floor(minutes / 60) + 'h ' + String(minutes % 60).padStart(2, '0') + 'm';
     }
     function lessonCount(n) { return n + (n === 1 ? ' lesson' : ' lessons'); }
+    function selection() {
+      if (!bulk) return;
+      var hidden = rows.filter(function (row) { return row.hidden && selected.has(row); }).length;
+      bulk.querySelector('[data-reading-selected]').textContent = selected.size + ' selected' + (hidden ? ' (' + hidden + ' hidden by filters)' : '');
+      bulk.querySelector('[data-reading-complete]').disabled = bulk.querySelector('[data-reading-reset]').disabled = !selected.size || !V2WReaderState.writable();
+      bulk.querySelector('[data-reading-undo]').disabled = !V2WReaderState.writable();
+      bulk.querySelector('[data-reading-select-all]').disabled = !rows.some(function (row) { return !row.hidden; });
+      rows.forEach(function (row) { row.dataset.selected = String(selected.has(row)); row.selectionBox.checked = selected.has(row); });
+      groups.forEach(function (group) {
+        if (!group.selectBox) return;
+        var n = group.rows.filter(function (row) { return selected.has(row); }).length;
+        group.selectBox.checked = n === group.rows.length;
+        group.selectBox.indeterminate = n > 0 && n < group.rows.length;
+      });
+    }
+    function progress() {
+      rows.forEach(function (row) {
+        row.querySelector('[data-lesson-progress]').textContent = V2WReading.label(row.reading);
+        row.dataset.progress = V2WReading.stats(row.reading).status;
+      });
+      groups.forEach(function (group) { group.progress.textContent = V2WReading.summary(group.rows.map(function (row) { return row.reading; })); });
+      filter();
+    }
     function textNode(tag, text, className) {
       var node = document.createElement(tag);
       node.textContent = text;
@@ -66,12 +106,27 @@
       summary.append(textNode('span', group.label));
       group.meta = textNode('span', '', 'chapter-meta');
       summary.append(group.meta);
+      group.progress = textNode('span', '', 'chapter-reading');
+      summary.append(group.progress);
       group.list = document.createElement('ol');
       group.list.className = 'lesson-list';
-      group.details.append(summary, group.list);
+      group.details.append(summary);
+      if (manage) {
+        group.selection = document.createElement('label'); group.selection.className = 'chapter-selection';
+        group.selectBox = document.createElement('input'); group.selectBox.type = 'checkbox';
+        group.selectBox.setAttribute('aria-label', 'Select all lessons in ' + group.label);
+        group.selection.append(group.selectBox, textNode('span', 'Select entire ' + group.label.toLocaleLowerCase() + ' (including filtered lessons)'));
+        group.selection.hidden = !managing;
+        group.selectBox.addEventListener('change', function () {
+          group.rows.forEach(function (row) { if (group.selectBox.checked) selected.add(row); else selected.delete(row); });
+          selection();
+        });
+        group.details.append(group.selection);
+      }
+      group.details.append(group.list);
       group.details.addEventListener('toggle', function () {
         // Programmatic opening during search must not erase the user's choices.
-        if (!group.details.isConnected || search.value.trim() || group.details.open === group.expectedOpen) return;
+        if (!group.details.isConnected || search.value.trim() || progressFilter.value !== 'all' || group.details.open === group.expectedOpen) return;
         group.expectedOpen = group.details.open;
         opened[group.key] = group.details.open;
         save();
@@ -80,23 +135,27 @@
     }
     function filter() {
       var terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      var state = progressFilter.value;
+      var filtered = terms.length || state !== 'all';
       var visible = 0;
       rows.forEach(function (row) {
         var haystack = row.dataset.search.toLocaleLowerCase();
-        row.hidden = !terms.every(function (term) { return haystack.includes(term); });
+        var matchesProgress = state === 'all' || (state === 'unfinished' ? row.dataset.progress !== 'complete' : row.dataset.progress === state);
+        row.hidden = !matchesProgress || !terms.every(function (term) { return haystack.includes(term); });
         if (!row.hidden) visible++;
       });
       groups.forEach(function (group) {
         var matches = group.rows.filter(function (row) { return !row.hidden; });
         group.details.hidden = !matches.length;
-        group.meta.textContent = (terms.length ? matches.length + ' of ' : '') + lessonCount(group.rows.length) +
+        group.meta.textContent = (filtered ? matches.length + ' of ' : '') + lessonCount(group.rows.length) +
           ' · ' + duration(matches.reduce(function (sum, row) { return sum + Number(row.dataset.duration); }, 0));
-        setOpen(group, terms.length ? matches.length > 0 : group.preferredOpen);
+        setOpen(group, filtered ? matches.length > 0 : group.preferredOpen);
       });
-      count.textContent = terms.length ? visible + ' of ' + lessonCount(rows.length) : lessonCount(rows.length);
-      empty.textContent = rows.length ? 'No lessons match your search.' : 'No lessons published yet.';
+      count.textContent = filtered ? visible + ' of ' + lessonCount(rows.length) : lessonCount(rows.length);
+      empty.textContent = rows.length ? 'No lessons match your search or progress filter.' : 'No lessons published yet.';
       empty.hidden = visible !== 0;
-      clear.hidden = !search.value;
+      clear.hidden = !search.value && state === 'all';
+      selection();
     }
     function rebuild() {
       var ordered = rows.slice();
@@ -138,16 +197,51 @@
           // Update the preferred state on native user toggles as well as the
           // stored value, so clearing a search restores the in-page selection.
           group.details.addEventListener('toggle', function () {
-            if (!search.value.trim() && group.details.isConnected) group.preferredOpen = group.details.open;
+            if (!search.value.trim() && progressFilter.value === 'all' && group.details.isConnected) group.preferredOpen = group.details.open;
           });
           container.append(group.details);
         });
       }
       expand.hidden = collapse.hidden = !groups.length;
-      filter();
+      progress();
     }
     search.addEventListener('input', filter);
-    clear.addEventListener('click', function () { search.value = ''; filter(); search.focus(); });
+    clear.textContent = 'Clear filters';
+    clear.addEventListener('click', function () { search.value = ''; progressFilter.value = 'all'; filter(); search.focus(); });
+    progressFilter.value = 'all';
+    progressFilter.addEventListener('change', filter);
+    if (manage) {
+      manage.addEventListener('click', function () {
+        managing = !managing; root.dataset.managing = String(managing); bulk.hidden = !managing;
+        manage.setAttribute('aria-expanded', String(managing));
+        manage.textContent = managing ? 'Finish managing' : 'Manage progress';
+        groups.forEach(function (group) { group.selection.hidden = !managing; });
+        if (!managing) selected.clear();
+        selection();
+      });
+      bulk.querySelector('[data-reading-select-all]').addEventListener('click', function () {
+        rows.forEach(function (row) { if (!row.hidden) selected.add(row); }); selection();
+      });
+      bulk.querySelector('[data-reading-deselect]').addEventListener('click', function () { selected.clear(); selection(); });
+      async function apply(value) {
+        var message = bulk.querySelector('[data-reading-message]');
+        try {
+          var result = await V2WReading.mark(rows.filter(function (row) { return selected.has(row); }).map(function (row) { return row.reading; }), value);
+          lastChanges = result.changes;
+          bulk.querySelector('[data-reading-undo]').hidden = !lastChanges.length;
+          message.textContent = V2WReading.report(result, value ? 'Completed' : 'Reset');
+          selected.clear(); selection();
+        } catch (e) { message.textContent = e.message; }
+      }
+      bulk.querySelector('[data-reading-complete]').addEventListener('click', function () { apply(true); });
+      bulk.querySelector('[data-reading-reset]').addEventListener('click', function () { apply(false); });
+      bulk.querySelector('[data-reading-undo]').addEventListener('click', async function () {
+        try {
+          bulk.querySelector('[data-reading-message]').textContent = V2WReading.report(await V2WReading.undo(lastChanges), 'Restored');
+          lastChanges = []; bulk.querySelector('[data-reading-undo]').hidden = true;
+        } catch (e) { bulk.querySelector('[data-reading-message]').textContent = e.message; }
+      });
+    }
     [sort, view].forEach(function (control) {
       control.addEventListener('change', function () { rebuild(); save(); });
     });
@@ -158,13 +252,14 @@
           if (group.details.hidden) return;
           var value = button === expand;
           setOpen(group, value);
-          if (!search.value.trim()) { group.preferredOpen = value; opened[group.key] = value; }
+          if (!search.value.trim() && progressFilter.value === 'all') { group.preferredOpen = value; opened[group.key] = value; }
         });
         save();
       });
     });
     root.dataset.density = density.value;
     rebuild();
+    V2WReading.subscribe(progress);
     root.querySelectorAll('[data-course-controls]').forEach(function (node) { node.hidden = false; });
     var contents = root.closest('.course-contents');
     if (contents) contents.addEventListener('toggle', function () {

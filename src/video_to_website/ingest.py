@@ -190,8 +190,9 @@ class IngestMixin:
     def api_get(self) -> bool:
         """Answer a GET if it is an API call. Returns whether it was."""
         from .worker_api import handle_worker_api
+        from .reading_state import handle_reading_api
 
-        if handle_worker_api(self):
+        if handle_reading_api(self) or handle_worker_api(self):
             return True
         path = urlparse(self.path).path
         if not path.startswith(API_PREFIX):
@@ -307,8 +308,9 @@ class IngestMixin:
 
     def do_POST(self):
         from .worker_api import handle_worker_api
+        from .reading_state import handle_reading_api
 
-        if handle_worker_api(self):
+        if handle_reading_api(self) or handle_worker_api(self):
             return
         parts = urlparse(self.path).path.strip("/").split("/")
         if not getattr(self.server, "uploads_enabled", True):

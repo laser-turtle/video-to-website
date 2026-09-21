@@ -582,7 +582,8 @@ class RenderTests(unittest.TestCase):
     def test_playback_speed_is_remembered_across_lessons(self):
         # The per-lesson key is prefixed with the lesson; speed must not be.
         script = render.SCRIPT
-        self.assertIn("var RATE_KEY = 'v2w:rate'", script)
+        self.assertIn("V2WReaderState.preferences().rate", script)
+        self.assertIn("local('v2w:rate')", render.READING_SCRIPT)
         self.assertNotIn("key + ':rate'", script)
         html = render.render_lesson_page(self.lesson, self.course)
         self.assertIn('<span class="rate">1x</span>', html)

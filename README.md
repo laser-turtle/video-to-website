@@ -221,11 +221,11 @@ The steps and their screenshots get the full column, because that is what you re
 video is reference material, so it lives in a small player floating in the corner that
 starts collapsed and opens by itself the moment you click a timestamp. Press `v`
 to collapse or reopen it without changing playback. Its header
-collapses it again, and that choice is remembered.
+collapses it again. Settings controls whether it starts collapsed when opening a lesson.
 
-Playback speed steps through 0.75x up to 3x with `,` and `.`, and is remembered under a
-key of its own rather than per lesson, so the speed you watch at follows you from one
-lesson to the next. Clips run at it too. Changing it with the player's own controls is
+Playback speed steps through 0.75x up to 3x with `,` and `.`, and is saved as a shared
+reader preference, so the speed follows you across lessons and devices.
+Clips run at it too. Changing it with the player's own controls is
 picked up as well, and the current speed sits in the player's header.
 
 Between lessons, **Shift+J / Shift+K** opens the next/previous lesson, and
@@ -269,8 +269,37 @@ moves the cursor too, but never scrolls the page under you.
 Every step timestamp, screenshot, clip caption, and transcript line is a jump point.
 Clicking the same one a second time pauses, so a click is how you stop to look at
 something and a second click is how you carry on. Each step has a checkbox that
-persists in the browser, and the step covering the current playback position is
+syncs through the server, and the step covering the current playback position is
 highlighted as the video plays.
+
+Course cards, chapter headings, and lesson rows show completion. A lesson's fraction
+comes from its checked steps; video-only lessons have a single completion toggle.
+Course/chapter percentages average their lessons' fractions, so partial work counts
+without a long lesson outweighing all the short ones. Percentages reach 100% only
+when every lesson is complete.
+
+On a course overview, choose **Manage progress** to select individual lessons,
+entire chapters, or all lessons matching the current search/progress filter.
+**Mark complete** checks every step; **Reset progress** clears them. **Undo** restores
+the previous partial progress, leaving lessons edited since the action unchanged.
+Hidden selections are counted explicitly. The reader itself also has a
+**Mark lesson complete** / **Reset lesson progress** control.
+
+The **Settings** page (linked from All courses and every page footer) manages
+video/clip speed, clip looping, automatic clip playback, and whether the floating
+player starts collapsed. Speed and loop shortcuts update these same preferences.
+**Restore defaults** resets playback preferences without clearing completion.
+
+The service stores one shared reader profile in `catalog.sqlite`. Open pages poll
+for changes every ten seconds while visible and refresh when focused. Existing
+browser checkmarks and playback settings are imported when the server has no saved
+state for them; server progress, including explicit resets, takes precedence.
+Bulk changes save atomically and conflicting edits prompt a retry using the latest
+state. Server outages disable progress saves until reconnection; static exports
+without the API continue to use browser-local storage. Browser layout preferences
+and reading position are not synced. Set `services.video-to-website.readingState =
+false` (or `v2w api --no-reading-state`) to disable synchronization independently
+of uploads and processing helpers.
 
 Screenshots and clips declare their dimensions, so the page does not reflow under you as
 they load.

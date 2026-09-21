@@ -18,6 +18,8 @@ LIBRARY_SCRIPT = STORAGE_SCRIPT + "\n" + (Path(__file__).parent / "assets" / "li
 WORKERS_SCRIPT = (Path(__file__).parent / "assets" / "workers.js").read_text(encoding="utf-8")
 COURSE_SCRIPT = (Path(__file__).parent / "assets" / "course.js").read_text(encoding="utf-8")
 NAVIGATION_SCRIPT = (Path(__file__).parent / "assets" / "navigation.js").read_text(encoding="utf-8")
+READING_SCRIPT = (Path(__file__).parent / "assets" / "reader-state.js").read_text(encoding="utf-8") + "\n" + (Path(__file__).parent / "assets" / "reading.js").read_text(encoding="utf-8")
+SETTINGS_SCRIPT = (Path(__file__).parent / "assets" / "settings.js").read_text(encoding="utf-8")
 
 STYLE = """\
 :root {
@@ -502,6 +504,43 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .course-browser .lesson-list a > div { min-width: 0; flex: 1; }
 .course-browser .lesson-list a[aria-current="page"] { border-color: var(--accent); background: var(--accent-soft); }
 .course-browser .current-lesson { color: var(--accent); font-size: 12px; font-weight: 500; margin-left: 8px; }
+.reading-summary, .reading-control { margin: 0 0 18px; font-size: 13px; color: var(--muted); }
+.reading-summary[hidden], .reading-control[hidden] { display: none; }
+.reading-summary progress, .reading-control progress { display: block; width: 100%; height: 6px; margin-top: 8px; accent-color: var(--accent); }
+.reading-summary progress::-webkit-progress-bar, .reading-control progress::-webkit-progress-bar { background: var(--line); border-radius: 4px; }
+.reading-summary progress::-webkit-progress-value, .reading-control progress::-webkit-progress-value { background: var(--accent); border-radius: 4px; }
+.reading-summary progress::-moz-progress-bar, .reading-control progress::-moz-progress-bar { background: var(--accent); }
+.reading-control { padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); }
+.reading-control button { font: inherit; cursor: pointer; color: var(--accent); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-height: 40px; margin-top: 10px; }
+.reading-control [hidden] { display: none; }
+.reading-control [data-reading-message]:empty { display: none; }
+.reading-control [data-reading-message] { margin: 8px 0 0; }
+.reader-settings { padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.reader-settings h2 { font-size: 18px; margin: 0 0 16px; }
+.reader-settings label { display: flex; align-items: center; gap: 10px; margin: 18px 0; font-size: 15px; }
+.reader-settings select, .reader-settings button, #reading-reconnect { font: inherit; padding: 9px 12px; border: 1px solid var(--line); border-radius: 6px; color: var(--accent); background: var(--panel); }
+.reader-settings input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+.reader-settings button, #reading-reconnect { cursor: pointer; }
+.reader-settings button:disabled { opacity: .5; cursor: default; }
+.reader-settings :focus-visible, .reading-control :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.reader-settings .settings-help { font-size: 13px; color: var(--muted); line-height: 1.6; }
+.reading-note { font-size: 12px; color: var(--muted); margin: 6px 0; }
+ul.cards .reading-summary { margin: 10px 0 0; }
+.lesson-reading { display: block; color: var(--accent); font-size: 12px; font-weight: 500; margin-top: 7px; }
+.chapter-reading { display: block; margin: 5px 0 0 15px; color: var(--accent); font-size: 12px; font-weight: 400; }
+.reading-bulk { padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 14px; }
+.reading-bulk .course-actions { margin: 0; }
+.reading-bulk button:disabled { opacity: .5; cursor: default; }
+.reading-bulk [data-reading-message] { font-size: 13px; margin: 8px 0 0; }
+.reading-bulk [data-reading-message]:empty { display: none; }
+.chapter-selection { display: flex; gap: 8px; padding: 0 12px 10px; align-items: center; font-size: 13px; color: var(--muted); }
+.reading-select { display: none; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; font-size: 13px; color: var(--muted); }
+.reading-select input { width: 18px; height: 18px; accent-color: var(--accent); }
+.course-browser[data-managing="true"] .reading-select { display: flex; }
+.course-browser[data-managing="true"] [data-course-lesson] { display: flex; align-items: stretch; }
+.course-browser[data-managing="true"] .lesson-list a { flex: 1; min-width: 0; }
+.course-browser[data-managing="true"] [data-selected="true"] > a { border-color: var(--accent); background: var(--accent-soft); }
+@media (max-width: 600px) { .course-browser[data-managing="true"] .lesson-list img { display: none; } }
 .course-browser[data-density="compact"] .lesson-list :is(img, .lesson-description, .lesson-source) { display: none; }
 .course-browser[data-density="compact"] .lesson-list { gap: 5px; }
 .course-browser[data-density="compact"] .lesson-list a { padding: 9px 12px; }
@@ -821,6 +860,17 @@ SCRIPT = """\
   var clips = Array.prototype.slice.call(document.querySelectorAll('.clip-frame video'));
   var key = 'v2w:' + (document.body.dataset.lesson || 'lesson');
   function noop() {}
+  var preferenceQueue = Promise.resolve(), preferencePending = 0;
+  function savePreference(values) {
+    preferencePending++;
+    preferenceQueue = preferenceQueue.then(function () { return V2WReaderState.edit([], values); }).catch(function (e) {
+      var message = document.querySelector('[data-reading-message]');
+      if (message) message.textContent = e.message;
+    }).finally(function () {
+      preferencePending--;
+      if (!preferencePending) applyPreferences();
+    });
+  }
 
   function clock(seconds) {
     seconds = Math.max(0, Math.floor(seconds || 0));
@@ -857,18 +907,18 @@ SCRIPT = """\
       player.classList.toggle('collapsed', collapsed);
       if (chevron) chevron.innerHTML = collapsed ? '&#9650;' : '&#9660;';
       if (head) head.title = (collapsed ? 'Expand' : 'Collapse') + ' video (v)';
-      try { localStorage.setItem(key + ':player', collapsed ? '1' : '0'); } catch (e) {}
       syncPlayerHeight();
     };
 
-    var stored = null;
-    try { stored = localStorage.getItem(key + ':player'); } catch (e) {}
-    // Collapsed until asked for: the steps are the page, and clicking any
-    // timestamp opens the player anyway.
-    setCollapsed(stored === null ? true : stored === '1');
+    setCollapsed(V2WReaderState.preferences().player_collapsed);
+    // Apply the server's starting preference once, without closing a video
+    // after the reader has already opened it or during later sync refreshes.
+    var playerTouched = false;
+    V2WReaderState.ready.then(function () { if (!playerTouched) setCollapsed(V2WReaderState.preferences().player_collapsed); });
 
     isFocused = function () { return player.classList.contains('focus'); };
     setFocus = function (on) {
+      playerTouched = true;
       if (on) setCollapsed(false);
       player.classList.toggle('focus', on);
       if (backdrop) backdrop.classList.toggle('on', on);
@@ -881,9 +931,11 @@ SCRIPT = """\
       syncPlayerHeight();
     };
     expandPlayer = function () {
+      playerTouched = true;
       if (player.classList.contains('collapsed')) setCollapsed(false);
     };
     togglePlayer = function () {
+      playerTouched = true;
       var collapse = !player.classList.contains('collapsed');
       if (collapse && isFocused()) setFocus(false);
       setCollapsed(collapse);
@@ -915,17 +967,8 @@ SCRIPT = """\
   // ---- playback speed -------------------------------------------------------
   // Kept outside the per-lesson key on purpose: a reading speed is a property
   // of the reader, not of one lesson.
-  var RATE_KEY = 'v2w:rate';
   var RATES = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
-
-  function storedRate() {
-    var raw = null;
-    try { raw = localStorage.getItem(RATE_KEY); } catch (e) {}
-    var value = parseFloat(raw);
-    return RATES.indexOf(value) >= 0 ? value : 1;
-  }
-
-  var rate = storedRate();
+  var rate = V2WReaderState.preferences().rate;
   var rateReadout = player ? player.querySelector('.rate') : document.querySelector('.video-lesson .rate');
 
   function applyRate() {
@@ -938,8 +981,8 @@ SCRIPT = """\
     var at = RATES.indexOf(rate);
     if (at < 0) at = RATES.indexOf(1);
     rate = RATES[Math.max(0, Math.min(RATES.length - 1, at + direction))];
-    try { localStorage.setItem(RATE_KEY, String(rate)); } catch (e) {}
     applyRate();
+    savePreference({rate: rate});
   }
   applyRate();
   // Loading a new source resets playbackRate, so reassert it.
@@ -949,8 +992,8 @@ SCRIPT = """\
       // Respect a change made through the native controls.
       if (video.playbackRate !== rate && RATES.indexOf(video.playbackRate) >= 0) {
         rate = video.playbackRate;
-        try { localStorage.setItem(RATE_KEY, String(rate)); } catch (e) {}
-        if (rateReadout) rateReadout.textContent = rate + 'x';
+        applyRate();
+        savePreference({rate: rate});
       }
     });
   }
@@ -958,10 +1001,9 @@ SCRIPT = """\
   // ---- looping --------------------------------------------------------------
   // Like the speed, this is a property of the reader rather than of a lesson,
   // so it is stored globally. Each clip's control doubles as the indicator.
-  var LOOP_KEY = 'v2w:loop';
   var loopButtons = Array.prototype.slice.call(document.querySelectorAll('.clip-loop'));
-  var looping = true;
-  try { looping = localStorage.getItem(LOOP_KEY) !== '0'; } catch (e) {}
+  var looping = V2WReaderState.preferences().loop;
+  var clipAutoplay = V2WReaderState.preferences().clip_autoplay;
 
   function applyLoop() {
     clips.forEach(function (clip) { clip.loop = looping; });
@@ -972,11 +1014,18 @@ SCRIPT = """\
   }
   function toggleLoop() {
     looping = !looping;
-    try { localStorage.setItem(LOOP_KEY, looping ? '1' : '0'); } catch (e) {}
     applyLoop();
+    savePreference({loop: looping});
   }
   applyLoop();
   loopButtons.forEach(function (button) { button.addEventListener('click', toggleLoop); });
+  function applyPreferences() {
+    if (preferencePending) return;
+    var values = V2WReaderState.preferences();
+    rate = values.rate; looping = values.loop; clipAutoplay = values.clip_autoplay;
+    applyRate(); applyLoop(); syncClipPlayback();
+  }
+  V2WReaderState.subscribe(applyPreferences);
 
   // ---- seeking --------------------------------------------------------------
   function seek(seconds) {
@@ -1105,6 +1154,7 @@ SCRIPT = """\
       // here would loop it even with looping turned off.
       var shouldPlay =
         clip === wanted && clip.dataset.onScreen && !clip.dataset.userPaused && !clip.ended;
+      if (!clipAutoplay && clip.paused) shouldPlay = false;
       if (shouldPlay) {
         if (clip.paused) {
           var playing = clip.play();
@@ -1360,15 +1410,16 @@ SCRIPT = """\
   }
 
   // ---- done tracking --------------------------------------------------------
+  var readingLesson = {key: key, steps: steps.map(function (step) { return step.id; })};
   var done = {};
-  try { done = JSON.parse(localStorage.getItem(key) || '{}'); } catch (e) { done = {}; }
 
   function paintDone() {
+    done = V2WReading.read(readingLesson);
     var count = 0;
     steps.forEach(function (step) {
       var box = step.querySelector('input[type=checkbox]');
       var isDone = !!done[step.id];
-      if (box) box.checked = isDone;
+      if (box) { box.checked = isDone; box.disabled = !V2WReaderState.writable(); }
       step.classList.toggle('done', isDone);
       if (isDone) count++;
     });
@@ -1380,10 +1431,13 @@ SCRIPT = """\
 
   function setDone(index, value) {
     var step = steps[index];
-    if (!step) return;
-    done[step.id] = value;
-    try { localStorage.setItem(key, JSON.stringify(done)); } catch (e) {}
-    paintDone();
+    if (!step || !V2WReaderState.writable()) return Promise.resolve(false);
+    return V2WReading.setStep(readingLesson, step.id, value).then(function () { return true; }).catch(function (e) {
+      var message = document.querySelector('[data-reading-message]');
+      if (message) message.textContent = e.message;
+      paintDone();
+      return false;
+    });
   }
 
   steps.forEach(function (step, index) {
@@ -1391,6 +1445,7 @@ SCRIPT = """\
     if (!box) return;
     box.addEventListener('change', function () { setDone(index, box.checked); });
   });
+  V2WReading.subscribe(paintDone);
   paintDone();
 
   // ---- enlarging a screenshot -----------------------------------------------
@@ -1553,9 +1608,10 @@ SCRIPT = """\
       case 'Enter':
         if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY') return;
         stop();
-        setDone(cursor, true);
-        following = false;
-        setCursor(cursor + 1, true);
+        var completedCursor = cursor;
+        setDone(cursor, true).then(function (saved) {
+          if (saved && cursor === completedCursor) { following = false; setCursor(cursor + 1, true); }
+        });
         return;
       case 'x':
         stop();
@@ -2129,7 +2185,7 @@ def _page(
     scripts: tuple[tuple[str, str], ...] = (),
 ) -> str:
     up = "../" * depth
-    body_attrs = f' data-lesson="{_esc(lesson_slug)}"' if lesson_slug else ""
+    body_attrs = f' data-reading-api="{up}api/reading"' + (f' data-lesson="{_esc(lesson_slug)}"' if lesson_slug else "")
     # The asset filenames never change, so without a content hash in the URL a
     # browser will happily keep running the script it cached last week.
     script = "\n".join(
@@ -2147,7 +2203,7 @@ def _page(
 </head>
 <body{body_attrs}>
 {body}
-<footer class="site">Built with video-to-website</footer>
+<footer class="site"><a href="{up}settings.html">Settings</a> &middot; Built with video-to-website</footer>
 </body>
 </html>
 """
@@ -2247,6 +2303,20 @@ def lesson_format(lesson: dict) -> str:
     return f'{len(lesson["steps"])} steps' if lesson["steps"] else 'Video lesson'
 
 
+def _reading_lesson(lesson: dict, course: dict) -> dict:
+    """Share the exact reader namespace and step IDs with every overview."""
+    identity = lesson.get("reading_key") or lesson.get("id") or course["slug"] + ":" + lesson["slug"]
+    return {"key": "v2w:" + identity, "steps": [f'step-{step["index"]}' for step in lesson["steps"]]}
+
+
+def _reading_summary(course: dict) -> str:
+    manifest = _esc(json.dumps([_reading_lesson(lesson, course) for lesson in course["lessons"]]))
+    return (
+        f'<div class="reading-summary" data-reading-summary="{manifest}" hidden>'
+        '<span data-reading-text></span><progress max="100" value="0" aria-label="Course completion"></progress></div>'
+    )
+
+
 def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
     lessons = course["lessons"]
     reader = current_slug is not None
@@ -2279,11 +2349,12 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
             f'data-title="{_esc(title)}" data-lesson-number="{numbering[1] if numbering else ""}" '
             f'data-chapter="{chapter if chapter is not None else ""}" '
             f'data-duration="{float(lesson["duration"])}" data-search="{_esc(search)}" '
-            f'data-current="{str(current).lower()}">'
+            f'data-current="{str(current).lower()}" data-reading="{_esc(json.dumps(_reading_lesson(lesson, course)))}">'
             f'<a href="{_esc(lesson["slug"])}.html"' + (' aria-current="page"' if current else '') + '>'
             f'<span class="lesson-number" aria-label="Lesson {reading_positions[lesson["slug"]]}">{reading_positions[lesson["slug"]]}</span>{thumb}<div>'
             f'<div class="t">{_esc(title)}{current_html}</div>{description_html}{source_html}'
             f'<div class="s">{lesson_format(lesson)} &middot; {human_duration(lesson["duration"])}</div>'
+            '<span class="lesson-reading" data-lesson-progress></span>'
             '</div></a></li>'
         )
 
@@ -2303,13 +2374,28 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
         groups.append(f'<ol class="lesson-list">{"".join(card(item) for item in lessons)}</ol>')
 
     course_id = _esc(course.get("id") or course["slug"])
+    bulk_controls = '' if reader else '''<section class="reading-bulk" data-reading-bulk aria-label="Manage reading progress" hidden>
+    <div class="course-actions">
+      <span data-reading-selected>0 selected</span>
+      <button type="button" data-reading-select-all>Select all shown</button>
+      <button type="button" data-reading-deselect>Clear selection</button>
+      <button type="button" data-reading-complete disabled>Mark complete</button>
+      <button type="button" data-reading-reset disabled>Reset progress</button>
+      <button type="button" data-reading-undo hidden>Undo</button>
+    </div>
+    <p class="reading-note">Mirror lessons finished elsewhere by selecting lessons or chapters. Reset clears their step checkmarks.</p>
+    <p data-reading-message role="status" aria-live="polite"></p>
+  </section>'''
     return f'''<nav class="course-browser" aria-label="Course lessons" data-course="{course_id}"
   data-context="{"reader" if reader else "course"}" data-density="{"compact" if reader else "detailed"}">
+  {_reading_summary(course)}
+  <p class="reading-note" data-reading-sync></p>
   <div class="course-tools" data-course-controls hidden>
     <label class="course-search-label">Find a lesson<input type="search" data-course-search placeholder="Title, description, or chapter" autocomplete="off"></label>
     <label class="course-sort-label">Sort view<select data-course-sort><option value="saved">Saved order</option><option value="number">Lesson number</option><option value="title">Title A–Z</option><option value="shortest">Shortest first</option></select></label>
     <label>Group<select data-course-view><option value="chapters">Chapters</option><option value="flat">All lessons</option></select></label>
     <label>Rows<select data-course-density><option value="detailed">Detailed</option><option value="compact">Compact</option></select></label>
+    <label>Progress<select data-course-progress><option value="all">All lessons</option><option value="not-started">Not started</option><option value="in-progress">In progress</option><option value="complete">Complete</option><option value="unfinished">Unfinished</option></select></label>
   </div>
   <p class="course-tools-note" data-course-controls hidden>View settings stay in this browser. <a href="../library.html?course={course_id}">Edit reading order in Library</a>.</p>
   <div class="course-actions" data-course-controls hidden>
@@ -2317,7 +2403,9 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
     <button type="button" data-course-clear hidden>Clear search</button>
     <button type="button" data-course-expand>Expand all</button>
     <button type="button" data-course-collapse>Collapse all</button>
+    {'' if reader else '<button type="button" data-manage-progress aria-expanded="false">Manage progress</button>'}
   </div>
+  {bulk_controls}
   <div class="course-groups">{"".join(groups)}</div>
   <p class="course-empty" hidden>No lessons match your search.</p>
 </nav>'''
@@ -2411,6 +2499,15 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
             f'{_course_browser(course, current_slug=lesson["slug"])}</details>'
         )
     description = f'<p class="lesson-description">{_esc(lesson_description(lesson))}</p>' if lesson_description(lesson) else ""
+    reading_control = (
+        f'<section class="reading-control" data-reading-control="{_esc(json.dumps(_reading_lesson(lesson, course)))}" '
+        'aria-label="Lesson progress" hidden><span data-reading-text></span>'
+        '<progress max="100" value="0" aria-label="Lesson completion"></progress>'
+        '<button type="button" data-reading-toggle>Mark lesson complete</button> '
+        '<button type="button" data-reading-undo hidden>Undo</button>'
+        '<p class="reading-note" data-reading-sync></p>'
+        '<p data-reading-message role="status" aria-live="polite"></p></section>'
+    )
     body = f"""<header class="top">
   <div class="crumbs"><a href="../index.html">All courses</a> / <a href="index.html">{_esc(course["title"])}</a></div>
   <h1>{_esc(lesson_title(lesson))}</h1>
@@ -2422,7 +2519,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
   <main>
     {inline_video}
     {summary_html}
-    {'<div class="progress"></div>' if not video_only else ''}
+    {reading_control}
     {steps_html}
     {transcript_html}
     {navigation}
@@ -2435,7 +2532,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
     return _page(
         lesson_title(lesson), body, depth=1,
         lesson_slug=lesson.get("reading_key") or lesson.get("id") or course["slug"] + ":" + lesson["slug"],
-        scripts=(("app.js", SCRIPT), ("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT))
+        scripts=(("reading.js", READING_SCRIPT), ("app.js", SCRIPT), ("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT))
     )
 
 
@@ -2447,7 +2544,7 @@ def render_course_page(course: dict) -> str:
   <div class="meta">{len(course["lessons"])} lessons &middot; {human_duration(total)}<button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>/</kbd></button></div>
 </header>
 <main class="wrap">{_course_browser(course)}</main>{_lesson_picker()}"""
-    return _page(course["title"], body, depth=1, scripts=(("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT)))
+    return _page(course["title"], body, depth=1, scripts=(("reading.js", READING_SCRIPT), ("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT)))
 
 
 def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
@@ -2466,16 +2563,46 @@ def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
             f'data-course-title="{_esc(course["title"])}"><a class="course-card-main" href="{_esc(course["slug"])}/index.html">{thumb}<div>'
             f'<div class="t">{_esc(course["title"])}</div>'
             f'<div class="s">{len(lessons)} lessons &middot; {human_duration(total)}</div>'
+            f'{_reading_summary(course)}'
             '</div></a><a class="course-activity" href="queue.html" hidden></a></li>'
         )
     meta = note if note and not courses else f"{len(courses)} courses"
     body = f"""<header class="top">
-  <div class="crumbs"><a href="library.html">Manage library</a> / <a href="upload.html">Add videos</a> / <a href="queue.html">Task queue</a> / <a href="workers.html">Workers</a></div>
+  <div class="crumbs"><a href="library.html">Manage library</a> / <a href="upload.html">Add videos</a> / <a href="queue.html">Task queue</a> / <a href="workers.html">Workers</a> / <a href="settings.html">Settings</a></div>
   <h1>Courses</h1>
   <div class="meta" id="course-count">{_esc(meta)}</div>
 </header>
-<main class="wrap"><ul class="cards" id="course-cards">{"".join(cards)}</ul></main>"""
-    return _page("Courses", body, depth=0, scripts=(("status.js", STATUS_SCRIPT),))
+<main class="wrap"><p class="reading-note" data-reading-sync></p><ul class="cards" id="course-cards">{"".join(cards)}</ul></main>"""
+    return _page("Courses", body, depth=0, scripts=(("reading.js", READING_SCRIPT), ("status.js", STATUS_SCRIPT)))
+
+
+def render_settings_page() -> str:
+    speeds = ''.join(f'<option value="{rate}">{rate}×</option>' for rate in (0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3))
+    body = f'''<header class="top">
+  <div class="crumbs"><a href="index.html">All courses</a> / <a href="library.html">Manage library</a></div>
+  <h1>Settings</h1><p class="meta">Your reading and playback preferences</p>
+</header>
+<main class="wrap">
+  <p class="reading-note" data-reading-sync role="status"></p>
+  <form class="reader-settings" id="reader-settings">
+    <h2>Playback</h2>
+    <label>Video and clip speed <select name="rate">{speeds}</select></label>
+    <label><input type="checkbox" name="loop">Loop short clips</label>
+    <label><input type="checkbox" name="clip_autoplay">Automatically play the current step’s clip</label>
+    <label><input type="checkbox" name="player_collapsed">Start the floating video collapsed</label>
+    <p class="settings-help">Speed and looping changes made inside a lesson are saved here too. Clip autoplay still respects clips you pause yourself. The floating-video setting applies when you open a lesson.</p>
+    <button type="submit" data-settings-save disabled>Save settings</button>
+    <button type="button" data-settings-reset disabled>Restore defaults</button>
+    <p data-settings-message role="status" aria-live="polite"></p>
+  </form>
+  <section class="summary"><h2>Reading progress &amp; sync</h2>
+    <p>The server keeps one shared reader profile. Completion and playback preferences follow you across browsers and devices. Existing browser checkmarks are imported only when the server has no saved progress for that lesson.</p>
+    <p>Open a course and choose <strong>Manage progress</strong> to complete or reset lessons and whole chapters. Overall progress averages the completion of each lesson, including partially completed lessons.</p>
+    <p>Search, chapter disclosures, and layout choices stay on each device. Static exports save progress and playback preferences in their browser.</p>
+    <button type="button" id="reading-reconnect">Refresh sync</button>
+  </section>
+</main>'''
+    return _page("Settings", body, depth=0, scripts=(("reading.js", READING_SCRIPT), ("settings.js", SETTINGS_SCRIPT)))
 
 
 def _storage_panel() -> str:
@@ -2661,6 +2788,8 @@ def write_assets(site_dir: Path) -> None:
     atomic_write(assets / "workers.js", WORKERS_SCRIPT)
     atomic_write(assets / "course.js", COURSE_SCRIPT)
     atomic_write(assets / "navigation.js", NAVIGATION_SCRIPT)
+    atomic_write(assets / "reading.js", READING_SCRIPT)
+    atomic_write(assets / "settings.js", SETTINGS_SCRIPT)
 
 
 def write_placeholder(site_dir: Path, note: str) -> None:
@@ -2677,6 +2806,7 @@ def write_placeholder(site_dir: Path, note: str) -> None:
     atomic_write(site_dir / "queue.html", render_queue_page())
     atomic_write(site_dir / "library.html", render_library_page())
     atomic_write(site_dir / "workers.html", render_workers_page())
+    atomic_write(site_dir / "settings.html", render_settings_page())
 
 
 def _prune_course(course_dir: Path, lessons: set[str]) -> int:
@@ -2772,6 +2902,7 @@ def write_site(
         dict(lesson, numbering=lesson_numbering(lesson), chapter=lesson_chapter(lesson)) for lesson in course["lessons"]
     ]) for course in courses]
     atomic_write(site_dir / "site.json", json.dumps(exported_courses, indent=2))
+    atomic_write(site_dir / "settings.html", render_settings_page())
     log(f"site written to {site_dir}")
 
 

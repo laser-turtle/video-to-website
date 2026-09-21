@@ -22,6 +22,14 @@ keyboard-operated lesson picker with partial-name search.
 Introductions/overviews without extracted steps publish as video lessons with an
 inline player, poster, and available summary/transcript. Silent/empty-transcript
 videos use the same fallback; genuine processing errors remain failures.
+Lesson, chapter, and course overviews show completion, including partial steps.
+Course progress filters and bulk lesson/chapter selection support Mark complete,
+Reset progress, and Undo. Video lessons can be marked complete too.
+Reading state and playback preferences sync through the application SQLite
+catalog (schema v8), using one shared reader profile. Existing browser checkmarks
+are imported only into untouched lesson namespaces; explicit server resets win.
+The Settings page manages playback speed, clip looping/autoplay and the floating
+player's starting state. Static exports retain browser-local storage.
 
 **Running as a service.** A NixOS module, an LXC image for Proxmox, nginx in
 front, uploads proxied to a loopback port. One DBOS coordinator reconciles the
@@ -116,11 +124,14 @@ Display title and order metadata are now persisted in schema v2.
 
 ### Stage 4: reading state that follows you
 
-Done checkboxes and preferences currently live in `localStorage`. Durable lesson
-IDs and instruction-content namespaces now prevent cross-course collisions and
-misapplied completion after regeneration. Saved reading position and synchronization
-are still to build. Store user reading state in the application SQLite database;
-DBOS execution history is separate from that product data.
+Progress and playback preferences now synchronize through SQLite. Stable lesson
+IDs and instruction-content namespaces prevent cross-course collisions and
+misapplied completion after regeneration. Bulk edits are atomic and revision
+checked; Undo preserves later changes. DBOS execution history remains separate.
+Saved reading position, separate authenticated reader profiles, and an offline
+edit queue remain to build. Course layout and disclosure choices stay on each
+device. An unavailable server disables synced edits rather than creating a second
+local source of truth.
 
 ### Stage 5: per-course tuning
 
@@ -168,7 +179,8 @@ Dollars are not the constraint; rate limits were. Sonnet is the default.
 **No authentication on the upload and management endpoints.** Right on a home
 network, wrong anywhere else. `services.video-to-website.uploads = false` disables
 library mutations and leaves `scp`. The separate `workers` option controls helper
-and worker-management endpoints; disable both to turn off all management APIs.
+and worker-management endpoints. `readingState` independently enables shared
+progress/preferences; disable all three to turn off the API service.
 
 **The service owns its library.** It takes ownership at start, because videos
 arrive by `scp` as root as often as through the page, and a root-owned course

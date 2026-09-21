@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const source = fs.readFileSync(process.argv[2], 'utf8');
+const reading = ['reader-state.js', 'reading.js'].map(name => fs.readFileSync('src/video_to_website/assets/' + name, 'utf8')).join('\n');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 class Element {
   constructor(tag, dataset = {}) {
@@ -24,6 +25,8 @@ class Element {
       node.parent = this; this.children.push(node);
     }
   }
+  prepend(node) { node.parent = this; this.children.unshift(node); }
+  setAttribute(name, value) { this[name] = value; }
   replaceChildren(...nodes) { this.children.forEach(node => { node.parent = null; }); this.children = []; this.append(...nodes); }
   addEventListener(event, callback) { (this.listeners[event] ||= []).push(callback); }
   fire(event) { (this.listeners[event] || []).forEach(callback => callback({target: this})); }
@@ -48,6 +51,15 @@ function fixture({course = 'stable-course', reader = false, current = '', items}
   const sort = node('select', '', {courseSort: ''});
   const view = node('select', '', {courseView: ''});
   const density = node('select', '', {courseDensity: ''});
+  const progressFilter = node('select', '', {courseProgress: ''});
+  const manage = reader ? null : node('button', '', {manageProgress: ''});
+  const bulk = reader ? null : node('section', '', {readingBulk: ''});
+  if (bulk) {
+    bulk.hidden = true;
+    for (const name of ['Selected', 'SelectAll', 'Deselect', 'Complete', 'Reset', 'Undo', 'Message']) {
+      bulk.append(new Element('button', {['reading' + name]: ''}));
+    }
+  }
   const clear = node('button', '', {courseClear: ''});
   const expand = node('button', '', {courseExpand: ''});
   const collapse = node('button', '', {courseCollapse: ''});
@@ -65,14 +77,18 @@ function fixture({course = 'stable-course', reader = false, current = '', items}
     const row = new Element('li', {courseLesson: id, chapter, lessonNumber: number, title,
       duration: String(duration), position: String(index + 1), current: String(id === current),
       search: `${title} ${description} ${chapter === '' ? 'Other lessons' : 'Chapter ' + chapter}`});
+    row.dataset.reading = JSON.stringify({key: 'v2w:' + course + ':' + id, steps: id === 'intro' ? [] : ['step-1', 'step-2']});
+    row.append(new Element('span', {lessonProgress: ''}));
     container.append(row); return row;
   });
-  return {root, search, sort, view, density, clear, expand, collapse, controls, count, empty, container, rows};
+  return {root, search, sort, view, density, progressFilter, manage, bulk, clear, expand, collapse, controls, count, empty, container, rows};
 }
 const state = new Map();
 const storage = {getItem: key => state.get(key) || null, setItem: (key, value) => state.set(key, value)};
 function run(f, localStorage = storage) {
-  new Function('document', 'localStorage', source)({querySelectorAll: () => [f.root], createElement: tag => new Element(tag)}, localStorage);
+  const document = {body: {dataset: {}}, addEventListener() {},
+    querySelectorAll: selector => selector === '.course-browser' ? [f.root] : [], createElement: tag => new Element(tag)};
+  f.state = new Function('document', 'localStorage', 'window', reading + '\n' + source + '\nreturn V2WReaderState;')(document, localStorage, {addEventListener() {}});
 }
 const groups = f => f.container.querySelectorAll('.course-chapter');
 const order = f => f.container.querySelectorAll('[data-course-lesson]').map(row => row.dataset.courseLesson);
@@ -149,4 +165,41 @@ const plain = fixture({items: [['intro', '', '', 'Welcome', 20, 'Introduction']]
 assert.equal(plain.view.disabled, true); assert.equal(plain.view.value, 'flat');
 assert.equal(plain.count.textContent, '1 lesson');
 const empty = fixture({items: []}); run(empty); assert.equal(empty.empty.hidden, false);
+
+state.clear();
+state.set('v2w:stable-course:two', JSON.stringify({'step-1': true}));
+const tracked = fixture(); run(tracked); await flush();
+assert.equal(tracked.rows[1].querySelector('[data-lesson-progress]').textContent, '1 of 2 steps · 50%');
+assert.equal(groups(tracked)[1].querySelector('.chapter-reading').textContent, '0 of 3 lessons complete · 17%');
+change(tracked.progressFilter, 'in-progress'); await flush();
+assert.deepEqual(visible(tracked), ['two']);
+tracked.manage.click();
+assert.equal(tracked.bulk.hidden, false);
+const action = name => tracked.bulk.querySelector('[data-reading-' + name + ']');
+action('select-all').click(); assert.equal(action('selected').textContent, '1 selected');
+tracked.clear.click(); await flush();
+const chapterBox = groups(tracked)[1].querySelector('.chapter-selection').children[0];
+assert.equal(chapterBox.indeterminate, true);
+chapterBox.checked = true; chapterBox.fire('change');
+assert.equal(action('selected').textContent, '3 selected', 'chapter selection includes scattered lessons');
+search(tracked, 'welcome');
+assert.equal(action('selected').textContent, '3 selected (3 hidden by filters)');
+action('complete').click(); await flush();
+assert.equal(action('message').textContent, 'Completed 3 lessons.');
+assert.ok(['two', 'ten', 'one'].every(id => JSON.parse(state.get('v2w:stable-course:' + id))['step-2']));
+action('undo').click(); await flush();
+assert.equal(JSON.parse(state.get('v2w:stable-course:two'))['step-1'], true, 'undo restores partial progress');
+assert.equal(JSON.parse(state.get('v2w:stable-course:two'))['step-2'], false);
+tracked.clear.click();
+change(tracked.view, 'flat');
+action('select-all').click(); action('complete').click(); await flush();
+assert.equal(JSON.parse(state.get('v2w:stable-course:intro')).__lessonComplete, true, 'video-only lessons can complete');
+change(tracked.progressFilter, 'unfinished'); assert.deepEqual(visible(tracked), []);
+tracked.clear.click(); action('select-all').click(); action('reset').click(); await flush();
+assert.ok(tracked.rows.every(row => row.dataset.progress === 'not-started'));
+change(tracked.view, 'chapters'); await flush();
+const beforeFilter = groups(tracked).map(g => g.open);
+change(tracked.progressFilter, 'complete'); await flush();
+tracked.clear.click(); await flush();
+assert.deepEqual(groups(tracked).map(g => g.open), beforeFilter, 'progress filters do not overwrite chapter disclosure preferences');
 console.log('course.js runtime checks passed');
