@@ -25,13 +25,14 @@
   var expanded = object(preferences.expanded);
   var chapterOpen = object(preferences.chapters);
   var sortMethods = {};
+  var selections = {}, bulkModes = {}, bulkTargets = {}, newChapters = {};
   grouping.value = preferences.grouping === 'flat' ? 'flat' : 'chapters';
   density.value = preferences.density === 'compact' ? 'compact' : 'detailed';
   var controls = [];
   var focusTargets = {};
   var selectedCourse = new URLSearchParams(location.search).get('course');
   if (selectedCourse) expanded[selectedCourse] = true;
-  var labels = { ready: 'Ready', running: 'Processing', queued: 'Waiting', failed: 'Failed', cancelled: 'Cancelled', superseded: 'Waiting' };
+  var labels = { ready: 'Ready', running: 'Processing', queued: 'Waiting', blocked: 'Waiting for API credits / billing', failed: 'Failed', cancelled: 'Cancelled', superseded: 'Waiting' };
   var sorts = [
     ['heuristic', 'Name (smart numbering)', 'Sort chapter and lesson prefixes numerically, then remaining names. Renamed lessons can use their original filename numbering.'],
     ['title', 'Displayed title A–Z', 'Sort the displayed titles naturally, with 2 before 10.'],
@@ -45,22 +46,18 @@
       grouping: grouping.value, density: density.value, expanded: expanded, chapters: chapterOpen
     })); } catch (e) {}
   }
-  function chapter(video) { return Array.isArray(video.numbering) ? video.numbering[0] : null; }
+  function chapter(video) { return 'chapter' in video ? video.chapter : (Array.isArray(video.numbering) ? video.numbering[0] : null); }
   function chapterGroups(videos) {
-    var groups = [], occurrences = {};
+    var groups = new Map();
     videos.forEach(function (video) {
       var number = chapter(video);
-      var previous = groups[groups.length - 1];
-      if (!previous || previous.number !== number) {
-        var occurrence = occurrences[number] = (occurrences[number] || 0) + 1;
-        previous = {number: number, videos: [], key: (number === null ? 'other' : number) + ':' + occurrence,
-          label: (number === null ? 'Other lessons' : 'Chapter ' + number) + (occurrence > 1 ? ' (continued)' : '')};
-        groups.push(previous);
-      }
-      previous.videos.push(video);
+      if (!groups.has(number)) groups.set(number, {number: number, videos: [], key: (number === null ? 'other' : number) + ':1',
+        label: number === null ? 'Other lessons' : 'Chapter ' + number});
+      groups.get(number).videos.push(video);
     });
-    return groups;
+    return Array.from(groups.values());
   }
+  function selected(course) { return selections[course.id] || (selections[course.id] = new Set()); }
   function duration(seconds) {
     if (seconds === null || seconds === undefined) return 'Duration pending';
     seconds = Math.max(0, Math.round(seconds));
@@ -110,7 +107,7 @@
       });
     });
   }
-  function mutate(path, body, success, focusKey) {
+  function mutate(path, body, success, focusKey, onSaved) {
     if (busy || !editable) return;
     setBusy(true);
     say('Saving…');
@@ -119,6 +116,7 @@
       body: JSON.stringify(Object.assign({ revision: catalog.revision }, body))
     }).then(function (result) {
       catalog = result.catalog;
+      if (onSaved) onSaved();
       editor = null;
       busy = false;
       render(focusKey);
@@ -193,9 +191,11 @@
       editor = { id: item.id, action: 'title' }; render();
     }));
     var index = items.indexOf(item);
+    var neighbours = kind === 'lesson' && grouping.value === 'chapters' ? items.filter(function (v) { return chapter(v) === chapter(item); }) : items;
+    var within = neighbours.indexOf(item);
     var filtered = !!search.value.trim();
-    var up = button('↑', prefix + '-up', function () { reorder(items, index, index - 1, course, prefix + '-rename'); }, filtered || index === 0);
-    var down = button('↓', prefix + '-down', function () { reorder(items, index, index + 1, course, prefix + '-rename'); }, filtered || index === items.length - 1);
+    var up = button('↑', prefix + '-up', function () { reorder(items, index, items.indexOf(neighbours[within - 1]), course, prefix + '-rename'); }, filtered || within === 0);
+    var down = button('↓', prefix + '-down', function () { reorder(items, index, items.indexOf(neighbours[within + 1]), course, prefix + '-rename'); }, filtered || within === neighbours.length - 1);
     up.setAttribute('aria-label', 'Move ' + item.title + ' up');
     down.setAttribute('aria-label', 'Move ' + item.title + ' down');
     area.appendChild(up); area.appendChild(down);
@@ -231,17 +231,107 @@
     area.appendChild(hint);
     return area;
   }
+  function selectLessons(course, videos, key) {
+    var selection = selected(course);
+    var all = videos.every(function (video) { return selection.has(video.id); });
+    videos.forEach(function (video) { if (all) selection.delete(video.id); else selection.add(video.id); });
+    render(key);
+  }
+  function bulkControls(course, videos, query) {
+    var prefix = 'course-' + course.id + '-bulk';
+    var selection = selected(course);
+    var area = el('div', 'managed-bulk' + (selection.size ? ' has-selection' : ''));
+    var hidden = course.videos.filter(function (v) { return selection.has(v.id) && !videos.includes(v); }).length;
+    var status = el('p', 'library-hint', selection.size + ' selected' + (hidden ? ' · ' + hidden + ' hidden by search' : ''));
+    status.setAttribute('role', 'status'); area.appendChild(status);
+    var selecting = el('div', 'library-actions');
+    selecting.appendChild(button(query ? 'Select matches' : 'Select all lessons', prefix + '-select', function () {
+      videos.forEach(function (video) { selection.add(video.id); }); render(prefix + '-select');
+    }, !!editor));
+    selecting.appendChild(button('Clear selection', prefix + '-clear', function () { selection.clear(); render(prefix + '-select'); }, !!editor || !selection.size));
+    area.appendChild(selecting);
+    var form = el('div', 'managed-bulk-form');
+    form.hidden = !selection.size;
+    function selectControl(labelText, key, options, value, changed) {
+      var label = el('label', '', labelText), select = el('select');
+      options.forEach(function (pair) { var option = el('option', '', pair[1]); option.value = pair[0]; select.appendChild(option); });
+      select.value = value;
+      select.dataset.focusKey = key; focusTargets[key] = select;
+      select.unavailable = !!editor || !selection.size; controls.push(select);
+      select.addEventListener('change', function () { changed(select.value); render(key); });
+      label.appendChild(select); form.appendChild(label); return select;
+    }
+    var mode = bulkModes[course.id] || 'chapter';
+    selectControl('Move selected', prefix + '-mode', [['chapter', 'To a chapter'], ['position', 'In saved order']], mode, function (value) {
+      bulkModes[course.id] = value; delete bulkTargets[course.id];
+    });
+    var options;
+    if (mode === 'chapter') {
+      var numbers = Array.from(new Set(course.videos.map(chapter).filter(function (n) { return n !== null; }))).sort(function (a, b) { return a - b; });
+      options = [['', 'Choose a chapter…']].concat(numbers.map(function (n) { return [String(n), 'Chapter ' + n]; }),
+        [['new', 'New chapter…'], ['other', 'Other lessons'], ['auto', 'Automatic from names']]);
+    } else {
+      options = [['start', 'Start of course'], ['end', 'End of course']].concat(course.videos.filter(function (v) { return !selection.has(v.id); })
+        .map(function (v) { return [v.id, 'Before: ' + v.title]; }));
+    }
+    var target = bulkTargets[course.id] || (mode === 'chapter' ? '' : 'end');
+    if (!options.some(function (pair) { return pair[0] === target; })) target = mode === 'chapter' ? '' : 'end';
+    selectControl(mode === 'chapter' ? 'Chapter' : 'Position', prefix + '-target', options, target, function (value) { bulkTargets[course.id] = value; });
+    var chapterInput;
+    if (mode === 'chapter' && target === 'new') {
+      var label = el('label', '', 'Chapter number'); chapterInput = el('input');
+      chapterInput.type = 'number'; chapterInput.min = '0'; chapterInput.max = '999'; chapterInput.step = '1';
+      chapterInput.value = newChapters[course.id] || ''; chapterInput.unavailable = !!editor || !selection.size;
+      chapterInput.dataset.focusKey = prefix + '-number'; focusTargets[prefix + '-number'] = chapterInput; controls.push(chapterInput);
+      chapterInput.addEventListener('input', function () { newChapters[course.id] = chapterInput.value; });
+      label.appendChild(chapterInput); form.appendChild(label);
+    }
+    form.appendChild(button('Move selected', prefix + '-apply', function () {
+      var ids = course.videos.filter(function (v) { return selection.has(v.id); }).map(function (v) { return v.id; });
+      var body = {ids: ids}, action = mode === 'chapter' ? 'chapter' : 'move';
+      if (mode === 'chapter') {
+        body.chapter = target === 'auto' ? null : target === 'other' ? -1 : Number(target === 'new' ? chapterInput.value : target);
+        if (target === 'new' && (!chapterInput.value.trim() || !Number.isInteger(body.chapter) || body.chapter < 0 || body.chapter > 999)) {
+          say('Choose a chapter number from 0 to 999.', true); chapterInput.focus(); return;
+        }
+      } else {
+        var first = course.videos.find(function (v) { return !selection.has(v.id); });
+        body.before = target === 'end' ? null : target === 'start' ? (first ? first.id : null) : target;
+      }
+      mutate('courses/' + course.id + '/' + action, body, ids.length + ' lessons moved.', prefix + '-select', function () { selection.clear(); });
+    }, !!editor || !selection.size || !target));
+    area.appendChild(form);
+    var hint = el('p', 'library-hint', mode === 'chapter'
+      ? 'Chapter assignments are saved without renaming files. Automatic restores grouping from names.'
+      : 'Moves the selection as one block, keeping its order. All lessons shows exact saved positions; Chapters collects matching lessons.');
+    hint.hidden = !selection.size; area.appendChild(hint);
+    return area;
+  }
   function lessonRow(video, course) {
     var row = el('li', 'managed-lesson');
     row.dataset.lessonId = video.id;
-    row.appendChild(el('span', 'library-number', String(course.videos.indexOf(video) + 1)));
+    var number = el('span', 'library-number', String(course.videos.indexOf(video) + 1));
+    if (editable) {
+      var label = el('label', 'lesson-selection'), checkbox = el('input');
+      checkbox.type = 'checkbox'; checkbox.checked = selected(course).has(video.id); checkbox.unavailable = !!editor;
+      checkbox.dataset.focusKey = 'lesson-' + video.id + '-select'; focusTargets[checkbox.dataset.focusKey] = checkbox;
+      checkbox.setAttribute('aria-label', 'Select ' + video.title); controls.push(checkbox);
+      checkbox.addEventListener('change', function () {
+        if (checkbox.checked) selected(course).add(video.id); else selected(course).delete(video.id);
+        render(checkbox.dataset.focusKey);
+      });
+      label.appendChild(checkbox); label.appendChild(number); row.appendChild(label);
+    } else row.appendChild(number);
     var copy = el('div', 'managed-copy');
     copy.appendChild(el('h3', '', video.title));
     if (video.description && video.description !== video.title) copy.appendChild(el('p', 'lesson-description', video.description));
     var sourcePath = video.source_path || video.source_name || video.title;
     var prefix = course.source_path + '/';
     if (sourcePath.indexOf(prefix) === 0) sourcePath = sourcePath.slice(prefix.length);
-    copy.appendChild(el('p', 'library-hint', sourcePath + ' · ' + (labels[video.state] || video.state) + ' · ' + duration(video.duration)));
+    copy.appendChild(el('p', 'library-hint', sourcePath + ' · ' + (labels[video.state] || video.state) + (video.video_only ? ' · Video lesson' : '') + ' · ' + duration(video.duration)));
+    if (video.source_reclaimed) copy.appendChild(el('p', 'library-hint', 'Original reclaimed · saved video retained'));
+    if (video.chapter_override !== null && video.chapter_override !== undefined) copy.appendChild(el('p', 'library-hint',
+      'Assigned to ' + (chapter(video) === null ? 'Other lessons' : 'Chapter ' + chapter(video))));
     row.appendChild(copy);
     row.appendChild(actions(video, 'lesson', course.videos, course));
     if (editor && editor.id === video.id) row.appendChild(editForm(video, 'lesson', course.videos, course));
@@ -257,6 +347,8 @@
     var total = catalog.courses.reduce(function (n, course) { return n + course.videos.length; }, 0);
     count.textContent = catalog.courses.length + ' courses · ' + total + ' lessons';
     catalog.courses.forEach(function (course, index) {
+      var selection = selected(course), valid = new Set(course.videos.map(function (v) { return v.id; }));
+      selection.forEach(function (id) { if (!valid.has(id)) selection.delete(id); });
       var courseMatches = [course.title, course.source_path].join(' ').toLowerCase().includes(query);
       var videos = course.videos.filter(function (video) {
         return courseMatches || [video.title, video.source_name, video.source_path, video.description,
@@ -282,7 +374,8 @@
       contents.id = 'lessons-' + course.id;
       contents.hidden = !open;
       var note = el('div', 'managed-order');
-      note.appendChild(el('span', 'library-hint', query ? 'Clear search to reorder.' : 'Lessons appear in this order.'));
+      note.appendChild(el('span', 'library-hint', query ? 'Clear search to reorder individually. Bulk actions include all selected lessons.'
+        : 'Chapters collect matching lessons. All lessons shows the saved positions.'));
       var groups = chapterGroups(course.videos);
       var grouped = grouping.value === 'chapters' && groups.some(function (group) { return group.number !== null; });
       if (grouped) [true, false].forEach(function (opening) {
@@ -292,6 +385,7 @@
         }, !!query || !!editor));
       });
       if (editable) contents.appendChild(sorting(course, !!query));
+      if (editable) contents.appendChild(bulkControls(course, videos, query));
       contents.appendChild(note);
       var visible = new Set(videos.map(function (video) { return video.id; }));
       (grouped ? groups : [{videos: course.videos}]).forEach(function (group, groupIndex) {
@@ -312,7 +406,17 @@
         });
         var summary = el('summary', '', group.label);
         summary.appendChild(el('span', 'chapter-meta', (query ? matches.length + ' of ' : '') + group.videos.length + (group.videos.length === 1 ? ' lesson' : ' lessons')));
-        details.appendChild(summary); details.appendChild(lessons); contents.appendChild(details);
+        details.appendChild(summary);
+        if (editable) {
+          var tools = el('div', 'library-actions managed-chapter-tools');
+          var selectedAll = matches.every(function (v) { return selection.has(v.id); });
+          var selectKey = 'course-' + course.id + '-select-' + group.key;
+          tools.appendChild(button(selectedAll ? 'Deselect chapter' : query ? 'Select matches' : 'Select chapter', selectKey, function () {
+            selectLessons(course, matches, selectKey);
+          }, !!editor));
+          details.appendChild(tools);
+        }
+        details.appendChild(lessons); contents.appendChild(details);
       });
       section.appendChild(contents); list.appendChild(section);
     });
@@ -338,7 +442,8 @@
               var sourceTitle = lesson.source_name ? lesson.source_name.replace(/\.[^.]+$/, '') : lesson.title;
               return { id: lesson.id || lesson.slug, title: lesson.display_title || sourceTitle,
                 description: lesson.description || lesson.title, source_name: lesson.source_name,
-                numbering: lesson.numbering, duration: lesson.duration,
+                numbering: lesson.numbering, duration: lesson.duration, chapter_override: lesson.chapter_override, video_only: lesson.video_only,
+                ...('chapter' in lesson ? {chapter: lesson.chapter} : {}),
                 state: 'ready', href: course.slug + '/' + lesson.slug + '.html' };
             }) };
         }) };

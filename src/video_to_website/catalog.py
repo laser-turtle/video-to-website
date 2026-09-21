@@ -8,20 +8,22 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 
-from .chapters import lesson_numbering
+from .chapters import chapter_groups, lesson_chapter, lesson_numbering
 from .pipeline import discover_courses
 from .progress import STAGE_LABELS
-from .util import digest_file, digest_json, file_lock, natural_key, slugify
+from .util import digest_file, digest_json, file_fingerprint, file_lock, natural_key, read_stage, slugify
 from .work_progress import progress_snapshot
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 PIPELINE_VERSION = "1"
 ACTIVE = ("queued", "running")
+LESSON_OPTIONS_PREFIX = "lesson-options:"
 
 
 class CatalogConflict(ValueError):
@@ -97,6 +99,21 @@ class Catalog:
                     db.execute("BEGIN IMMEDIATE")
                 db.execute("ALTER TABLE workers ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
                 db.execute("PRAGMA user_version=5")
+                version = 5
+            if version == 5:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                db.execute("ALTER TABLE lessons ADD COLUMN chapter_override INTEGER CHECK(chapter_override BETWEEN -1 AND 999)")
+                db.execute("PRAGMA user_version=6")
+                version = 6
+            if version == 6:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                db.execute("""CREATE TABLE reclaimed_sources (
+                    lesson_id TEXT PRIMARY KEY REFERENCES lessons(id),
+                    digest TEXT NOT NULL, snapshot TEXT NOT NULL,
+                    build_id TEXT NOT NULL, created REAL NOT NULL)""")
+                db.execute("PRAGMA user_version=7")
 
     @contextlib.contextmanager
     def connect(self, *, timeout: float = 30):
@@ -117,6 +134,11 @@ class Catalog:
         return (row["position"] is None, row["position"] or 0, natural_key(row["path"]))
 
     def _library(self, db) -> dict:
+        from .provider_pause import PAUSE_PREFIX, WAIT_PREFIX
+
+        paused = {row["key"][len(PAUSE_PREFIX):] for row in db.execute("SELECT key FROM settings WHERE key LIKE ?", (PAUSE_PREFIX + "%",))}
+        waiting = {row["key"][len(WAIT_PREFIX):]: json.loads(row["value"])["provider"]
+                   for row in db.execute("SELECT key,value FROM settings WHERE key LIKE ?", (WAIT_PREFIX + "%",))}
         courses = []
         for course in sorted(
             [dict(r) for r in db.execute("SELECT * FROM courses")], key=self.order_key
@@ -124,8 +146,10 @@ class Catalog:
             rows = [
                 dict(r)
                 for r in db.execute(
-                    """SELECT l.*,b.state FROM lessons l
-                LEFT JOIN builds b ON b.id=l.desired_build WHERE l.course_id=? AND l.deleted=0""",
+                    """SELECT l.*,b.state,r.snapshot FROM lessons l
+                LEFT JOIN builds b ON b.id=l.desired_build
+                LEFT JOIN reclaimed_sources r ON r.lesson_id=l.id
+                WHERE l.course_id=? AND l.deleted=0""",
                     (course["id"],),
                 )
             ]
@@ -136,6 +160,10 @@ class Catalog:
                     {
                         "id": row["id"],
                         "title": row["title"] or Path(row["path"]).stem,
+                        "display_title": row["title"] or Path(row["path"]).stem,
+                        "chapter_override": row["chapter_override"],
+                        "chapter": lesson_chapter({"display_title": row["title"],
+                            "source_name": Path(row["path"]).name, "chapter_override": row["chapter_override"]}),
                         "source_title": Path(row["path"]).stem,
                         "source_name": Path(row["path"]).name,
                         "source_path": row["path"],
@@ -143,8 +171,10 @@ class Catalog:
                         "position": row["position"],
                         "description": published.get("title", ""),
                         "bytes": row["size"],
-                        "state": row["state"] or "queued",
+                        "source_reclaimed": row["snapshot"] is not None,
+                        "state": "blocked" if row["state"] in ACTIVE and waiting.get(row["desired_build"]) in paused else row["state"] or "queued",
                         "duration": published.get("duration"),
+                        "video_only": bool(published.get("video_only")),
                         "numbering": lesson_numbering({
                             "display_title": row["title"], "source_name": Path(row["path"]).name,
                         }),
@@ -182,6 +212,7 @@ class Catalog:
                             v["source_path"],
                             v["position"],
                             v["custom_title"],
+                            v["chapter_override"],
                         ]
                         for v in c["videos"]
                     ],
@@ -229,6 +260,39 @@ class Catalog:
                     if any(ord(char) < 32 for char in title):
                         raise ValueError("Titles must be a single line.")
                 db.execute(f"UPDATE {table} SET title=? WHERE id=?", (title, item_id))
+            elif action in {"move", "chapter"}:
+                if resource != "courses" or course is None:
+                    raise ValueError("Choose a course for this change.")
+                ids = body.get("ids")
+                items = course["videos"]
+                if (not isinstance(ids, list) or not ids or not all(isinstance(v, str) for v in ids)
+                        or len(set(ids)) != len(ids) or not set(ids) <= {v["id"] for v in items}):
+                    raise ValueError("Select lessons from this course exactly once.")
+                selected = set(ids)
+                moving = [item for item in items if item["id"] in selected]
+                remaining = [item for item in items if item["id"] not in selected]
+                if action == "move":
+                    before = body.get("before")
+                    if "before" not in body or (before is not None and (not isinstance(before, str) or before not in {v["id"] for v in remaining})):
+                        raise ValueError("Choose an unselected lesson to move before, or the end of the course.")
+                    index = next((i for i, v in enumerate(remaining) if v["id"] == before), len(remaining))
+                    ordered = remaining[:index] + moving + remaining[index:]
+                else:
+                    number = body.get("chapter")
+                    if "chapter" not in body or (number is not None and (type(number) is not int or not -1 <= number <= 999)):
+                        raise ValueError("Use a chapter number from 0 to 999, Other lessons, or Automatic.")
+                    for item in moving:
+                        item["chapter_override"] = number
+                        item["chapter"] = lesson_chapter(item)
+                    if number is None:
+                        ordered = items
+                    else:
+                        target = None if number == -1 else number
+                        index = max((i + 1 for i, v in enumerate(remaining) if v["chapter"] == target), default=len(remaining))
+                        ordered = remaining[:index] + moving + remaining[index:]
+                    ordered = [v for group in chapter_groups(ordered) for v in group["lessons"]]
+                    db.executemany("UPDATE lessons SET chapter_override=? WHERE id=?", [(number, v["id"]) for v in moving])
+                db.executemany("UPDATE lessons SET position=? WHERE id=?", [(i, v["id"]) for i, v in enumerate(ordered)])
             elif action == "order":
                 if resource != "courses":
                     raise ValueError("Unknown ordering action.")
@@ -253,7 +317,7 @@ class Catalog:
                             title = natural_key(item["title"])
                             if mode == "heuristic":
                                 numbering = item["numbering"]
-                                return (numbering is None, tuple(numbering or (0, 0)), title)
+                                return (item["chapter"] is None, item["chapter"] or 0, numbering[1] if numbering else 0, title)
                             if mode == "filename":
                                 return natural_key(item["source_name"])
                             if mode in {"shortest", "longest"}:
@@ -327,6 +391,7 @@ class Catalog:
         library = library.resolve()
         with self.lock():
             existing = {r["path"]: r for r in self.rows("SELECT * FROM lessons")}
+            reclaimed = {r["lesson_id"]: r for r in self.rows("SELECT * FROM reclaimed_sources")}
             found = []
             for course in discover_courses([library]):
                 for video in course["videos"]:
@@ -336,7 +401,7 @@ class Catalog:
                     before = video.stat()
                     previous = existing.get(relative)
                     fingerprint = (before.st_size, before.st_mtime_ns)
-                    if previous and fingerprint == (
+                    if previous and previous["id"] not in reclaimed and fingerprint == (
                         previous["size"],
                         previous["mtime"],
                     ):
@@ -350,15 +415,36 @@ class Catalog:
                         )
                     found.append((course, relative, fingerprint, digest))
             paths = {entry[1] for entry in found}
+            # Reclamation removes a duplicate, not the logical library entry.
+            # Include snapshot-backed lessons in normal settings reconciliation,
+            # even when their entire course folder has since been removed.
+            courses = {r["id"]: r for r in self.rows("SELECT * FROM courses")}
+            retained_paths = set()
+            for previous in existing.values():
+                retained = reclaimed.get(previous["id"])
+                if retained and not previous["deleted"] and previous["path"] not in paths:
+                    course = courses[previous["course_id"]]
+                    course_path, course_title = Path(course["path"]), course["title"]
+                    if not Path(previous["path"]).is_relative_to(course_path):
+                        # An API file move updates path before its course is
+                        # reconciled; cleanup may happen between those events.
+                        course_path = Path(previous["path"]).parent
+                        course_title = course_path.name
+                    retained_paths.add(previous["path"])
+                    found.append(({"root": library / course_path, "title": course_title},
+                                  previous["path"], (previous["size"], previous["mtime"]), previous["digest"]))
+            paths |= retained_paths
             moved = {}
             for previous in existing.values():
-                if previous["path"] not in paths:
+                if previous["path"] not in paths and previous["id"] not in reclaimed:
                     moved.setdefault(previous["digest"], []).append(previous)
             new_counts = {}
             for _, relative, _, digest in found:
                 if relative not in existing:
                     new_counts[digest] = new_counts.get(digest, 0) + 1
             with self.connect() as db:
+                overrides = {row["key"][len(LESSON_OPTIONS_PREFIX):]: json.loads(row["value"])
+                             for row in db.execute("SELECT key,value FROM settings WHERE key LIKE ?", (LESSON_OPTIONS_PREFIX + "%",))}
                 config = json.dumps(options, sort_keys=True)
                 db.execute(
                     "INSERT OR REPLACE INTO settings VALUES ('options',?)", (config,)
@@ -391,6 +477,10 @@ class Catalog:
                     lesson_slug = (
                         previous["slug"] if previous else "lesson-" + lesson_id
                     )
+                    if relative not in retained_paths:
+                        # A deliberate re-upload or external restore owns the
+                        # source path again; never delete it on an old request.
+                        db.execute("DELETE FROM reclaimed_sources WHERE lesson_id=?", (lesson_id,))
                     if previous:
                         db.execute(
                             """UPDATE lessons SET course_id=?,path=?,digest=?,size=?,mtime=?,deleted=0,position=?
@@ -421,10 +511,11 @@ class Catalog:
                                 mtime,
                             ),
                         )
+                    lesson_options = {**options, **overrides.get(lesson_id, {})}
                     input_key = digest_json(
                         {
                             "source": digest,
-                            "options": options,
+                            "options": lesson_options,
                             "pipeline": PIPELINE_VERSION,
                         }
                     )
@@ -439,7 +530,7 @@ class Catalog:
                             "digest": digest,
                             "lesson_id": lesson_id,
                             "slug": lesson_slug,
-                            "options": options,
+                            "options": lesson_options,
                             "catalog": str(self.directory),
                             "legacy_course": slugify(course["title"]),
                             "legacy_lesson": slugify(Path(relative).stem),
@@ -504,6 +595,67 @@ class Catalog:
             spec["path"] = lesson["path"]
             return self._new_build(db, lesson_id, row["input_key"], spec)
 
+    def configure_lesson(self, lesson_id: str, body: dict) -> str:
+        """Save instruction chunking and enqueue a new attempt atomically.
+
+        The running workflow's immutable spec/history is never patched. A build
+        ID acts as a compare-and-swap token for concurrent retries or imports.
+        """
+        if not isinstance(body, dict) or set(body) != {"build_id", "chunk_minutes"}:
+            raise ValueError("Expected build_id and chunk_minutes.")
+        minutes = body["chunk_minutes"]
+        if minutes is not None and (type(minutes) not in (int, float) or not math.isfinite(minutes) or not 1 <= minutes <= 120):
+            raise ValueError("Section length must be between 1 and 120 minutes, or null for the server default.")
+        with self.lock(), self.connect() as db:
+            row = db.execute("""SELECT l.path,l.digest,b.* FROM lessons l JOIN builds b ON b.id=l.desired_build
+                             WHERE l.id=? AND l.deleted=0""", (lesson_id,)).fetchone()
+            if row is None:
+                raise KeyError(lesson_id)
+            if row["id"] != body["build_id"]:
+                raise CatalogConflict("This lesson changed or was retried elsewhere. Reload the latest settings before saving.")
+            if row["state"] in ACTIVE:
+                raise CatalogConflict("This lesson is queued or processing. Cancel it before changing processing settings.")
+            spec = json.loads(row["spec"])
+            saved = db.execute("SELECT value FROM settings WHERE key='options'").fetchone()
+            defaults = json.loads(saved[0]) if saved else spec["options"]
+            override = {"chunk_minutes": float(minutes)} if minutes is not None else {}
+            options = {**defaults, **override}
+            key = LESSON_OPTIONS_PREFIX + lesson_id
+            if override:
+                db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, json.dumps(override)))
+            else:
+                db.execute("DELETE FROM settings WHERE key=?", (key,))
+            spec.update(path=row["path"], digest=row["digest"], options=options)
+            input_key = digest_json({"source": row["digest"], "options": options, "pipeline": PIPELINE_VERSION})
+            return self._new_build(db, lesson_id, input_key, spec)
+
+    def lesson_processing(self, lesson_id: str) -> dict:
+        with self.lock(), self.connect() as db:
+            row = db.execute("""SELECT l.path,b.* FROM lessons l JOIN builds b ON b.id=l.desired_build
+                             WHERE l.id=? AND l.deleted=0""", (lesson_id,)).fetchone()
+            if row is None:
+                raise KeyError(lesson_id)
+            spec = json.loads(row["spec"])
+            options = spec["options"]
+            saved = db.execute("SELECT value FROM settings WHERE key='options'").fetchone()
+            defaults = json.loads(saved[0]) if saved else options
+            override = db.execute("SELECT value FROM settings WHERE key=?", (LESSON_OPTIONS_PREFIX + lesson_id,)).fetchone()
+            override = json.loads(override[0]) if override else {}
+        duration = None
+        try:
+            snapshot = Path(options["out"]) / "_sources" / spec["digest"] / ("source" + Path(row["path"]).suffix.lower())
+            cache = Path(options["work"]) / "lessons" / lesson_id / spec["digest"] / "probe.json"
+            info = read_stage(cache, file_fingerprint(snapshot), {"stage": "probe"})
+            value = info.get("duration") if isinstance(info, dict) else None
+            if type(value) in (int, float) and math.isfinite(value) and value > 0:
+                duration = value
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass  # The editor also works before probing or after cache cleanup.
+        return {"id": lesson_id, "build_id": row["id"], "state": row["state"], "updated": row["updated"],
+                "chunk_minutes": options.get("chunk_minutes", 25.0),
+                "default_chunk_minutes": defaults.get("chunk_minutes", options.get("chunk_minutes", 25.0)),
+                "custom_chunk_minutes": override.get("chunk_minutes"), "duration": duration}
+
     def cancel(self, lesson_id: str):
         with self.lock(), self.connect() as db:
             db.execute(
@@ -536,6 +688,7 @@ class Catalog:
                 lesson["description"] = lesson.get("title", "")
                 lesson["title"] = row["title"] or Path(row["path"]).stem
                 lesson["display_title"] = lesson["title"]
+                lesson["chapter_override"] = row["chapter_override"]
                 lesson["source_name"] = Path(row["path"]).name
                 lessons.append(lesson)
             if lessons:
@@ -550,8 +703,16 @@ class Catalog:
         return courses
 
     def status(self) -> dict:
+        from .provider_pause import ProviderPauses
+
+        pauses = ProviderPauses(self)
+        paused, waiting = pauses.active(), pauses.waiting()
+        overrides = {row["key"][len(LESSON_OPTIONS_PREFIX):]: json.loads(row["value"])
+                     for row in self.rows("SELECT key,value FROM settings WHERE key LIKE ?", (LESSON_OPTIONS_PREFIX + "%",))}
+        defaults_row = self.rows("SELECT value FROM settings WHERE key='options'")
+        defaults = json.loads(defaults_row[0]["value"]) if defaults_row else {}
         rows = self.rows("""SELECT l.id,l.course_id,l.path,l.slug,l.title,l.published,c.title AS course,c.slug AS course_slug,
-            b.id AS build_id,b.state,b.stage,b.error,b.created,b.updated,
+            b.id AS build_id,b.state,b.stage,b.error,b.created,b.updated,b.spec,
             p.stage AS progress_stage,p.started AS stage_started,p.payload AS progress_payload
             FROM lessons l JOIN courses c ON c.id=l.course_id LEFT JOIN builds b ON b.id=l.desired_build
             LEFT JOIN build_progress p ON p.build_id=b.id
@@ -560,9 +721,17 @@ class Catalog:
         queue_position = 0
         stages = ["probe", "transcribe", "scenes", "steps", "frames", "publish"]
         for row in rows:
+            options = json.loads(row["spec"]).get("options", {}) if row["spec"] else {}
             state = {"ready": "done", "running": "working"}.get(
                 row["state"], row["state"] or "queued"
             )
+            wait = waiting.get(row["build_id"])
+            blocked = paused.get(wait["provider"]) if wait and state in {"queued", "working"} else None
+            if state == "queued" and row["spec"]:
+                provider = options.get("llm")
+                blocked = blocked or paused.get(provider)
+            if blocked:
+                state = "blocked"
             if state == "queued":
                 queue_position += 1
             measured = None
@@ -607,8 +776,14 @@ class Catalog:
                     if row["published"]
                     else None,
                     "state": state,
+                    "blocked": blocked,
+                    "processing": {
+                        "chunk_minutes": options.get("chunk_minutes", 25.0),
+                        "default_chunk_minutes": defaults.get("chunk_minutes", options.get("chunk_minutes", 25.0)),
+                        "custom_chunk_minutes": overrides.get(row["id"], {}).get("chunk_minutes"),
+                    },
                     "stage": row["stage"],
-                    "label": row["error"]
+                    "label": ("Waiting for API credits or billing" if blocked else row["error"])
                     or {
                         **STAGE_LABELS,
                         "prepare": "Preparing the video",
@@ -646,4 +821,5 @@ class Catalog:
             "error": None,
             "retry_in": None,
             "videos": videos,
+            "provider_pauses": list(paused.values()),
         }

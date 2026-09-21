@@ -228,6 +228,27 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(len(worker.catalog.published_courses()[0]["lessons"]), 1)
 
+    def test_reclaimed_upload_reprocesses_after_worker_restart(self):
+        from video_to_website.source_storage import reclaim_source
+
+        with DurableWorker(self.library, self.options, self.root / "state") as worker:
+            self.wait(worker, lambda: bool(worker.catalog.rows("SELECT * FROM builds WHERE state='ready'")))
+            row = worker.catalog.rows("SELECT * FROM lessons")[0]
+            before = worker.catalog.published_courses()[0]["lessons"][0]
+            reclaim_source(worker.catalog, self.library, row["id"], {"build_id": row["desired_build"]})
+        self.assertFalse(self.video.exists())
+        with DurableWorker(self.library, self.options, self.root / "state") as worker:
+            worker.tick(); worker.tick()
+            self.assertEqual(worker.catalog.published_courses()[0]["lessons"][0]["revision"], before["revision"])
+            new_id = worker.catalog.configure_lesson(row["id"], {"build_id": row["desired_build"], "chunk_minutes": 5})
+            self.wait(worker, lambda: worker.catalog.build(new_id)["state"] == "ready")
+            after = worker.catalog.published_courses()[0]["lessons"][0]
+            self.assertEqual(after["video_href"], before["video_href"])
+            self.assertEqual(after["reading_key"], before["reading_key"])
+            self.assertNotEqual(after["revision"], before["revision"])
+            self.assertEqual(self.transcribe.call_count, 1)
+            self.assertFalse(self.video.exists())
+
     def test_live_transcription_progress_is_visible_before_stage_finishes(self):
         entered = threading.Event()
         release = threading.Event()

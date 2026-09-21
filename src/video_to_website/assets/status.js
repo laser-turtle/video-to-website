@@ -14,7 +14,7 @@
     var params = new URLSearchParams();
     if (group.id || group.slug) params.set('course', group.id || group.slug);
     else params.set('q', group.title);
-    if (group.failed) params.set('state', group.working || group.queued ? 'all' : 'failed');
+    if (group.failed) params.set('state', group.working || group.queued || group.blocked ? 'all' : 'failed');
     return 'queue.html?' + params.toString();
   }
   function node(tag, className, text) {
@@ -32,11 +32,11 @@
   function render(data) {
     var groups = new Map();
     data.videos.forEach(function (video) {
-      if (!['working', 'queued', 'failed'].includes(video.state)) return;
+      if (!['working', 'queued', 'blocked', 'failed'].includes(video.state)) return;
       var key = video.course_id ? 'id:' + video.course_id : video.course_slug ? 'slug:' + video.course_slug : 'title:' + video.course;
       if (!groups.has(key)) groups.set(key, {
         id: video.course_id || '', slug: video.course_slug || '', title: video.course || 'Untitled course',
-        working: 0, queued: 0, failed: 0
+        working: 0, queued: 0, blocked: 0, failed: 0
       });
       groups.get(key)[video.state]++;
     });
@@ -71,6 +71,7 @@
       var parts = [];
       if (group.working) parts.push(group.working + (group.working === 1 ? ' video processing' : ' videos processing'));
       if (group.queued) parts.push(group.queued + ' waiting');
+      if (group.blocked) parts.push(group.blocked + ' waiting for API credits / billing');
       if (group.failed) parts.push(group.failed + ' failed');
       var activity = card.querySelector('.course-activity');
       var text = parts.join(' · ');

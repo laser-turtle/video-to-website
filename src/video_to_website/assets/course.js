@@ -3,6 +3,8 @@
   'use strict';
   document.querySelectorAll('.course-browser').forEach(function (root) {
     var rows = Array.from(root.querySelectorAll('[data-course-lesson]'));
+    // Server HTML is grouped; the positions retain the original flat order.
+    rows.sort(function (a, b) { return Number(a.dataset.position) - Number(b.dataset.position); });
     var container = root.querySelector('.course-groups');
     var search = root.querySelector('[data-course-search]');
     var sort = root.querySelector('[data-course-sort]');
@@ -54,10 +56,9 @@
       group.expectedOpen = value;
       group.details.open = value;
     }
-    function makeGroup(chapter, occurrence) {
-      var group = {rows: [], key: (chapter || 'other') + ':' + occurrence};
+    function makeGroup(chapter) {
+      var group = {rows: [], key: (chapter || 'other') + ':1'};
       group.label = chapter === '' ? 'Other lessons' : 'Chapter ' + chapter;
-      if (occurrence > 1) group.label += ' (continued)';
       group.details = document.createElement('details');
       group.details.className = 'course-chapter';
       group.details.dataset.chapterKey = group.key;
@@ -118,16 +119,15 @@
         ordered.forEach(function (row) { list.append(row); });
         container.append(list);
       } else {
-        var occurrences = {};
-        var previous;
+        var byChapter = new Map();
         ordered.forEach(function (row) {
           var chapter = row.dataset.chapter;
-          if (chapter !== previous) {
-            occurrences[chapter] = (occurrences[chapter] || 0) + 1;
-            groups.push(makeGroup(chapter, occurrences[chapter]));
-            previous = chapter;
+          if (!byChapter.has(chapter)) {
+            var created = makeGroup(chapter);
+            byChapter.set(chapter, created);
+            groups.push(created);
           }
-          var group = groups[groups.length - 1];
+          var group = byChapter.get(chapter);
           group.rows.push(row);
           group.list.append(row);
         });

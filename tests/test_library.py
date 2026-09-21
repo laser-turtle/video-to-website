@@ -334,6 +334,80 @@ class LibraryTests(unittest.TestCase):
             409,
         )
 
+    def test_bulk_chapter_moves_are_durable_metadata_and_can_be_reset(self):
+        course = self.catalog.library()["courses"][0]
+        a, b, c = course["videos"]
+        before_builds = self.catalog.rows("SELECT * FROM builds ORDER BY id")
+        before_files = sorted(str(p.relative_to(self.library)) for p in self.library.rglob("*.mp4"))
+        keys = {v["id"]: v["reading_key"] for v in self.catalog.published_courses()[0]["lessons"]}
+        result = self.edit("courses", course["id"], "chapter", ids=[c["id"], a["id"]], chapter=7)
+        videos = result["courses"][0]["videos"]
+        self.assertEqual([v["id"] for v in videos], [b["id"], a["id"], c["id"]])
+        self.assertEqual([v["chapter"] for v in videos], [4, 7, 7])
+        self.assertEqual([v["title"] for v in videos], [b["title"], a["title"], c["title"]])
+        self.catalog = Catalog(self.root / "state")
+        self.catalog.reconcile(self.library, self.options)
+        self.assertEqual(self.catalog.library()["courses"][0]["videos"], videos)
+        published = self.catalog.published_courses()[0]
+        self.assertIn('Chapter 7', render.render_course_page(published))
+        self.assertEqual({v["id"]: v["reading_key"] for v in published["lessons"]}, keys)
+        self.assertEqual(self.catalog.rows("SELECT * FROM builds ORDER BY id"), before_builds)
+        self.assertEqual(sorted(str(p.relative_to(self.library)) for p in self.library.rglob("*.mp4")), before_files)
+        self.edit("courses", course["id"], "order", mode="heuristic")
+        result = self.edit("courses", course["id"], "chapter", ids=[a["id"], c["id"]], chapter=None)
+        self.assertTrue(all(v["chapter"] == 4 and v["chapter_override"] is None for v in result["courses"][0]["videos"]))
+
+    def test_bulk_assignment_appends_to_existing_chapter_and_supports_other(self):
+        course = self.catalog.library()["courses"][0]
+        a, b, c = course["videos"]
+        self.edit("courses", course["id"], "chapter", ids=[b["id"]], chapter=0)
+        result = self.edit("courses", course["id"], "chapter", ids=[a["id"], c["id"]], chapter=0)
+        self.assertEqual([v["id"] for v in result["courses"][0]["videos"]], [b["id"], a["id"], c["id"]])
+        result = self.edit("courses", course["id"], "chapter", ids=[a["id"], c["id"]], chapter=-1)
+        self.assertEqual([v["chapter"] for v in result["courses"][0]["videos"]], [0, None, None])
+        self.assertIn('Other lessons', render.render_course_page(self.catalog.published_courses()[0]))
+
+    def test_bulk_move_preserves_selection_order_and_untouched_lessons(self):
+        course = self.catalog.library()["courses"][0]
+        a, b, c = course["videos"]
+        result = self.edit("courses", course["id"], "move", ids=[c["id"], a["id"]], before=b["id"])
+        self.assertEqual([v["id"] for v in result["courses"][0]["videos"]], [a["id"], c["id"], b["id"]])
+        result = self.edit("courses", course["id"], "move", ids=[a["id"], c["id"]], before=None)
+        self.assertEqual([v["id"] for v in result["courses"][0]["videos"]], [b["id"], a["id"], c["id"]])
+        self.assertTrue(all(v["chapter_override"] is None for v in result["courses"][0]["videos"]))
+
+    def test_bulk_operations_validate_complete_selection_before_writing(self):
+        course, other = self.catalog.library()["courses"]
+        a, b, c = course["videos"]
+        before = self.catalog.library()
+        for ids in [[], [a["id"], a["id"]], [a["id"], "missing"], [other["videos"][0]["id"]], [7], "bad"]:
+            for action, payload in [("chapter", {"chapter": 4}), ("move", {"before": None})]:
+                with self.subTest(ids=ids, action=action), self.assertRaises(ValueError):
+                    self.edit("courses", course["id"], action, ids=ids, **payload)
+        for chapter in [True, "4", -2, 1000, 4.5, []]:
+            with self.subTest(chapter=chapter), self.assertRaises(ValueError):
+                self.edit("courses", course["id"], "chapter", ids=[a["id"]], chapter=chapter)
+        for target in [a["id"], "missing", [], other["videos"][0]["id"]]:
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                self.edit("courses", course["id"], "move", ids=[a["id"]], before=target)
+        for action in ["chapter", "move"]:
+            with self.assertRaises(ValueError):
+                self.edit("courses", course["id"], action, ids=[a["id"]])
+        self.assertEqual(self.catalog.library(), before)
+        self.edit("courses", course["id"], "chapter", ids=[a["id"]], chapter=6)
+        with self.assertRaises(CatalogConflict):
+            self.catalog.edit_library("courses", course["id"], "move", {"revision": before["revision"], "ids": [b["id"], c["id"]], "before": None})
+
+    def test_v5_migration_preserves_saved_order_and_defaults_to_automatic(self):
+        before = self.catalog.library()
+        with self.catalog.connect() as db:
+            db.execute("ALTER TABLE lessons DROP COLUMN chapter_override")
+            db.execute("DROP TABLE reclaimed_sources")
+            db.execute("PRAGMA user_version=5")
+        migrated = Catalog(self.catalog.directory)
+        self.assertEqual(migrated.library(), before)
+        self.assertEqual(migrated.rows("PRAGMA user_version")[0]["user_version"], SCHEMA_VERSION)
+
 
 class MigrationTests(unittest.TestCase):
     def test_v1_catalog_migrates_without_losing_existing_identity(self):

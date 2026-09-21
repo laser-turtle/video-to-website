@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
+import uuid
 
 from . import media, render, whisper
 from . import steps as steps_mod
@@ -171,7 +173,8 @@ def process_video(
 
     info = execute("probe", read_probe)
     duration = float(info.get("duration") or 0.0)
-    if duration <= 0 or not info.get("has_audio"):
+    if (not math.isfinite(duration) or duration <= 0
+            or int(info.get("width") or 0) <= 0 or int(info.get("height") or 0) <= 0):
         return None
     if not options.wants("transcribe"):
         return None
@@ -180,8 +183,8 @@ def process_video(
         progress.stage("transcribe")
         # --- transcribe --------------------------------------------------------
         if not info.get("has_audio"):
-            warn(f"{video.name} has no audio track; skipping")
-            return None
+            log("  no audio track; keeping the original video")
+            return []
         transcribe_params = {
             "stage": "transcribe",
             "model": model_path.name if model_path else options.model,
@@ -215,11 +218,14 @@ def process_video(
         return segments
 
     segments = execute("transcribe", transcribe_audio)
-    if not segments or not options.wants("scenes"):
+    segments = segments or []
+    if not options.wants("scenes"):
         return None
 
     def find_scenes():
         progress.stage("scenes")
+        if not segments:
+            return []
         # --- scenes ------------------------------------------------------------
         # The threshold is deliberately absent from the cache key: scores are stored
         # once, so re-tuning --scene-threshold never re-decodes the video.
@@ -251,6 +257,8 @@ def process_video(
 
     def write_steps():
         progress.stage("steps")
+        if not segments:
+            return {"title": Path(source_name or video.name).stem, "summary": "", "prerequisites": [], "skip": [], "steps": []}
         # --- steps -------------------------------------------------------------
         backend_name = backend.name if backend else "heuristic"
         steps_params = {
@@ -279,6 +287,12 @@ def process_video(
                 )
             else:
                 log(f"  writing steps with {backend_name}")
+                section_cache = work_dir / "llm-sections"
+                if options.forced("steps"):
+                    # A forced build bypasses older results, but retains its own
+                    # sections across recovery. Standalone forced runs are fresh.
+                    scope = digest_json(str(course_dir.resolve())) if run_stage else uuid.uuid4().hex
+                    section_cache = work_dir / "llm-sections-forced" / scope
                 lesson = steps_mod.extract_lesson(
                     backend,
                     title=fallback_title,
@@ -286,6 +300,8 @@ def process_video(
                     segments=segments,
                     scene_times=scene_times,
                     chunk_minutes=options.chunk_minutes,
+                    cache_dir=section_cache,
+                    cache_context={"source": fingerprint, "settings": steps_params},
                 )
             lesson = steps_mod.normalize_lesson(lesson, duration=duration, fallback_title=fallback_title)
             write_stage(work_dir / "steps.json", fingerprint, steps_params, lesson)
@@ -295,11 +311,23 @@ def process_video(
         return lesson
 
     lesson = execute("steps", write_steps)
-    if not lesson["steps"] or not options.wants("frames"):
+    if not options.wants("frames"):
         return None
 
     def make_assets():
         progress.stage("frames")
+        if not lesson["steps"]:
+            # A successful extraction with no actions is a valid video lesson.
+            # This stays inside the existing frames stage for replay compatibility.
+            poster = f"frames/{slug}/video-poster.jpg"
+            target = course_dir / poster
+            params = {"stage": "video-poster", "width": options.frame_width, "time": min(2.0, duration / 10)}
+            cached = None if options.forced("frames") else read_stage(work_dir / "video-poster.json", fingerprint, params)
+            if cached is None or not target.is_file() or target.stat().st_size == 0:
+                media.extract_frame(video, params["time"], target, width=options.frame_width)
+                write_stage(work_dir / "video-poster.json", fingerprint, params, {"src": poster})
+            log("  no instructional steps; publishing the original video")
+            return {**lesson, "poster": poster}
         # --- frames and clips --------------------------------------------------
         # Emitting real dimensions stops the page reflowing as screenshots arrive,
         # which otherwise moves the step you are reading.
@@ -526,7 +554,7 @@ def process_video(
             target = course_dir / "videos" / f"{slug}{video.suffix.lower()}"
             video_href = render.link_video(video, target, options.videos)
 
-        first_frame = next((step.get("frame") for step in lesson["steps"] if step.get("frame")), None)
+        first_frame = lesson.get("poster") or next((step.get("frame") for step in lesson["steps"] if step.get("frame")), None)
         return {
             "slug": slug,
             "title": lesson["title"] or fallback_title,
@@ -534,6 +562,9 @@ def process_video(
             "source_path": str(video),
             "duration": duration,
             "video_href": video_href,
+            "video_only": not bool(lesson["steps"]),
+            "video_width": info.get("width"),
+            "video_height": info.get("height"),
             "poster": first_frame,
             "summary": lesson["summary"],
             "prerequisites": lesson["prerequisites"],

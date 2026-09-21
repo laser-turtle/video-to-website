@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -26,6 +27,46 @@ class LLMError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False):
         super().__init__(message)
         self.retryable = retryable
+
+
+class ProviderBlocked(LLMError):
+    """A funding/spend limit needs intervention, rather than transient retries."""
+
+    def __init__(self, message, *, reason="credits"):
+        super().__init__(message)
+        self.reason = reason
+
+
+def funding_error(message: str, *, status=None, body=None, cli=False):
+    """Recognize explicit billing errors; an ordinary 429 is still retryable.
+
+    Structured Anthropic errors: https://platform.claude.com/docs/en/api/errors
+    Spend limits: https://platform.claude.com/docs/en/api/rate-limits
+    Text fallbacks cover older API responses and CLI error envelopes only.
+    """
+    error = body.get("error", body) if isinstance(body, dict) else {}
+    if not isinstance(error, dict):
+        error = {}
+    details = error.get("details") or {}
+    code = details.get("error_code") if isinstance(details, dict) else None
+    text = str(error.get("message") or message).lower()
+    reason = None
+    if isinstance(code, str) and code in {"enforced_spend_limit_reached", "spend_limit_exceeded", "insufficient_quota"}:
+        reason = "spend_limit"
+    elif re.search(r"credit balance (?:is )?(?:too )?low|insufficient[_ ]credits?|out of credits|credits? (?:exhausted|depleted)", text):
+        reason = "credits"
+    elif re.search(r"(?:spend(?:ing)?|monthly cost) (?:limit|cap).{0,60}(?:reached|exceeded)|(?:reached|exceeded).{0,60}(?:spend(?:ing)?|monthly cost) (?:limit|cap)|insufficient_quota|reached your specified (?:workspace )?api usage limits", text):
+        reason = "spend_limit"
+    elif cli and re.search(r"usage limit (?:reached|exceeded)|(?:you've|you’ve|you have) hit your (?:usage )?limit", text):
+        reason = "spend_limit"
+    elif status == 402 or error.get("type") == "billing_error":
+        reason = "billing"
+    if reason:
+        messages = {"credits": "The provider reports insufficient API credits. Add credits, then resume requests.",
+                    "spend_limit": "The provider's spending or usage limit was reached. Restore access, then resume requests.",
+                    "billing": "The provider reports a billing problem. Resolve it, then resume requests."}
+        return ProviderBlocked(messages[reason], reason=reason)
+    return None
 
 
 SYSTEM_PROMPT = """\
@@ -257,10 +298,19 @@ class AnthropicBackend:
         try:
             message = self._final_message(system, user)
         except self._anthropic.APIStatusError as exc:
+            blocked = funding_error(str(exc), status=exc.status_code, body=getattr(exc, "body", None))
+            if blocked:
+                raise blocked from exc
             raise LLMError(f"Anthropic API error {exc.status_code}: {exc}",
                            retryable=exc.status_code == 429 or exc.status_code >= 500) from exc
         except self._anthropic.APIConnectionError as exc:
             raise LLMError(f"could not reach the Anthropic API: {exc}", retryable=True) from exc
+        except self._anthropic.APIError as exc:
+            # Streaming error events may arrive after an HTTP 200 response.
+            blocked = funding_error(str(exc), body=getattr(exc, "body", None))
+            if blocked:
+                raise blocked from exc
+            raise LLMError(f"Anthropic streaming error: {exc}") from exc
 
         stop_reason = getattr(message, "stop_reason", None)
         if stop_reason == "refusal":
@@ -268,8 +318,8 @@ class AnthropicBackend:
             raise LLMError(f"the model declined this transcript (stop_details={details})")
         if stop_reason == "max_tokens":
             raise LLMError(
-                "response hit max_tokens before finishing. Lower --chunk-minutes so each "
-                "request covers less of the lesson."
+                "response hit max_tokens before finishing. Open Processing settings in Task queue "
+                "and lower the section length, then retry (CLI: --chunk-minutes)."
             )
 
         text = "".join(
@@ -314,7 +364,11 @@ class OllamaBackend:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = json.loads(response.read())
         except urllib.error.HTTPError as exc:
-            raise LLMError(f"Ollama returned HTTP {exc.code}: {exc.read()[:400]!r}",
+            detail = exc.read()[:400].decode("utf-8", errors="replace")
+            blocked = funding_error(detail, status=exc.code)
+            if blocked:
+                raise blocked from exc
+            raise LLMError(f"Ollama returned HTTP {exc.code}: {detail}",
                            retryable=exc.code == 429 or exc.code >= 500) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise LLMError(f"could not reach Ollama at {self.host}: {exc}", retryable=True) from exc
@@ -384,6 +438,8 @@ class ClaudeCliBackend:
 
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+            if blocked := funding_error(detail, cli=True):
+                raise blocked
             raise LLMError(f"the claude CLI exited {proc.returncode}: {detail}")
 
         try:
@@ -394,6 +450,8 @@ class ClaudeCliBackend:
         result = payload.get("result") or ""
         # subtype stays "success" even for auth failures, so is_error is the real signal.
         if payload.get("is_error"):
+            if blocked := funding_error(result, body=payload, cli=True):
+                raise blocked
             raise LLMError(f"the claude CLI reported an error: {result[:300]}")
         if not result.strip():
             raise LLMError("the claude CLI returned an empty result")
@@ -433,6 +491,8 @@ class CodexCliBackend:
             raise LLMError(f"could not run '{self.binary}': {exc}") from exc
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+            if blocked := funding_error(detail, cli=True):
+                raise blocked
             raise LLMError(f"the codex CLI exited {proc.returncode}: {detail}")
         if not proc.stdout.strip():
             raise LLMError("the codex CLI returned nothing")

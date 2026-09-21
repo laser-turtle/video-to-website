@@ -220,14 +220,22 @@ class IngestMixin:
         elif path == "/api/library":
             courses = library_listing(self.library)
             if self.catalog:
+                from .source_storage import annotate_sources
+
                 titles = {row["path"]: row["title"] for row in self.catalog.rows("SELECT path,title FROM courses")}
                 for course in courses:
                     course["title"] = titles.get(course["name"], course["name"])
+                courses = annotate_sources(self.catalog, self.library, courses)
             self._json(200, {"courses": courses})
         elif path == "/api/jobs" and self.catalog:
             self._json(200, self.catalog.status())
         elif path == "/api/catalog" and self.catalog:
             self._json(200, self.catalog.library())
+        elif self.catalog and len(path.strip("/").split("/")) == 4 and path.startswith("/api/lessons/") and path.endswith("/settings"):
+            try:
+                self._json(200, self.catalog.lesson_processing(path.strip("/").split("/")[2]))
+            except KeyError:
+                self._json(404, {"error": "lesson not found"})
         else:
             self._json(404, {"error": "no such endpoint"})
         return True
@@ -268,11 +276,14 @@ class IngestMixin:
         if found is None:
             return
         target, course, name = found
-        if not target.is_file():
+        retained = self.catalog and self.catalog.rows("""SELECT l.id FROM lessons l
+            JOIN reclaimed_sources r ON r.lesson_id=l.id WHERE l.path=? AND l.deleted=0""",
+            (str(target.relative_to(self.library)),))
+        if not target.is_file() and not retained:
             self._json(404, {"error": f"{course}/{name} is not there"}, close=True)
             return
         try:
-            target.unlink()
+            target.unlink(missing_ok=bool(retained))
             # The course folder goes too once its last lesson does, so a
             # deleted course does not linger as an empty directory.
             if not course_videos(target.parent):
@@ -303,13 +314,47 @@ class IngestMixin:
         if not getattr(self.server, "uploads_enabled", True):
             self._json(403, {"error": "Library editing is disabled."}, close=True)
             return
+        if len(parts) == 4 and parts[:2] == ["api", "providers"] and parts[3] == "resume" and self.catalog:
+            from .provider_pause import PauseConflict, ProviderPauses
+
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 4096:
+                    raise ValueError("Expected a small JSON request with the current pause ID.")
+                body = json.loads(self.rfile.read(size))
+                if not isinstance(body, dict):
+                    raise ValueError("Expected a JSON object.")
+                resumed = ProviderPauses(self.catalog).resume(parts[2], body.get("pause_id"))
+                self._json(200, {"resumed": resumed}, close=True)
+            except PauseConflict as exc:
+                self._json(409, {"error": str(exc)}, close=True)
+            except (ValueError, TypeError) as exc:
+                self._json(400, {"error": str(exc)}, close=True)
+            return
         if parts[:2] == ["api", "catalog"]:
             self._edit_catalog(parts)
             return
         if len(parts) == 4 and parts[:2] == ["api", "lessons"] and self.catalog:
+            from .catalog import CatalogConflict
+
             try:
                 if parts[3] == "retry":
                     result = {"build_id": self.catalog.retry(parts[2])}
+                elif parts[3] == "settings":
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 4096:
+                        raise ValueError("Expected a small JSON settings request.")
+                    result = {"build_id": self.catalog.configure_lesson(parts[2], json.loads(self.rfile.read(size)))}
+                elif parts[3] == "reclaim":
+                    from .source_storage import reclaim_source
+
+                    if self.library is None:
+                        self._json(503, {"error": "The library is unavailable."}, close=True)
+                        return
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 4096:
+                        raise ValueError("Expected a small JSON reclaim request.")
+                    result = reclaim_source(self.catalog, self.library, parts[2], json.loads(self.rfile.read(size)))
                 elif parts[3] == "cancel":
                     self.catalog.cancel(parts[2])
                     result = {"cancelled": parts[2]}
@@ -319,6 +364,12 @@ class IngestMixin:
                 self._json(200, result, close=True)
             except KeyError:
                 self._json(404, {"error": "lesson not found"}, close=True)
+            except CatalogConflict as exc:
+                self._json(409, {"error": str(exc)}, close=True)
+            except (ValueError, TypeError) as exc:
+                self._json(400, {"error": str(exc)}, close=True)
+            except OSError as exc:
+                self._json(500, {"error": f"Could not finish the operation: {exc}. Refresh to check its current state."}, close=True)
             return
         if self.library is None:
             self._json(503, {"error": "uploads are not enabled here"}, close=True)
@@ -399,7 +450,7 @@ class IngestMixin:
         if target == source:
             self._json(200, {"course": course, "name": name})
             return
-        if target.exists():
+        if self._occupied(target):
             self._json(409, {"error": f"{to_course}/{to_name} is already there"}, close=True)
             return
 
@@ -472,6 +523,13 @@ class IngestMixin:
 
     # -- the upload itself --------------------------------------------------
 
+    def _occupied(self, target: Path) -> bool:
+        # A reclaimed upload still names a lesson. Replacing it must remain an
+        # explicit choice, even though the duplicate file no longer exists.
+        return target.exists() or bool(self.catalog and self.catalog.rows(
+            "SELECT id FROM lessons WHERE path=? AND deleted=0",
+            (str(target.relative_to(self.library)),)))
+
     def _store(self, raw_course: str, raw_name: str) -> None:
         existing_course = existing_component(raw_course)
         course = (existing_course if existing_course and (self.library / existing_course).is_dir()
@@ -498,7 +556,7 @@ class IngestMixin:
         if not self._contained(target):
             return
         overwrite = parse_qs(urlparse(self.path).query).get("overwrite") == ["1"]
-        if target.exists() and not overwrite:
+        if self._occupied(target) and not overwrite:
             self._json(409, {"error": f"{course}/{name} is already there"}, close=True)
             return
 
@@ -514,13 +572,14 @@ class IngestMixin:
                 with self._library_lock():
                     if not self._contained(target):
                         return
-                    if target.exists() and not overwrite:
+                    if self._occupied(target) and not overwrite:
                         self._json(409, {"error": f"{course}/{name} is already there"}, close=True)
                         return
                     upload.commit()
                     if self.catalog:
                         with self.catalog.connect() as db:
                             relative = str(target.relative_to(self.library))
+                            db.execute("DELETE FROM reclaimed_sources WHERE lesson_id=(SELECT id FROM lessons WHERE path=?)", (relative,))
                             db.execute("UPDATE builds SET state='superseded' WHERE id=(SELECT desired_build FROM lessons WHERE path=?) AND state IN ('queued','running')", (relative,))
                             db.execute("UPDATE lessons SET desired_build=NULL WHERE path=?", (relative,))
         except StorageFull as exc:

@@ -36,12 +36,49 @@ transcription, scenes, instructions, assets, assembly, and publication. The
 ordinary `build` command uses those same stage callbacks without DBOS. Only the
 `watch` service supplies the durable runner.
 
+A valid video need not contain instructional actions. Missing audio, a successful
+empty transcript, or a successful empty normalized step list produces a video-only
+lesson. The existing stages remain in the same order: unnecessary audio/analysis/
+LLM work returns empty results, and the frames stage extracts a poster. Publication
+still validates the poster and links to the immutable source snapshot. Exceptions
+from tools or API calls are not swallowed by this fallback. Cached empty steps
+from previously failed jobs remain usable on Retry, with no pipeline-version bump.
+
 Workflow inputs contain a snapshot of processing settings and the source digest.
 File operations, model calls, and catalog changes happen inside steps. Network
 failures and retryable API responses get up to three step attempts with backoff.
 Invalid input and local processing errors fail that lesson and remain available
 for explicit retry. DBOS limits crash recovery to three attempts. The next
 lesson can proceed independently.
+
+Explicit funding/spend-limit failures are intercepted inside the existing LLM
+stage. `ProviderPauses` stores versioned pause identities under `llm-pause:<backend>`
+and waiting markers under `llm-wait:<build ID>` in the existing catalog settings
+table, so no catalog or DBOS schema changes are needed. Catalog build states stay
+`queued`/`running`; the status API adds `blocked` and `provider_pauses` as UI
+projections. The request gate rechecks the pause while holding the existing LLM
+slot, preventing concurrent callers from repeating the rejected request. Waiting
+releases that lock, polls only local SQLite, and observes cancellation/shutdown.
+It retains the existing bounded workflow slot instead of starting unbounded work.
+Other admitted workflows can continue until they need the paused backend.
+
+`POST /api/providers/<backend>/resume` requires the current `pause_id`. Compare and
+delete runs in a SQLite transaction: a stale browser cannot clear a newer pause.
+Restoring credits is external; resume simply allows requests again. Already-failed
+workflows keep the explicit Retry behavior. Known waiting workflows that exceed
+the normal recovery allowance after repeated deployments are re-enqueued with
+`DBOS.resume_workflow(..., queue_name="lessons")`; their IDs and checkpoints remain
+intact. Other failures still use the normal recovery limit.
+
+LLM section checkpoints are atomic files in `llm-sections/<request hash>.json`,
+including a checksum of the accepted response. Their key covers the exact system
+and user prompts, backend/model/fallback policy, source fingerprint and instruction
+settings. Invalid/partial caches are ignored. Forced builds use their own namespace;
+standalone forced runs use a fresh namespace. These files live inside the existing
+`steps` stage; no DBOS calls are inserted or reordered. Completed `steps.json`
+caches, serialized build specs and pipeline/prompt versions stay compatible.
+Saving sections narrows the retry window but cannot recover an API response that
+never reached disk, nor retroactively save sections produced by older code.
 
 **Optional processing helpers**
 
@@ -118,6 +155,29 @@ verifies its digest. This costs additional disk space, but keeps active jobs and
 published playback independent of subsequent overwrite, rename, or deletion.
 The source snapshot is reused for later builds of the same bytes.
 
+Explicit upload reclamation is recorded in schema v7's `reclaimed_sources` table.
+`POST /api/lessons/<id>/reclaim` requires the displayed completed `build_id`.
+Under the shared catalog/ingest lock it checks that this build is ready and
+published and rejects linked files. It verifies both files' digests and flushes
+the retained snapshot outside the lock, then reacquires it and checks that file
+identities and build intent are unchanged. It commits the retained path/digest
+before unlinking the upload, then flushes the upload directory. An interruption
+before unlink leaves an ordinary upload for the next scan; an interruption after
+unlink leaves a durable snapshot-backed lesson. Repeated requests are idempotent.
+Each course cleanup sends independent requests sequentially and reports failures
+without hiding successful removals. Listing byte counts are file sizes, while the
+storage panel reads actual filesystem free space again after cleanup.
+
+Reconciliation includes these lessons even without physical course folders and
+still applies settings changes and per-lesson overrides. Reclaimed entries cannot
+be mistaken for renamed files when a duplicate video appears elsewhere. A new file
+at the same path clears reclamation and is hashed afresh; browser replacement
+requires the usual explicit overwrite. Source preparation can copy the recorded
+retained snapshot into a different output root for future builds. Existing DBOS
+workflow names, step ordering, input specs, and completed history are unchanged.
+Saved snapshots and historical media are never garbage-collected by this action;
+`site/_sources` must be backed up alongside the catalog once uploads are reclaimed.
+
 ```text
 library/                         user-managed source videos
 state/catalog.sqlite             library metadata and build intent
@@ -153,6 +213,18 @@ the generated title becomes the short description. Ordering defaults to natural
 source order until explicitly changed. New items append after a custom order.
 
 `GET /api/catalog` returns the editable library and an organization revision.
+Processing overrides are separate: `lesson-options:<lesson ID>` in the existing
+settings table stores the lesson's `chunk_minutes` override. Reconciliation merges
+it with server defaults before calculating the build input key, so a rescan cannot
+silently undo a per-lesson edit. No new schema or pipeline version is required.
+`GET /api/lessons/<id>/settings` returns the current attempt's values and, when
+available, its validated cached probe duration. `POST` to the same endpoint accepts
+`build_id` and `chunk_minutes` (null restores the current server default). The API
+rejects active/stale attempts and unsupported fields, then commits the override
+and new build together under the catalog lock. Existing workflow specs and DBOS
+history are never rewritten; upstream caches remain reusable. The queue editor
+lives outside the polled job list so polling cannot discard a typed value.
+
 `POST /api/catalog/courses/<id>/title` and
 `POST /api/catalog/lessons/<id>/title` update display metadata. A null lesson title
 restores its filename. `POST /api/catalog/courses/order` orders courses, while
@@ -166,6 +238,21 @@ the same catalog lock as the worker. Source files, lesson IDs, URLs, instruction
 state, and build intents remain intact. The Library page supports title editing,
 up/down controls, moving to a numbered position, order resets, and search. The
 course reader uses a vertical list with previous/next navigation.
+
+Schema version 6 adds nullable `lessons.chapter_override`: null uses the naming
+heuristic, -1 assigns Other lessons, and 0–999 assigns a chapter. The override is
+part of the organization revision and survives reconciliation. It does not enter
+build inputs or instruction reading-state keys. Published records and static
+exports include the override/effective chapter for consistent navigation.
+
+`POST /api/catalog/courses/<id>/chapter` accepts the selected `ids` and a `chapter`
+override. `POST /api/catalog/courses/<id>/move` accepts the selected `ids` and a
+`before` lesson ID (null means end). Both require the catalog revision, validate
+the entire selection belongs to the course, preserve selected lessons' saved
+relative order, and update metadata/positions atomically. Chapter assignments
+append to the destination chapter; automatic restoration regroups from names.
+Rendering collects all members of a chapter, ordered by first chapter appearance
+and saved relative lesson order; Previous/Next uses the same grouped sequence.
 
 **Running locally**
 

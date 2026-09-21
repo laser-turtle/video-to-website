@@ -207,6 +207,16 @@ When the model does not label a step, a keyword scan over the step's own wording
 
 ## Reading a lesson page
 
+Chapter introductions, overviews, and other videos with no extracted actions are
+published as **Video lessons**. They use a full-size inline player, keep any
+available summary/transcript, and participate in the same chapter and keyboard
+navigation. Valid silent videos or videos with an empty transcript are kept too.
+The fallback creates a poster instead of generating step screenshots/clips; it
+does not convert failed API calls or media-tool errors into successful lessons.
+Existing failed introductions can be retried from Task queue without re-uploading;
+cached transcription and empty instruction results are reused. Exports configured
+with `--videos none` still omit the source video and say so on the lesson page.
+
 The steps and their screenshots get the full column, because that is what you read. The
 video is reference material, so it lives in a small player floating in the corner that
 starts collapsed and opens by itself the moment you click a timestamp. Press `v`
@@ -218,6 +228,17 @@ key of its own rather than per lesson, so the speed you watch at follows you fro
 lesson to the next. Clips run at it too. Changing it with the player's own controls is
 picked up as well, and the current speed sits in the player's header.
 
+Between lessons, **Shift+J / Shift+K** opens the next/previous lesson, and
+**Shift+L / Shift+H** jumps to the first lesson of the next/previous chapter.
+These follow the grouped reading order, independent of temporary view sorting.
+They stop at the course boundaries and do not fire while typing.
+
+Press **/** or click **Jump to lesson** to open the lesson picker. Search titles,
+descriptions, original filenames, or `chapter 4`; ordered-letter abbreviations such
+as `bse frm` also find “Base form.” Use **↑ / ↓**, then **Enter**, or **Esc** to
+return to reading. Choosing the current lesson closes the picker without reloading
+it. The picker also works on course pages and in static exports.
+
 The player has three sizes. Collapsed it is a chip showing the current time. Open it
 sits in the corner. Pressing <kbd>f</kbd>, or the button in its header, moves it to the
 centre of the screen at full size for studying one passage closely; <kbd>f</kbd> again,
@@ -225,10 +246,12 @@ centre of the screen at full size for studying one passage closely; <kbd>f</kbd>
 deliberately not remembered, because it is meant to be temporary.
 
 One step at a time is the cursor, highlighted and moved with `j` and `k`. A step
-carrying a clip and a screenshot is often taller than the window, so `j` pages down
-through the step it is on and only moves to the next one once you have reached its end;
-`k` is the exact inverse, landing on the previous step's last page rather than its
-start. Arriving at a step aligns its top, not its middle, because the text worth reading
+carrying a clip and a screenshot is often taller than the window. `j` brings the
+instructions below the first visual to the top, moving that clip/screenshot out
+of the way so the text and following screenshot are easier to study. Very tall
+visuals still advance in overlapping pages. `k` stops at the instructions on the
+way back too, and returns to that reading position when entering the previous
+step. Arriving at a step aligns its top, not its middle, because the text worth reading
 is at the top. Scrolling by hand is respected: the next `j` resumes from whatever is
 actually on screen. The page animates its own scrolling over 200ms, because
 the browser's built-in smooth scrolling has a fixed duration that is slow enough to get
@@ -496,6 +519,22 @@ The queue updates in place, so completed lessons do not reset the current search
 or filter. If the API is unavailable, it displays the last published status as a
 read-only view and explains why controls are unavailable.
 
+Use **Processing settings** on a queue entry to inspect its transcript section
+length. Failed `max_tokens` responses offer **Adjust settings & retry**, with a
+smaller suggested length based on the cached video duration when available.
+Choose 1–120 minutes and **Save and retry**; ready lessons offer **Save and
+reprocess**. Shorter sections reduce output per request but make more requests.
+The override applies only to that lesson and survives imports, renames and server
+restarts. **Use the server default** removes it. Other processing parameters
+remain server configuration for now.
+
+Saving creates a new workflow attempt. Completed transcription and visual
+analysis are reused under the normal cache/force rules; instructions and any
+changed media are regenerated. Existing published content remains available.
+Running or queued jobs must be cancelled before changing their settings. Polling
+does not disturb the editor, and conflicting retries/imports require **Reload
+latest settings**, which preserves your proposed value.
+
 *Add videos* on the home page takes a course name and however many files, and
 PUTs them into the library one at a time with a progress bar each. They land as
 ordinary files, so the scanner picks them up exactly as it would an `scp`.
@@ -522,8 +561,10 @@ as a short description. Course lessons list vertically, with collapsible chapter
 inferred from leading numbers such as `4.01`, `4-02`, `4_03`, or
 `Chapter 4 - Lesson 2`. Numbered title overrides take precedence; unnumbered renames
 fall back to the source filename. Embedded version numbers and full date prefixes
-are ignored. Unnumbered lessons stay available under **Other lessons**. Groups
-preserve the saved sequence; a later return to a chapter is marked **continued**.
+are ignored. Unnumbered lessons stay available under **Other lessons**. Every
+chapter appears once, collecting its lessons even when they are scattered in the
+saved list. Chapters follow their first appearance, and lessons retain their order
+within each chapter. **All lessons** shows the exact saved flat sequence.
 
 Use **Find a lesson** to search titles, generated descriptions, original filenames,
 and chapter numbers. Search opens matching chapters temporarily; clearing it
@@ -535,7 +576,8 @@ in this browser per course and do not edit the library's reading order.
 The reader has a collapsible **Course contents** menu with the same controls and
 the current lesson highlighted and its chapter open. It starts with compact rows;
 its row density is remembered separately from the course index. Previous/next
-links always follow the saved order. Chapters and lesson links also work in static
+links follow the grouped reading sequence, so the next lesson stays in the current
+chapter until its end. Chapters and lesson links also work in static
 exports without JavaScript. These are viewing changes: existing videos do not need
 to be reprocessed.
 
@@ -560,15 +602,40 @@ course list. Sorting includes unpublished lessons too, and can be reapplied afte
 an out-of-order upload. Selecting a method alone does not change anything; saving
 uses the catalog revision to guard against concurrent library edits.
 
+To move several lessons, use their checkboxes, **Select chapter**, or **Select all
+lessons** (**Select matches** while searching). The selection toolbar shows how
+many selected lessons are hidden by the current search. Choose **To a chapter**
+to assign the selection to an existing/new chapter or **Other lessons**. These
+assignments persist without renaming titles or source files; **Automatic from
+names** restores the naming heuristic. Moved lessons append to the destination
+chapter in their saved relative order. Choose **In saved order** to move the
+selection as a block to the start, end, or before another lesson. Chapter grouping
+still collects matching members; switch to **All lessons** to see exact positions.
+Up/down arrows in chapter view move within that chapter. A failed or conflicting
+bulk save keeps the selection, and successful moves clear it.
+
 Metadata edits update published pages immediately, independently of the media
 worker. They do not create processing jobs. Concurrent edits and imports are
 checked against the revision loaded by the page; a stale edit asks you to refresh
 instead of overwriting someone else's organization.
 
-The Add videos page retains **Rename file** and **Delete** for direct-child source
-files. Delete takes two clicks and removes the original library file; there is no
-restore action yet. Reconciliation removes its current page and navigation entry.
-Stage caches, historical revisions, and processing snapshots are retained.
+On **Add videos → Uploaded originals**, **Reclaim space** removes an uploaded copy
+after the current lesson finishes. **Reclaim completed uploads** does this for a
+whole course, showing the combined file size before confirmation. The server
+verifies the saved video's checksum against the upload before removing anything.
+Lessons, playback, chapters, reading progress, and future reprocessing remain
+available. Reclaimed originals stay listed with an **Open lesson** link; Library
+also labels them. **Refresh originals** updates eligibility after jobs finish.
+The storage panel refreshes after cleanup; actual disk space recovered can differ
+from the file sizes on compressed or copy-on-write filesystems.
+
+**Rename file** and **Delete** remain available for direct-child source files.
+Delete takes two clicks and removes the lesson and any remaining original upload;
+there is no restore action yet. Reconciliation removes its current page and
+navigation entry. Stage caches, historical revisions, and saved videos are retained.
+Keep `site/_sources` in backups: after reclamation it contains the authoritative
+original video. Uploading another file with the reclaimed name requires **Replace
+it**, just as replacing any other lesson does.
 
 **There is no authentication.** Anyone who can reach the site can add a course
 or replace a lesson -- or now delete one. That is the right trade on a home
@@ -601,6 +668,34 @@ limited to three recovery attempts. Retryable network/API failures get bounded
 step retries. Other processing errors remain visible in the Task queue with Retry,
 and the worker continues to later lessons.
 
+Explicit credit, billing, and spending-limit errors pause requests to that LLM
+backend. The Task queue shows **Waiting for API credits / billing**, a provider
+banner, and **Resume requests**. After restoring access, resume there; waiting
+workflows continue with their existing IDs. If access is still blocked, the next
+caller pauses the backend again. Ordinary rate limits and transient network errors
+retain bounded retries. Pause detection uses [Anthropic's documented error types
+and spending-limit codes](https://platform.claude.com/docs/en/api/errors), with
+conservative text matching for older responses and CLI error output.
+
+Pauses persist across restarts and release the model-request lock. Waiting jobs
+remain cancellable. They occupy the existing bounded workflow slots, so when all
+slots are waiting, later lessons stay queued until access resumes; no extra
+workflow threads are created to work around the pause. The pause applies per
+backend (Anthropic API, Claude CLI, Codex CLI, or Ollama) for the server's current
+credentials, rather than to individual models or accounts. The standalone `build`
+command saves sections but exits on a billing error; durable waiting is a service
+feature.
+
+Each successfully parsed instruction section is saved before the next LLM
+request. Recovery and retries reuse matching sections, keyed by the request,
+backend/model, source and processing settings. Existing complete instruction
+caches remain valid. Forced builds start a separate cache for that build and can
+reuse it on recovery. The workflow name, stage sequence, pipeline/prompt versions,
+and existing build inputs are unchanged. Jobs that already failed before this
+upgrade still need **Retry**. Responses that were never saved—including partial
+work from older code and a request interrupted before its result reached disk—may
+need to be requested again; this does not guarantee exactly-once API charges.
+
 Rebuilding a lesson creates a new media revision. Its previous revision remains
 readable until replacement succeeds. Generation happens outside the published
 revision, and public text files are replaced atomically. A canceled or removed
@@ -621,7 +716,8 @@ v2w jobs cancel LESSON_ID --state /var/lib/video-to-website/state
 ```
 
 Deleting a library source removes its current catalog page, but historical media
-and processing snapshots are retained. Automatic artifact cleanup and trash/restore
+and processing snapshots are retained. Use **Reclaim space** to keep the lesson
+while removing only its duplicate upload. Automatic artifact cleanup and trash/restore
 are not implemented yet. This means storage usage includes source snapshots and
 previous revisions, not just the original library.
 

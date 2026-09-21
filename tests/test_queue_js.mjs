@@ -9,24 +9,31 @@ function element(tag) {
     appendChild(child) { this.children.push(child); return child; },
     setAttribute(name, value) { this.attributes[name] = value; },
     addEventListener(name, fn) { this.listeners[name] = fn; },
-    fire(name) { this.listeners[name]?.(); },
+    fire(name, event = {}) { this.listeners[name]?.({preventDefault() {}, ...event}); },
+    showModal() { this.open = true; },
+    close() { this.open = false; this.fire('close'); },
     focus() { document.activeElement = this; },
     get textContent() { return this._text + this.children.map(c => c.textContent).join(''); },
     set textContent(text) { this._text = text; this.children = []; },
   };
 }
 const ids = {};
-for (const id of ['job-list', 'queue-summary', 'job-filter', 'job-search', 'queue-empty', 'queue-notice', 'queue-updated', 'queue-course', 'queue-course-name', 'queue-all-courses']) {
+for (const id of ['job-list', 'queue-summary', 'job-filter', 'job-search', 'queue-empty', 'queue-notice', 'queue-updated', 'queue-course', 'queue-course-name', 'queue-all-courses', 'provider-pauses']) {
   ids[id] = element('div');
 }
+for (const id of ['processing-settings', 'processing-settings-form', 'processing-settings-lesson', 'processing-settings-current', 'processing-settings-default', 'processing-settings-chunk', 'processing-settings-hint', 'processing-settings-error', 'processing-settings-save', 'processing-settings-reload', 'processing-settings-close']) ids[id] = element('div');
 const list = ids['job-list'];
 const filter = ids['job-filter'];
 filter.value = 'active';
-filter.options = ['active', 'queued', 'failed', 'cancelled', 'done', 'all'].map(value => ({ value }));
+filter.options = ['active', 'queued', 'blocked', 'failed', 'cancelled', 'done', 'all'].map(value => ({ value }));
 const document = {
   hidden: false, activeElement: null, listeners: {},
   getElementById(id) { return ids[id]; },
   createElement: element,
+  querySelector(selector) {
+    const job = /data-job-id="([^"]+)"/.exec(selector)?.[1];
+    return descendants(list).find(node => node.dataset.jobId === job && node.dataset.action === 'settings');
+  },
   addEventListener(name, fn) { this.listeners[name] = fn; },
 };
 const id = n => n.toString(16).padStart(32, '0');
@@ -41,14 +48,16 @@ let payload = {updated: Date.now() / 1000, built: 1, videos: [ready, ...queued, 
 let apiAvailable = true;
 let staticAvailable = true;
 let completeAction;
+let processingProfile;
 const requests = [];
 const fetch = (url, init = {}) => {
-  requests.push({url, method: init.method || 'GET'});
+  requests.push({url, method: init.method || 'GET', body: init.body && JSON.parse(init.body)});
   if (init.method === 'POST') {
     return new Promise(resolve => { completeAction = (ok, error) => resolve({
       ok, status: ok ? 200 : 409, json: () => Promise.resolve({error})
     }); });
   }
+  if (url.endsWith('/settings')) return Promise.resolve({ok: true, json: async () => structuredClone(processingProfile)});
   const available = url === 'api/jobs' ? apiAvailable : staticAvailable;
   return Promise.resolve({ok: available, json: () => Promise.resolve(structuredClone(payload))});
 };
@@ -146,7 +155,7 @@ completeAction(true);
 await flush();
 select('cancelled');
 assert.equal(list.children.length, 1);
-assert.ok(list.textContent.includes('source video is still in the library'));
+assert.ok(list.textContent.includes('lesson video is retained'));
 assert.equal(buttons()[0].textContent, 'Retry processing');
 assert.ok(requests.some(r => r.url === 'api/lessons/' + queued[0].id + '/cancel' && r.method === 'POST'));
 
@@ -198,4 +207,82 @@ new Function('document', 'fetch', 'setInterval', 'location', source)(document, f
 payload = {videos: [{...failed, state: 'failed'}, running]}; await flush(); tick(); await flush();
 assert.equal(ids['job-search'].value, 'Drawing');
 assert.equal(list.children.length, 1, 'legacy status links use visible search text');
+
+search(''); select('active');
+const pause = {id: 'f'.repeat(32), provider: 'anthropic', name: 'Anthropic API', reason: 'credits', message: 'Add credits, then resume requests.'};
+payload = {provider_pauses: [pause], videos: [{...running, state: 'blocked', blocked: pause}]};
+tick(); await flush();
+assert.equal(list.children.length, 1, 'active queue includes paused lessons');
+assert.ok(list.textContent.includes('Waiting for API credits'));
+assert.ok(!list.textContent.includes('left for transcription'), 'paused lessons do not show an active estimate');
+assert.ok(ids['queue-summary'].textContent.includes('1 waiting for API access'));
+assert.equal(buttons()[0].textContent, 'Cancel processing', 'waiting workflows remain cancellable');
+const resume = () => descendants(ids['provider-pauses']).find(node => node.tagName === 'button');
+assert.equal(resume().textContent, 'Resume requests');
+resume().focus(); tick(); await flush();
+assert.equal(document.activeElement, resume(), 'provider controls retain keyboard focus across polls');
+const posts = requests.filter(r => r.method === 'POST').length;
+resume().fire('click'); resume().fire('click');
+assert.equal(requests.filter(r => r.method === 'POST').length, posts + 1);
+assert.equal(requests.at(-1).url, 'api/providers/anthropic/resume');
+assert.deepEqual(requests.at(-1).body, {pause_id: pause.id});
+completeAction(false, 'The provider paused again. Refresh its status before resuming.'); await flush();
+assert.ok(ids['provider-pauses'].textContent.includes('paused again'));
+assert.equal(resume().disabled, false);
+resume().fire('click'); payload = {provider_pauses: [], videos: [running]}; completeAction(true); await flush();
+assert.equal(ids['provider-pauses'].children.length, 0);
+payload = {provider_pauses: [pause], videos: [{...running, state: 'blocked', blocked: pause}]};
+apiAvailable = false; staticAvailable = true; tick(); await flush();
+assert.equal(resume().disabled, true, 'static exports cannot claim to resume the provider');
+
+// Processing settings are a stable dialog while the queue continues polling.
+apiAvailable = true; filter.value = 'failed';
+const configurable = {id: id(60), build_id: id(70), course: 'polygon_runway', title: 'polygon-runway-katana',
+  state: 'failed', error: 'response hit max_tokens before finishing', updated: 1,
+  processing: {chunk_minutes: 25, default_chunk_minutes: 25, custom_chunk_minutes: null}};
+processingProfile = {id: id(60), build_id: id(70), state: 'failed', updated: 1,
+  chunk_minutes: 25, default_chunk_minutes: 25, custom_chunk_minutes: null, duration: 480};
+payload = {videos: [configurable]}; tick(); await flush();
+const settings = () => buttons().find(node => node.dataset.action === 'settings');
+assert.equal(settings().textContent, 'Adjust settings & retry');
+settings().fire('click'); await flush();
+assert.equal(ids['processing-settings'].open, true);
+assert.equal(ids['processing-settings-chunk'].value, '4', 'suggestion accounts for actual duration, not just configured chunk size');
+assert.equal(ids['processing-settings-default'].checked, false);
+ids['processing-settings-chunk'].value = '3.5'; ids['processing-settings-chunk'].focus();
+tick(); await flush();
+assert.equal(ids['processing-settings-chunk'].value, '3.5', 'polls do not erase an unsaved edit');
+assert.equal(document.activeElement, ids['processing-settings-chunk']);
+const beforeSettings = requests.filter(request => request.method === 'POST').length;
+ids['processing-settings-form'].fire('submit'); ids['processing-settings-form'].fire('submit');
+assert.equal(requests.filter(request => request.method === 'POST').length, beforeSettings + 1);
+assert.deepEqual(requests.at(-1).body, {build_id: id(70), chunk_minutes: 3.5});
+assert.equal(ids['processing-settings-close'].disabled, true);
+completeAction(false, 'This lesson changed. Reload the latest settings.'); await flush();
+assert.equal(ids['processing-settings-chunk'].value, '3.5');
+assert.equal(ids['processing-settings-reload'].hidden, false);
+processingProfile = {...processingProfile, build_id: id(71), updated: 2, chunk_minutes: 10, custom_chunk_minutes: 10};
+configurable.build_id = id(71); configurable.updated = 2;
+tick(); await flush();
+assert.equal(ids['processing-settings-save'].disabled, true, 'a stale edit cannot replace a newer attempt');
+ids['processing-settings-reload'].fire('click'); await flush();
+assert.equal(ids['processing-settings-chunk'].value, '3.5', 'explicit refresh preserves the proposed value');
+ids['processing-settings-form'].fire('submit');
+assert.deepEqual(requests.at(-1).body, {build_id: id(71), chunk_minutes: 3.5});
+configurable.build_id = id(72); configurable.updated = 3; configurable.state = 'queued'; configurable.error = null;
+completeAction(true); await flush();
+assert.equal(ids['processing-settings'].open, false);
+filter.value = 'active'; filter.fire('change');
+processingProfile = {...processingProfile, build_id: id(72), updated: 3, state: 'queued', chunk_minutes: 3.5, custom_chunk_minutes: 3.5};
+settings().fire('click'); await flush();
+assert.equal(ids['processing-settings-save'].disabled, true, 'active workflows cannot be changed in place');
+assert.ok(ids['processing-settings-error'].textContent.includes('Cancel it'));
+ids['processing-settings-close'].fire('click');
+configurable.state = 'failed'; filter.value = 'failed'; processingProfile.state = 'failed'; tick(); await flush();
+settings().fire('click'); await flush();
+ids['processing-settings-default'].checked = true; ids['processing-settings-default'].fire('change');
+assert.equal(ids['processing-settings-chunk'].disabled, true);
+ids['processing-settings-form'].fire('submit');
+assert.deepEqual(requests.at(-1).body, {build_id: id(72), chunk_minutes: null}, 'default reset is explicit');
+completeAction(true); await flush();
 console.log('queue.js runtime checks passed');

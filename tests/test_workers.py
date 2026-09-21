@@ -153,6 +153,8 @@ class WorkerTests(WorkerFixture):
         worker = self.pair()
         with self.catalog.connect() as db:
             db.execute("ALTER TABLE workers DROP COLUMN archived")
+            db.execute("ALTER TABLE lessons DROP COLUMN chapter_override")
+            db.execute("DROP TABLE reclaimed_sources")
             db.execute("PRAGMA user_version=4")
         reopened = WorkerStore(Catalog(self.root / "state"))
         self.assertEqual(reopened.authenticate(worker["token"]), worker["id"])

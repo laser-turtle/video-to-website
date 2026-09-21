@@ -75,6 +75,7 @@ let libraryPayload = {
 let apiOk = true;
 let availableSpace = 8 * 1024 ** 3;
 let mutationError = null;
+let reclaimGate = null, reclaimError = null;
 const apiCalls = [];
 const fakeFetch = (url, init) => {
   const method = (init && init.method) || 'GET';
@@ -95,6 +96,17 @@ const fakeFetch = (url, init) => {
     return Promise.resolve({
       ok: false, status: 409, json: () => Promise.resolve({ error: mutationError }),
     });
+  }
+  if (url.endsWith('/reclaim')) {
+    const item = libraryPayload.courses.flatMap(c => c.videos).find(v => url.includes('/' + v.lesson_id + '/'));
+    const perform = () => {
+      if (item.lesson_id === reclaimError) return {ok: false, status: 409, json: async () => ({error: 'The saved video does not match the original.'})};
+      const removed_bytes = item.bytes;
+      item.bytes = 0; item.source_reclaimed = true; item.reclaimable = false;
+      return {ok: true, status: 200, json: async () => ({removed_bytes})};
+    };
+    if (reclaimGate) return new Promise(resolve => { reclaimGate.release = () => resolve(perform()); });
+    return Promise.resolve(perform());
   }
   return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
 };
@@ -237,7 +249,7 @@ apiCalls.length = 0;
 const doomed = rows()[0];
 buttonIn(doomed, 'Delete').click();
 assert.equal(apiCalls.length, 0, 'the first click deletes nothing');
-assert.ok(doomed.textContent.includes('Remove source from library?'), 'it asks first');
+assert.ok(doomed.textContent.includes('Delete the original and remove this lesson'), 'it explains lesson removal');
 assert.ok(buttonIn(doomed, 'Cancel'), 'and offers a way out');
 buttonIn(doomed, 'Yes, delete').click();
 await flush();
@@ -292,6 +304,57 @@ availableSpace = 100;
 rejected.children.find(c => c.className === 'again').click(); await flush();
 assert.equal(sent.length, beforeCapacityCheck + 1, 'retry checks the newly available space');
 sent[sent.length - 1].finish(201); await flush();
+
+// Reclamation is explicit, disables duplicate actions during verification, and
+// preserves visible lessons; course cleanup reports partial failures accurately.
+libraryPayload.courses[0].videos.forEach((v, index) => Object.assign(v, {
+  lesson_id: 'lesson-' + index, build_id: 'build-' + index, reclaimable: true,
+  href: 'course/lesson-' + index + '.html',
+}));
+libraryPayload.courses[1].videos[0].lesson_id = 'processing';
+run(); await flush(); await flush();
+apiCalls.length = 0;
+const ready = rows()[0];
+buttonIn(ready, 'Reclaim space').click();
+assert.equal(apiCalls.length, 0, 'opening the cleanup confirmation does not delete anything');
+assert.ok(ready.textContent.includes('lesson and saved video stay available'));
+assert.ok(ready.textContent.includes('reprocessing'));
+const confirmReclaim = buttonIn(ready, 'Reclaim original');
+reclaimGate = {};
+confirmReclaim.click(); await flush();
+assert.ok(message.textContent.includes('Verifying saved video'));
+assert.equal(confirmReclaim.disabled, true);
+confirmReclaim.click(); await flush();
+assert.equal(apiCalls.filter(c => c.url.endsWith('/reclaim')).length, 1, 'duplicate clicks cannot repeat cleanup');
+assert.deepEqual(JSON.parse(apiCalls.find(c => c.url.endsWith('/reclaim')).body), {build_id: 'build-0'});
+reclaimGate.release(); reclaimGate = null; await flush(); await flush();
+assert.ok(rows()[0].textContent.includes('Original reclaimed'));
+assert.equal(rows()[0].children[2].textContent, '0 B', 'removed copies do not claim to occupy any upload space');
+assert.ok(rows()[0].children.some(c => c.tagName === 'a' && c.textContent === 'Open lesson'));
+assert.equal(buttonIn(rows()[0], 'Rename file'), undefined);
+assert.equal(buttonIn(rows()[0], 'Reclaim space'), undefined);
+assert.ok(message.textContent.includes('duplicate uploads'));
+assert.equal(buttonIn(rows()[2], 'Reclaim space').disabled, true, 'unfinished lessons cannot be reclaimed');
+
+// Set up two ready originals to exercise sequential bulk cleanup and a refusal.
+Object.assign(libraryPayload.courses[0].videos[0], {source_reclaimed: false, reclaimable: true, bytes: 1048576});
+run(); await flush(); await flush();
+const toolbar = libraryList.children[0].children.find(c => c.className === 'source-tools');
+apiCalls.length = 0;
+toolbar.children[0].click();
+assert.equal(apiCalls.length, 0);
+assert.ok(toolbar.textContent.includes('All lessons and saved videos stay available'));
+reclaimError = 'lesson-0';
+buttonIn(toolbar, 'Reclaim 2 originals').click(); await flush(); await flush(); await flush();
+assert.deepEqual(apiCalls.filter(c => c.url.endsWith('/reclaim')).map(c => c.url), ['api/lessons/lesson-0/reclaim', 'api/lessons/lesson-1/reclaim']);
+assert.ok(message.textContent.includes('does not match'));
+assert.equal(libraryPayload.courses[0].videos[0].source_reclaimed, false);
+assert.equal(libraryPayload.courses[0].videos[1].source_reclaimed, true);
+assert.ok(rows()[0].children.every(c => c.tagName !== 'button' || !c.disabled), 'controls recover after a partial failure');
+reclaimError = null;
+const retainedRow = rows()[1];
+buttonIn(retainedRow, 'Delete').click();
+assert.ok(retainedRow.textContent.includes('Remove this lesson from the library?'));
 
 // 13. A site with no API behind it says so rather than failing silently.
 apiOk = false;

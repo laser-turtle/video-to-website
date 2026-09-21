@@ -45,6 +45,19 @@ function fetch(url, init = {}) {
       const item = parts[2] === 'courses' ? data.courses.find(c => c.id === parts[3]) : data.courses.flatMap(c => c.videos).find(v => v.id === parts[3]);
       item.title = body.title === null ? item.source_title : body.title;
       item.custom_title = body.title !== null;
+    } else if (['chapter', 'move'].includes(parts.at(-1))) {
+      const course = data.courses.find(c => c.id === parts[3]);
+      const moving = course.videos.filter(v => body.ids.includes(v.id));
+      const remaining = course.videos.filter(v => !body.ids.includes(v.id));
+      if (parts.at(-1) === 'chapter') {
+        moving.forEach(v => { v.chapter_override = body.chapter; v.chapter = body.chapter === null ? v.numbering?.[0] ?? null : body.chapter === -1 ? null : body.chapter; });
+        const groups = new Map();
+        [...remaining, ...moving].forEach(v => { const chapter = v.chapter ?? v.numbering?.[0] ?? null; if (!groups.has(chapter)) groups.set(chapter, []); groups.get(chapter).push(v); });
+        course.videos = [...groups.values()].flat();
+      } else {
+        const at = body.before === null ? remaining.length : remaining.findIndex(v => v.id === body.before);
+        course.videos = [...remaining.slice(0, at), ...moving, ...remaining.slice(at)];
+      }
     } else if (parts.at(-1) === 'order') {
       const course = parts.length === 5 ? data.courses.find(c => c.id === parts[3]) : null;
       const items = course ? course.videos : data.courses;
@@ -64,7 +77,7 @@ function fetch(url, init = {}) {
 const flush = async () => { for (let i = 0; i < 3; i++) await new Promise(resolve => setImmediate(resolve)); };
 function nodes(root = ids['library-courses']) { return root.children.flatMap(c => [c, ...nodes(c)]); }
 function control(key) { return nodes().find(n => n.dataset.focusKey === key); }
-function input() { return nodes().find(n => n.tagName === 'input'); }
+function input() { const form = nodes().find(n => n.className === 'library-edit'); return form && nodes(form).find(n => n.tagName === 'input'); }
 function titleOrder() { return nodes().filter(n => n.tagName === 'h3').map(n => n.textContent); }
 const state = new Map();
 const storage = {getItem: key => state.get(key) || null, setItem: (key, value) => state.set(key, value)};
@@ -180,6 +193,48 @@ assert.equal(nodes().find(n => n.className === 'managed-chapter').open, true, 'e
 assert.equal(control('course-a-sort-apply').disabled, true, 'sorting cannot discard an unsaved title');
 assert.equal(ids['library-group'].disabled, true);
 control('edit-cancel').click();
+
+// Scattered chapter members merge; bulk selection survives filtering and conflicts.
+const managed = data.courses.find(c => c.id === 'a');
+const a1 = managed.videos.find(v => v.id === 'a1'), a2 = managed.videos.find(v => v.id === 'a2');
+managed.videos = [a1, {id: 'a3', title: '5.01 - Another chapter', source_name: '5.01 - Another chapter.mp4', numbering: [5, 1], state: 'queued'}, a2];
+data.revision = String(Number(data.revision) + 1);
+ids['library-refresh'].click(); await flush();
+assert.equal(nodes().filter(n => n.dataset.chapterKey?.startsWith('a|')).length, 2);
+assert.deepEqual(titleOrder().filter(t => t.startsWith('4.') || t.startsWith('5.')), [a1.title, a2.title, '5.01 - Another chapter']);
+control('course-a-select-4:1').click();
+assert.ok(ids['library-courses'].textContent.includes('2 selected'));
+ids['library-search'].value = 'Another'; ids['library-search'].fire('input');
+assert.ok(ids['library-courses'].textContent.includes('2 hidden by search'));
+let target = control('course-a-bulk-target'); target.value = '5'; target.fire('change');
+conflict = true; control('course-a-bulk-apply').click(); await flush();
+assert.deepEqual(requests.at(-1).body.ids, ['a1', 'a2'], 'the explicit selection includes hidden lessons');
+assert.equal(requests.at(-1).body.chapter, 5);
+assert.ok(ids['library-courses'].textContent.includes('2 selected'), 'failed saves keep the selection');
+assert.equal(control('course-a-bulk-target').value, '5');
+conflict = false; control('course-a-bulk-apply').click(); await flush();
+assert.ok(ids['library-courses'].textContent.includes('0 selected'));
+ids['library-search'].value = ''; ids['library-search'].fire('input');
+control('course-a-bulk-select').click();
+target = control('course-a-bulk-target'); target.value = 'new'; target.fire('change');
+let chapterNumber = control('course-a-bulk-number');
+before = requests.length; chapterNumber.value = ''; control('course-a-bulk-apply').click();
+assert.equal(requests.length, before, 'blank chapter numbers do not accidentally become chapter zero');
+chapterNumber.value = '7'; chapterNumber.fire('input'); control('course-a-bulk-apply').click(); await flush();
+assert.ok(data.courses.find(c => c.id === 'a').videos.every(v => v.chapter_override === 7));
+assert.ok(ids['library-courses'].textContent.includes('Assigned to Chapter 7'));
+control('course-a-bulk-select').click();
+target = control('course-a-bulk-target'); target.value = 'auto'; target.fire('change');
+control('course-a-bulk-apply').click(); await flush();
+assert.ok(data.courses.find(c => c.id === 'a').videos.every(v => v.chapter_override === null));
+const checkbox = control('lesson-a1-select'); checkbox.checked = true; checkbox.fire('change');
+const mode = control('course-a-bulk-mode'); mode.value = 'position'; mode.fire('change');
+target = control('course-a-bulk-target'); target.value = 'start'; target.fire('change');
+control('course-a-bulk-apply').click(); await flush();
+assert.equal(requests.at(-1).url, 'api/catalog/courses/a/move');
+assert.deepEqual(requests.at(-1).body.ids, ['a1']);
+assert.equal(data.courses.find(c => c.id === 'a').videos[0].id, 'a1');
+assert.equal(control('lesson-a1-select').checked, false, 'successful moves clear checkboxes');
 
 offline = true; ids['library-refresh'].click(); await flush();
 assert.ok(ids['library-message'].textContent.includes('Read-only'));

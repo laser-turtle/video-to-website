@@ -421,6 +421,7 @@ assert.equal(page.y, 920, 'then pages back up through it');
 scrollByHand(2384);
 press('j');
 assert.ok(stepTwo.classes.has('current'), 'j moves on from where they actually are');
+assert.equal(page.y, 2600, 'a sliver of the previous step does not consume the first keypress');
 press('j');
 assert.equal(page.y, 2600, 'paging to the last page of the final step');
 press('j');
@@ -434,6 +435,24 @@ assert.ok(step.classes.has('current'), 'and the cursor follows');
 press('End');
 assert.ok(stepTwo.classes.has('current'), 'End goes to the last step');
 assert.equal(page.y, 2600, 'landing on its last page');
+
+// Notes below the lead visual should reach the top, even when fitting the
+// step's bottom would produce a much smaller scroll. Back uses that stop too.
+const instructions = makeElement('ul', {classes: ['actions'], docTop: 600, docHeight: 100});
+instructions.parentNode = step; step.children.push(instructions); step.docHeight = 1100;
+press('Home'); press('j');
+assert.equal(page.y, 584, 'align the instructions at the 16px top inset, not the screenshot bottom');
+assert.ok(step.classes.has('current'));
+press('k'); assert.equal(page.y, 0);
+press('j'); press('j'); assert.ok(stepTwo.classes.has('current'));
+press('k'); assert.equal(page.y, 584, 'return to the notes when coming back from the next step');
+scrollByHand(400); press('j'); assert.equal(page.y, 584, 'manual scrolling still finds the notes');
+step.docHeight = 2400; instructions.docTop = 1700;
+press('Home'); press('j'); assert.equal(page.y, 680, 'very tall lead visuals still get overlapping pages');
+press('j'); assert.equal(page.y, 1360);
+press('j'); assert.equal(page.y, 1684, 'then the notes align at the top');
+step.children = step.children.filter(child => child !== instructions);
+press('End');
 
 // 19. Playback speed steps through a ladder and is remembered globally.
 assert.equal(mainVideo.playbackRate, 1, 'starts at normal speed');

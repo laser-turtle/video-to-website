@@ -7,7 +7,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from video_to_website import render
-from video_to_website.chapters import chapter_number, chapter_runs, lesson_numbering
+from video_to_website.chapters import chapter_number, chapter_groups, lesson_chapter, lesson_numbering
 
 
 def lesson(name, slug="lesson", **overrides):
@@ -59,17 +59,29 @@ class ChapterTests(unittest.TestCase):
         self.assertIsNone(lesson_numbering(lesson("Intro", title="3.14 - Generated description")))
         self.assertEqual(lesson_numbering({"title": "4.10 - Old export"}), (4, 10))
 
-    def test_grouping_never_reorders_or_drops_lessons(self):
+    def test_grouping_collects_scattered_chapters_without_losing_lessons(self):
         lessons = [lesson(name, str(i)) for i, name in enumerate([
             "Welcome", "4.02 Start", "4-03 Middle", "Resources", "10.01 End", "4.01 Revisit",
         ])]
-        groups = chapter_runs(lessons)
+        groups = chapter_groups(lessons)
         self.assertEqual([group["label"] for group in groups], [
-            "Other lessons", "Chapter 4", "Other lessons (continued)", "Chapter 10", "Chapter 4 (continued)",
+            "Other lessons", "Chapter 4", "Chapter 10",
         ])
-        self.assertEqual([item for group in groups for item in group["lessons"]], lessons)
-        self.assertEqual(groups[-1]["key"], "4:2")
-        self.assertEqual(chapter_runs([]), [])
+        self.assertEqual([item["slug"] for group in groups for item in group["lessons"]], ["0", "3", "1", "2", "5", "4"])
+        self.assertEqual(groups[1]["key"], "4:1")
+        self.assertEqual(chapter_groups([]), [])
+
+    def test_manual_chapters_and_navigation_through_scattered_lessons(self):
+        lessons = [lesson("4.01 First", "first"), lesson("5.01 Next chapter", "next"), lesson("4.02 Second", "second")]
+        course = {"slug": "course", "title": "Course", "lessons": lessons}
+        page = render.render_lesson_page(lessons[0], course)
+        self.assertIn('Next: 4.02 Second', page)
+        self.assertNotIn('continued', page)
+        self.assertEqual([row['data-course-lesson'] for row in NavigationParser(page).rows], ['first', 'second', 'next'])
+        self.assertEqual([row['data-position'] for row in NavigationParser(page).rows], ['1', '3', '2'])
+        self.assertEqual(lesson_chapter(dict(lessons[0], chapter_override=0)), 0)
+        self.assertIsNone(lesson_chapter(dict(lessons[0], chapter_override=-1)))
+        self.assertEqual(lesson_chapter(dict(lessons[0], chapter_override=None)), 4)
 
     def test_native_groups_are_usable_without_javascript(self):
         lessons = [lesson("4.01 First", "first"), lesson("4-02 Second", "second"), lesson("10.01 Third", "third")]
@@ -120,6 +132,8 @@ class ChapterTests(unittest.TestCase):
             render.write_site(root, [{"slug": "course", "title": "Course", "lessons": [lesson("4.01 First")]}])
             self.assertEqual((root / "assets" / "course.js").read_text(), render.COURSE_SCRIPT)
             self.assertIn('assets/course.js?v=', (root / "course" / "lesson.html").read_text())
+            self.assertIn('assets/navigation.js?v=', (root / "course" / "lesson.html").read_text())
+            self.assertEqual((root / "assets" / "navigation.js").read_text(), render.NAVIGATION_SCRIPT)
             self.assertEqual(json.loads((root / "site.json").read_text())[0]["lessons"][0]["numbering"], [4, 1])
 
 

@@ -47,30 +47,24 @@ def lesson_numbering(lesson: dict) -> tuple[int, int] | None:
 
 
 def lesson_chapter(lesson: dict) -> int | None:
+    override = lesson.get("chapter_override")
+    if override is not None:
+        return None if override == -1 else override
     numbering = lesson_numbering(lesson)
     return numbering[0] if numbering else None
 
 
-def chapter_runs(lessons: list[dict]) -> list[dict]:
-    """Group adjacent chapters, preserving even an interleaved custom order.
-
-    A later return to a chapter is labelled '(continued)' rather than moving a
-    lesson away from its saved neighbours. The browser uses the same rule when
-    applying a temporary sort to these rows.
-    """
-    runs: list[dict] = []
-    occurrences: dict[int | None, int] = {}
+def chapter_groups(lessons: list[dict]) -> list[dict]:
+    """Collect each chapter once, retaining first appearance and lesson order."""
+    groups: dict[int | None, dict] = {}
     for lesson in lessons:
         number = lesson_chapter(lesson)
-        if not runs or runs[-1]["number"] != number:
-            occurrences[number] = occurrences.get(number, 0) + 1
-            occurrence = occurrences[number]
-            label = f"Chapter {number}" if number is not None else "Other lessons"
-            runs.append({
+        if number not in groups:
+            groups[number] = {
                 "number": number,
-                "key": f"{number if number is not None else 'other'}:{occurrence}",
-                "label": label + (" (continued)" if occurrence > 1 else ""),
+                "key": f"{number if number is not None else 'other'}:1",
+                "label": f"Chapter {number}" if number is not None else "Other lessons",
                 "lessons": [],
-            })
-        runs[-1]["lessons"].append(lesson)
-    return runs
+            }
+        groups[number]["lessons"].append(lesson)
+    return list(groups.values())

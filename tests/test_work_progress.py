@@ -333,6 +333,8 @@ class DurableProgressTests(unittest.TestCase):
                 db.execute("DROP TABLE build_progress")
                 for table in ("compute_attempts", "compute_tasks", "worker_pairing", "workers"):
                     db.execute("DROP TABLE " + table)
+                db.execute("ALTER TABLE lessons DROP COLUMN chapter_override")
+                db.execute("DROP TABLE reclaimed_sources")
                 db.execute("PRAGMA user_version=2")
             reopened = Catalog(Path(tmp))
             self.assertEqual(reopened.rows("SELECT * FROM build_progress"), [])

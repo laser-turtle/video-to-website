@@ -597,7 +597,7 @@ class RenderTests(unittest.TestCase):
             self.assertIn(keys.replace("&", "&amp;"), html)
 
     def test_every_listed_shortcut_is_actually_handled(self):
-        script = render.SCRIPT
+        script = render.SCRIPT + render.NAVIGATION_SCRIPT
         named = {
             "\u2193": "ArrowDown",
             "\u2191": "ArrowUp",
@@ -609,12 +609,12 @@ class RenderTests(unittest.TestCase):
         for keys, _ in render.SHORTCUTS:
             for key in keys.split(" / "):
                 key = key.split(" (")[0].strip()
+                if key.startswith("Shift+"):
+                    key = key[len("Shift+"):]
                 key = named.get(key, key)
                 # A bare letter occurs all over the script, so look for the
                 # branch that handles it rather than the character itself.
-                self.assertIn(
-                    f"case '{key}':", script, f"{keys} is listed but has no branch"
-                )
+                self.assertTrue(f"case '{key}':" in script or f"event.key === '{key}'" in script, f"{keys} is listed but has no handler")
 
     def test_clip_video_has_no_seek_target_of_its_own(self):
         # Clicking the clip pauses it; the caption button is what seeks.

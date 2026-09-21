@@ -82,11 +82,10 @@ const search = (f, value) => { f.search.value = value; f.search.fire('input'); }
 const key = 'v2w:course:stable-course:navigation';
 
 const f = fixture(); run(f); await flush();
-assert.deepEqual(order(f), ['intro', 'two', 'ten', 'end', 'one'], 'saved sequence survives interleaved chapters');
-assert.deepEqual(groups(f).map(g => g.dataset.chapterKey), ['other:1', '4:1', '10:1', '4:2']);
-assert.equal(groups(f)[3].children[0].children[0].textContent, 'Chapter 4 (continued)');
-assert.equal(groups(f)[1].querySelector('.chapter-meta').textContent, '2 lessons · 3m 00s');
-assert.deepEqual(groups(f).map(g => g.open), [true, false, false, false]);
+assert.deepEqual(order(f), ['intro', 'two', 'ten', 'one', 'end'], 'scattered chapter lessons are collected');
+assert.deepEqual(groups(f).map(g => g.dataset.chapterKey), ['other:1', '4:1', '10:1']);
+assert.equal(groups(f)[1].querySelector('.chapter-meta').textContent, '3 lessons · 3m 30s');
+assert.deepEqual(groups(f).map(g => g.open), [true, false, false]);
 assert.equal(f.controls.hidden, false);
 assert.equal(f.root.dataset.density, 'detailed');
 
@@ -99,7 +98,7 @@ assert.equal(groups(f)[1].hidden, true);
 assert.equal(f.count.textContent, '1 of 5 lessons');
 assert.equal(JSON.parse(state.get(key)).opened['10:1'], undefined, 'search opening is temporary');
 f.clear.click(); await flush();
-assert.deepEqual(groups(f).map(g => g.open), [true, true, false, false], 'clear restores disclosure choices');
+assert.deepEqual(groups(f).map(g => g.open), [true, true, false], 'clear restores disclosure choices');
 assert.equal(f.search.focused, true);
 search(f, 'original.mp4'); assert.deepEqual(visible(f), ['one'], 'renamed source filenames are searchable');
 search(f, 'Chapter 4'); assert.deepEqual(visible(f), ['two', 'ten', 'one']);
@@ -140,7 +139,7 @@ for (const corrupt of ['null', '[]', '"hello"', '{broken', '{"sort":"bogus","den
   state.set(key, corrupt);
   const fresh = fixture(); run(fresh); await flush();
   assert.equal(fresh.sort.value, 'saved'); assert.equal(fresh.density.value, 'detailed');
-  assert.deepEqual(order(fresh), ['intro', 'two', 'ten', 'end', 'one']);
+  assert.deepEqual(order(fresh), ['intro', 'two', 'ten', 'one', 'end']);
 }
 const blocked = fixture();
 run(blocked, {getItem() { throw Error('blocked'); }, setItem() { throw Error('full'); }});

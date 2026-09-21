@@ -17,6 +17,20 @@
   var pollAgain = false;
   var pending = {};
   var errors = {};
+  var providerList = document.getElementById('provider-pauses');
+  var resuming = {}, resumeErrors = {};
+  var settingsDialog = document.getElementById('processing-settings');
+  var settingsForm = document.getElementById('processing-settings-form');
+  var settingsLesson = document.getElementById('processing-settings-lesson');
+  var settingsCurrent = document.getElementById('processing-settings-current');
+  var settingsDefault = document.getElementById('processing-settings-default');
+  var settingsChunk = document.getElementById('processing-settings-chunk');
+  var settingsHint = document.getElementById('processing-settings-hint');
+  var settingsError = document.getElementById('processing-settings-error');
+  var settingsSave = document.getElementById('processing-settings-save');
+  var settingsReload = document.getElementById('processing-settings-reload');
+  var settingsClose = document.getElementById('processing-settings-close');
+  var settingsEditor = null;
   var params = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
   var selectedLesson = params.get('lesson');
   var selectedCourse = params.get('course');
@@ -24,14 +38,14 @@
   var courseName = document.getElementById('queue-course-name');
   var clearCourse = document.getElementById('queue-all-courses');
   if (params.get('q')) search.value = params.get('q');
-  if (['active', 'queued', 'failed', 'cancelled', 'done', 'all'].includes(params.get('state'))) filter.value = params.get('state');
+  if (['active', 'queued', 'blocked', 'failed', 'cancelled', 'done', 'all'].includes(params.get('state'))) filter.value = params.get('state');
   if (selectedLesson) filter.value = 'all';
   var stateLabels = {
-    working: 'Running', queued: 'Waiting', failed: 'Failed',
+    working: 'Running', queued: 'Waiting', blocked: 'Waiting for API credits / billing', failed: 'Failed',
     cancelled: 'Cancelled', done: 'Ready', skipped: 'Skipped'
   };
   var filterLabels = {
-    active: 'Running and waiting', queued: 'Waiting', failed: 'Failed',
+    active: 'Running and waiting', queued: 'Waiting', blocked: 'API credits / billing', failed: 'Failed',
     cancelled: 'Cancelled', done: 'Ready', all: 'All lessons'
   };
 
@@ -44,7 +58,7 @@
 
   function matches(entry, selected) {
     if (selected === 'all') return true;
-    if (selected === 'active') return entry.state === 'working' || entry.state === 'queued';
+    if (selected === 'active') return ['working', 'queued', 'blocked'].includes(entry.state);
     return entry.state === selected;
   }
 
@@ -67,6 +81,147 @@
       delete pending[entry.id];
       errors[entry.id] = err.message;
       render();
+    });
+  }
+
+  function syncSettings() {
+    if (!settingsEditor) return;
+    var editor = settingsEditor, profile = editor.profile;
+    var latest = (data.videos || []).find(function (entry) { return entry.id === editor.entry.id; });
+    var blocked = '';
+    if (!canManage) blocked = 'Processing settings need a connection to the server.';
+    else if (!profile) blocked = 'Loading settings…';
+    else if (!latest) blocked = 'This lesson is no longer available. Close this window and refresh the queue.';
+    else if (Number(latest.updated || 0) >= Number(profile.updated || 0) && latest.build_id !== profile.build_id) {
+      blocked = 'This lesson changed or was retried elsewhere. Reload the latest settings before saving.';
+    } else if (['queued', 'running'].includes(profile.state) ||
+      (latest.build_id === profile.build_id && ['queued', 'working', 'blocked'].includes(latest.state))) {
+      blocked = 'This lesson is queued or processing. Cancel it before changing settings.';
+    }
+    settingsDefault.disabled = !profile || editor.saving || !!blocked;
+    settingsChunk.disabled = settingsDefault.checked || settingsDefault.disabled;
+    settingsSave.disabled = !profile || editor.saving || !!blocked;
+    settingsClose.disabled = !!editor.saving;
+    settingsSave.textContent = editor.saving ? 'Saving…' : profile && profile.state === 'ready' ? 'Save and reprocess' : 'Save and retry';
+    settingsReload.hidden = !editor.error && !blocked;
+    settingsReload.disabled = !canManage || editor.saving || editor.loading || !latest;
+    var errorText = editor.error || (blocked === 'Loading settings…' ? '' : blocked);
+    if (settingsError.textContent !== errorText) settingsError.textContent = errorText;
+    settingsError.hidden = !settingsError.textContent;
+  }
+
+  function loadSettings(editor, keepDraft) {
+    editor.loading = true; editor.error = ''; editor.profile = null;
+    settingsCurrent.textContent = 'Loading settings…'; syncSettings();
+    fetch('api/lessons/' + encodeURIComponent(editor.entry.id) + '/settings', {cache: 'no-store'}).then(function (response) {
+      return response.json().then(function (profile) {
+        if (!response.ok) throw new Error(profile.error || 'Could not load processing settings.');
+        if (!profile.build_id || typeof profile.chunk_minutes !== 'number') throw new Error('Invalid processing settings.');
+        if (settingsEditor !== editor || !settingsDialog.open) return;
+        editor.profile = profile; editor.loading = false;
+        var suggestion = null;
+        if (!keepDraft && /response hit max_tokens/i.test(editor.entry.error || '') && profile.build_id === editor.entry.build_id) {
+          var length = profile.chunk_minutes;
+          if (profile.duration && profile.duration / 60 <= length * 1.25) length = profile.duration / 60;
+          suggestion = Math.max(1, Math.floor(Math.min(10, length / 2) * 10) / 10);
+          if (suggestion >= profile.chunk_minutes) suggestion = null;
+        }
+        if (!keepDraft) {
+          settingsDefault.checked = profile.custom_chunk_minutes === null && suggestion === null;
+          settingsChunk.value = String(suggestion === null ? profile.chunk_minutes : suggestion);
+        }
+        if (settingsDefault.checked) settingsChunk.value = String(profile.default_chunk_minutes);
+        settingsCurrent.textContent = 'Last attempt: ' + profile.chunk_minutes + ' min sections. Server default: ' + profile.default_chunk_minutes + ' min.';
+        settingsHint.textContent = (suggestion !== null ? 'Suggested for this truncated response: ' + suggestion + ' min. ' : '') +
+          'Shorter sections make more model requests, with less output per request. Cached transcription and visual analysis are reused. This saves a setting for this lesson and starts a new attempt.';
+        syncSettings();
+        if (!keepDraft && !settingsChunk.disabled) settingsChunk.focus();
+      });
+    }).catch(function (err) {
+      if (settingsEditor !== editor || !settingsDialog.open) return;
+      editor.loading = false; editor.error = err.message; syncSettings();
+    });
+  }
+
+  function openSettings(entry) {
+    settingsEditor = {entry: entry, profile: null, loading: false, saving: false, error: ''};
+    settingsLesson.textContent = entry.course + ' · ' + (entry.title || entry.source_name);
+    settingsDefault.checked = false; settingsChunk.value = '';
+    settingsHint.textContent = '';
+    settingsDialog.showModal();
+    loadSettings(settingsEditor, false);
+  }
+
+  if (settingsDialog) {
+    settingsDefault.addEventListener('change', function () {
+      if (settingsEditor && settingsEditor.profile && settingsDefault.checked) settingsChunk.value = String(settingsEditor.profile.default_chunk_minutes);
+      syncSettings();
+    });
+    settingsClose.addEventListener('click', function () { if (!settingsEditor || !settingsEditor.saving) settingsDialog.close(); });
+    settingsDialog.addEventListener('cancel', function (event) { if (settingsEditor && settingsEditor.saving) event.preventDefault(); });
+    settingsDialog.addEventListener('close', function () {
+      if (settingsDialog.open) return;
+      var id = settingsEditor && settingsEditor.entry.id;
+      settingsEditor = null;
+      var control = id && document.querySelector('[data-job-id="' + id + '"][data-action="settings"]');
+      if (control) control.focus({preventScroll: true}); else filter.focus({preventScroll: true});
+    });
+    settingsReload.addEventListener('click', function () { if (settingsEditor && !settingsEditor.saving) loadSettings(settingsEditor, true); });
+    settingsForm.addEventListener('submit', function (event) {
+      event.preventDefault(); syncSettings();
+      if (!settingsEditor || settingsSave.disabled) return;
+      var editor = settingsEditor;
+      var minutes = settingsDefault.checked ? null : Number(settingsChunk.value);
+      if (minutes !== null && (!settingsChunk.value.trim() || !Number.isFinite(minutes) || minutes < 1 || minutes > 120)) {
+        editor.error = 'Choose a section length between 1 and 120 minutes.'; syncSettings(); settingsChunk.focus(); return;
+      }
+      editor.saving = true; editor.error = ''; syncSettings();
+      fetch('api/lessons/' + encodeURIComponent(editor.entry.id) + '/settings', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({build_id: editor.profile.build_id, chunk_minutes: minutes})
+      }).then(function (response) {
+        return response.json().then(function (body) { if (!response.ok) throw new Error(body.error || 'Could not save processing settings.'); });
+      }).then(function () {
+        editor.saving = false;
+        if (settingsEditor === editor) settingsDialog.close();
+        poll();
+      }).catch(function (err) {
+        editor.saving = false; editor.error = err.message;
+        if (settingsEditor === editor) syncSettings();
+      });
+    });
+  }
+
+  function renderProviders() {
+    if (!providerList) return;
+    var focused = document.activeElement;
+    var focusProvider = focused && focused.dataset && focused.dataset.provider;
+    providerList.textContent = '';
+    (data.provider_pauses || []).forEach(function (pause) {
+      var section = element('section', 'provider-pause');
+      section.appendChild(element('h2', '', (pause.name || pause.provider) + ' paused'));
+      section.appendChild(element('p', '', pause.message));
+      section.appendChild(element('p', 'library-hint', 'Restore credits or billing access, then resume. Waiting lessons will continue automatically.'));
+      var button = element('button', '', resuming[pause.id] ? 'Resuming…' : 'Resume requests');
+      button.type = 'button'; button.disabled = !canManage || !!resuming[pause.id];
+      button.dataset.provider = pause.provider;
+      button.addEventListener('click', function () {
+        if (!canManage || resuming[pause.id]) return;
+        resuming[pause.id] = true; delete resumeErrors[pause.id]; renderProviders();
+        fetch('api/providers/' + encodeURIComponent(pause.provider) + '/resume', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pause_id: pause.id})
+        }).then(function (response) {
+          return response.json().then(function (body) {
+            if (!response.ok) throw new Error(body.error || 'Could not resume requests. Try again.');
+          });
+        }).then(function () { delete resuming[pause.id]; poll(); }).catch(function (err) {
+          delete resuming[pause.id]; resumeErrors[pause.id] = err.message; renderProviders();
+        });
+      });
+      section.appendChild(button);
+      if (resumeErrors[pause.id]) section.appendChild(element('p', 'job-error', resumeErrors[pause.id]));
+      providerList.appendChild(section);
+      if (focusProvider === pause.provider) button.focus({preventScroll: true});
     });
   }
 
@@ -127,10 +282,12 @@
       fill.style.width = progress.fraction === null ? '30%' : progress.percent + '%';
       bar.appendChild(fill);
       item.appendChild(bar);
+    } else if (entry.state === 'blocked') {
+      item.appendChild(element('p', 'job-detail', entry.blocked ? entry.blocked.message : 'Waiting for provider access. Resume requests after restoring credits or billing.'));
     } else if (entry.state === 'queued') {
       item.appendChild(element('p', 'job-detail', entry.queue_position === 1 ? 'Next in line for an available processor' : 'Waiting for processing capacity'));
     } else if (entry.state === 'cancelled') {
-      item.appendChild(element('p', 'job-detail', 'Processing cancelled. Your source video is still in the library.'));
+      item.appendChild(element('p', 'job-detail', 'Processing cancelled. Your lesson video is retained.'));
     }
     if (entry.error || entry.state === 'failed') {
       item.appendChild(element('p', 'job-error', entry.error || entry.label || 'Processing failed. Retry when the issue is resolved.'));
@@ -143,7 +300,7 @@
 
     var actions = element('div', 'job-actions');
     if (canManage && /^[a-f0-9]{32}$/.test(entry.id || '')) {
-      var action = ['working', 'queued'].indexOf(entry.state) >= 0 ? 'cancel'
+      var action = ['working', 'queued', 'blocked'].indexOf(entry.state) >= 0 ? 'cancel'
         : ['failed', 'cancelled'].indexOf(entry.state) >= 0 ? 'retry' : null;
       if (action) {
         var button = element('button', '', pending[entry.id]
@@ -158,6 +315,13 @@
         controls[entry.id + ':' + action] = button;
         actions.appendChild(button);
       }
+      if (settingsDialog && entry.processing && entry.build_id) {
+        var settings = element('button', '', /response hit max_tokens/i.test(entry.error || '') ? 'Adjust settings & retry' : 'Processing settings');
+        settings.type = 'button'; settings.dataset.jobId = entry.id; settings.dataset.action = 'settings';
+        settings.disabled = !!pending[entry.id];
+        settings.addEventListener('click', function () { openSettings(entry); });
+        controls[entry.id + ':settings'] = settings; actions.appendChild(settings);
+      }
     }
     // Only allow generated relative lesson links, including for old static status.
     if (entry.lesson_href && /^[a-z0-9-]+\/[a-z0-9-]+\.html$/.test(entry.lesson_href)) {
@@ -170,6 +334,8 @@
   }
 
   function render() {
+    renderProviders();
+    syncSettings();
     var allVideos = data.videos || [];
     var position = 0;
     allVideos.forEach(function (entry) {
@@ -191,6 +357,7 @@
       (counts.failed || 0) + ' failed', (counts.done || 0) + ' ready'
     ];
     if (counts.cancelled) parts.push(counts.cancelled + ' cancelled');
+    if (counts.blocked) parts.push(counts.blocked + ' waiting for API access');
     if (summary.textContent !== parts.join(' · ')) summary.textContent = parts.join(' · ');
     Array.prototype.forEach.call(filter.options, function (option) {
       var total = videos.filter(function (entry) { return matches(entry, option.value); }).length;
@@ -203,7 +370,7 @@
       return matches(entry, filter.value) && [entry.title, entry.course, entry.source_name, entry.source_path]
         .join(' ').toLowerCase().includes(query);
     });
-    var ranks = { working: 0, queued: 1, failed: 2, cancelled: 3, done: 4, skipped: 5 };
+    var ranks = { working: 0, blocked: 1, queued: 2, failed: 3, cancelled: 4, done: 5, skipped: 6 };
     shown.sort(function (a, b) {
       var rank = ranks[a.state] - ranks[b.state];
       if (rank) return rank;

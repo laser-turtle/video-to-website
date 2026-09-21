@@ -18,8 +18,9 @@ from dbos import DBOS, SetWorkflowID
 from . import render, whisper
 from .catalog import PIPELINE_VERSION, Catalog
 from .compute import compute_with
-from .distributed import LLM_SLOT, PREPARE_SLOT, ComputeExecutor, acquire
-from .llm import LLMError, make_backend
+from .distributed import LLM_SLOT, PREPARE_SLOT, ComputeExecutor, acquire, check_cancelled
+from .llm import LLMError, ProviderBlocked, make_backend
+from .provider_pause import ProviderPauses
 from .pipeline import BuildOptions, process_video
 from .publication import refresh_site
 from .storage import DEFAULT_BUFFER
@@ -85,12 +86,15 @@ def prepare_source(spec: dict) -> dict:
         options.out / "_sources" / spec["digest"] / ("source" + video.suffix.lower())
     )
     if not snapshot.exists():
+        retained = catalog.rows("SELECT snapshot FROM reclaimed_sources WHERE lesson_id=? AND digest=?",
+                                (spec["lesson_id"], spec["digest"]))
+        source = Path(retained[0]["snapshot"]) if retained else video
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=".incoming-", dir=snapshot.parent)
         os.close(fd)
         temporary = Path(name)
         try:
-            shutil.copy2(video, temporary)
+            shutil.copy2(source, temporary)
             if digest_file(temporary) != spec["digest"]:
                 raise ValueError("source changed while taking its processing snapshot")
             temporary.chmod(0o644)
@@ -121,14 +125,42 @@ def prepare_source(spec: dict) -> dict:
 
 
 class LazyBackend:
-    def __init__(self, name, model, fallbacks):
+    def __init__(self, name, model, fallbacks, *, catalog=None, build_id=None, catalog_path=None):
         self.name, self.model, self.fallbacks = name, model, fallbacks
+        self.pauses = ProviderPauses(catalog) if catalog is not None else None
+        self.build_id = build_id
+        self.catalog_path = catalog_path
 
     def complete(self, system, user):
-        with acquire(LLM_SLOT):
-            return make_backend(self.name, self.model, fallbacks=self.fallbacks).complete(
-                system, user
-            )
+        if self.pauses is None and self.catalog_path is not None:
+            self.pauses = ProviderPauses(Catalog(self.catalog_path))
+        reported = None
+        while True:
+            check_cancelled()
+            pause = self.pauses.get(self.name) if self.pauses else None
+            if pause:
+                if reported != pause["id"]:
+                    self.pauses.mark_waiting(self.build_id, self.name)
+                    report_work("waiting_credits", "Waiting for API credits or billing", estimate=False,
+                                detail=pause["message"])
+                    reported = pause["id"]
+                # No API calls or processor/LLM lock while waiting. The bounded
+                # workflow remains recoverable; cancellation/shutdown is checked.
+                time.sleep(.5)
+                continue
+            with acquire(LLM_SLOT):
+                # Another workflow may have paused the provider while we waited
+                # for the single request slot. Recheck before making any call.
+                if self.pauses and self.pauses.get(self.name):
+                    continue
+                if self.pauses:
+                    self.pauses.clear_waiting(self.build_id)
+                try:
+                    return make_backend(self.name, self.model, fallbacks=self.fallbacks).complete(system, user)
+                except ProviderBlocked as exc:
+                    if not self.pauses:
+                        raise
+                    self.pauses.pause(self.name, exc.reason, str(exc))
 
 
 def publish(spec: dict, lesson: dict, source: dict) -> str:
@@ -174,6 +206,10 @@ def publish(spec: dict, lesson: dict, source: dict) -> str:
                     target = staging / entry["src"]
                     if not target.is_file() or target.stat().st_size == 0:
                         raise ValueError(f"missing generated asset: {entry['src']}")
+            if lesson.get("poster"):
+                target = staging / lesson["poster"]
+                if not target.is_file() or target.stat().st_size == 0:
+                    raise ValueError(f"missing generated poster: {lesson['poster']}")
             revision.parent.mkdir(parents=True, exist_ok=True)
             staging.replace(revision)
         catalog.accept(spec["build_id"], record)
@@ -247,7 +283,8 @@ def lesson_workflow(spec: dict) -> str:
     backend = (
         None
         if source["backend"] == "heuristic"
-        else LazyBackend(source["backend"], source["model"], options.llm_fallbacks)
+        else LazyBackend(source["backend"], source["model"], options.llm_fallbacks,
+                         catalog_path=Path(spec["catalog"]), build_id=spec["build_id"])
     )
     lesson = process_video(
         Path(source["video"]),
@@ -261,7 +298,7 @@ def lesson_workflow(spec: dict) -> str:
         source_name=source["source_name"],
     )
     if lesson is None:
-        raise ValueError("video has no usable audio, transcript, or lesson steps")
+        raise ValueError("video has no usable video stream or duration")
     return stage("publish", lambda: publish(spec, lesson, source))
 
 
@@ -344,6 +381,7 @@ class DurableWorker:
         self.workers.expire()
         if time.monotonic() >= self.next_worker_cleanup:
             self.workers.cleanup()
+            ProviderPauses(self.catalog).prune()
             self.next_worker_cleanup = time.monotonic() + 60
         concurrency = min(4, 1 + len(self.workers.available()))
         if concurrency != self.concurrency:
@@ -355,6 +393,7 @@ class DurableWorker:
                 self.catalog.reconcile(self.library, self.serialized)
                 self.reconciled = state
             self.seen = state
+        waiting_for_provider = ProviderPauses(self.catalog).waiting()
         for build in self.catalog.rows(
             "SELECT * FROM builds WHERE state IN ('queued','running','cancelled','superseded') ORDER BY created,id"
         ):
@@ -368,6 +407,12 @@ class DurableWorker:
                     DBOS.enqueue_workflow(
                         QUEUE, lesson_workflow, json.loads(build["spec"])
                     )
+            elif (status.status == "MAX_RECOVERY_ATTEMPTS_EXCEEDED"
+                  and status.app_version == PIPELINE_VERSION and build["id"] in waiting_for_provider):
+                # An intentional billing wait can span many deployments. Reset
+                # only its crash-recovery allowance, through DBOS's public API,
+                # preserving the ID/history and the existing queue's limits.
+                DBOS.resume_workflow(build["id"], queue_name=QUEUE)
             elif status.status in ("ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED"):
                 detail = build["error"] or str(
                     status.error or "processing failed; retry this lesson"

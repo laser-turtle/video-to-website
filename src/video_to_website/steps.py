@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 import re
+from pathlib import Path
 from typing import Any
 
 from .llm import SYSTEM_PROMPT, LLMError, build_user_prompt, extract_json
+from .llm_cache import read_section, request_key, write_section
 from .util import log, warn
 from .work_progress import report_work, work_group
 
@@ -64,6 +66,8 @@ def extract_lesson(
     scene_times: list[float],
     chunk_minutes: float = 25.0,
     overlap_seconds: float = 45.0,
+    cache_dir: Path | None = None,
+    cache_context: dict | None = None,
 ) -> dict:
     """Ask the backend for a structured lesson, chunking long videos into windows."""
     windows = [window for window in _plan_windows(duration, chunk_minutes, overlap_seconds)
@@ -100,8 +104,16 @@ def extract_lesson(
         with work_group("sections", "Writing lesson instructions", completed=index,
                         total=len(windows), unit="sections",
                         detail=f"Section {index + 1} of {len(windows)}"):
-            report_work("model", "Waiting for the model response")
-            result = _ask(backend, SYSTEM_PROMPT, user)
+            key = request_key(backend, SYSTEM_PROMPT, user, cache_context) if cache_dir is not None else ""
+            result = read_section(cache_dir, key)
+            if result is None:
+                report_work("model", "Waiting for the model response")
+                result = _ask(backend, SYSTEM_PROMPT, user)
+                # Save before moving to the next request, including on a DBOS
+                # replay. These files never alter its existing step history.
+                write_section(cache_dir, key, result)
+            else:
+                report_work("cached_section", "Using saved instructions for this section", estimate=False)
         report_work("sections", "Writing lesson instructions", completed=index + 1,
                     total=len(windows), unit="sections", detail=f"{index + 1} sections completed")
 

@@ -234,6 +234,8 @@
             node tests/test_library_js.mjs src/video_to_website/assets/library.js
             node --check src/video_to_website/assets/course.js
             node tests/test_course_js.mjs src/video_to_website/assets/course.js
+            node --check src/video_to_website/assets/navigation.js
+            node tests/test_navigation_js.mjs src/video_to_website/assets/navigation.js
             node --check src/video_to_website/assets/storage.js
             node tests/test_storage_js.mjs src/video_to_website/assets/storage.js
             node --check src/video_to_website/assets/workers.js

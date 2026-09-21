@@ -8,7 +8,7 @@ import json
 import shutil
 from pathlib import Path
 
-from .chapters import chapter_runs, lesson_chapter, lesson_numbering
+from .chapters import chapter_groups, lesson_chapter, lesson_numbering
 from .util import atomic_write, hms, human_duration, log
 
 PROGRESS_SCRIPT = (Path(__file__).parent / "assets" / "progress.js").read_text(encoding="utf-8")
@@ -17,6 +17,7 @@ STORAGE_SCRIPT = (Path(__file__).parent / "assets" / "storage.js").read_text(enc
 LIBRARY_SCRIPT = STORAGE_SCRIPT + "\n" + (Path(__file__).parent / "assets" / "library.js").read_text(encoding="utf-8")
 WORKERS_SCRIPT = (Path(__file__).parent / "assets" / "workers.js").read_text(encoding="utf-8")
 COURSE_SCRIPT = (Path(__file__).parent / "assets" / "course.js").read_text(encoding="utf-8")
+NAVIGATION_SCRIPT = (Path(__file__).parent / "assets" / "navigation.js").read_text(encoding="utf-8")
 
 STYLE = """\
 :root {
@@ -64,6 +65,7 @@ header.top .meta { font-size: 13px; color: var(--muted); }
 /* The steps are what you read, so they get the full column. The video is
    reference material and lives in a small player you can collapse. */
 .wrap { max-width: 980px; margin: 0 auto; padding: 20px 20px calc(24px + var(--player-h)); }
+#reader-wrap { padding-bottom: calc(24px + var(--player-h) + var(--reading-tail, 0px)); }
 
 .summary {
   background: var(--panel);
@@ -75,6 +77,9 @@ header.top .meta { font-size: 13px; color: var(--muted); }
 .summary p { margin: 0 0 8px; }
 .summary h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 6px; }
 .summary ul { margin: 0; padding-left: 20px; }
+.video-lesson { margin-bottom: 22px; }
+.video-lesson video { display: block; width: 100%; height: auto; max-height: 75vh; background: #000; border-radius: var(--radius); }
+.video-lesson .hint { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
 .progress { font-size: 13px; color: var(--muted); margin-bottom: 14px; }
 .step {
   background: var(--panel);
@@ -505,6 +510,25 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .course-contents > summary { cursor: pointer; color: var(--accent); padding: 0 0 12px; font-size: 14px; }
 .course-contents .course-browser { padding-bottom: 14px; }
 .course-contents .course-groups { max-height: 60vh; overflow-y: auto; overscroll-behavior: contain; padding: 4px; }
+.keyhint[hidden] { display: none; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.lesson-picker { width: min(680px, calc(100vw - 28px)); max-height: 85vh; padding: 20px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 16px 60px #0004; }
+.lesson-picker::backdrop { background: #0007; }
+.lesson-picker[open] { display: flex; flex-direction: column; }
+.lesson-picker > :not(#lesson-picker-results) { flex-shrink: 0; }
+.picker-heading { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.picker-heading h2 { margin: 0; font-size: 18px; }
+.picker-heading button { font: inherit; font-size: 13px; padding: 6px 10px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.lesson-picker label, .picker-count, .picker-hint { font-size: 12.5px; color: var(--muted); }
+.lesson-picker input { width: 100%; margin: 6px 0 0; padding: 10px 12px; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; }
+.lesson-picker :is(input, button, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.picker-count { margin: 10px 0; }
+#lesson-picker-results { max-height: 48vh; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+#lesson-picker-results a { display: grid; gap: 3px; padding: 10px 12px; border: 1px solid transparent; border-radius: 7px; color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
+#lesson-picker-results a:hover, #lesson-picker-results a[aria-selected="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.picker-title { font-size: 14px; font-weight: 600; }
+.picker-meta, .picker-description { font-size: 12.5px; color: var(--muted); }
+.picker-hint { margin: 12px 0 0; }
 @media (max-width: 520px) {
   .course-tools { gap: 8px; }
   .course-tools .course-search-label { flex-basis: 100%; }
@@ -559,6 +583,16 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .managed-chapter { border: 1px solid var(--line); border-radius: 7px; margin-bottom: 12px; }
 .managed-chapter > summary { cursor: pointer; padding: 10px 12px; font-weight: 600; font-size: 14px; }
 .managed-chapter > .managed-lessons { padding: 0 12px; }
+.managed-chapter-tools { padding: 0 12px 8px; }
+.lesson-selection { display: flex; flex-direction: column; align-items: center; gap: 5px; cursor: pointer; }
+.lesson-selection input { width: 17px; height: 17px; accent-color: var(--accent); cursor: pointer; }
+.managed-bulk { display: grid; gap: 8px; padding: 12px; margin-bottom: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; }
+.managed-bulk.has-selection { position: sticky; top: 8px; z-index: 2; border-color: var(--accent); box-shadow: 0 3px 12px #0001; }
+.managed-bulk-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.managed-bulk-form label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); flex: 1 1 140px; min-width: 0; }
+.managed-bulk-form :is(input, select) { width: 100%; min-width: 0; font: inherit; font-size: 14px; padding: 8px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.managed-bulk-form button { font: inherit; font-size: 13px; padding: 8px 10px; color: var(--accent); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.managed-bulk-form button:disabled { opacity: .45; cursor: default; }
 #library-courses[data-density="compact"] .lesson-description { display: none; }
 #library-courses[data-density="compact"] .managed-lesson { padding: 8px 0; }
 #library-courses [hidden] { display: none !important; }
@@ -640,6 +674,20 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 }
 .job-source, .job-detail, .queue-updated { color: var(--muted); }
 .queue-notice { margin-bottom: 12px; }
+.provider-pause { margin: 0 0 16px; padding: 14px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent-soft); }
+.provider-pause h2 { margin: 0 0 6px; font-size: 16px; }
+.provider-pause p { margin: 6px 0; font-size: 13px; overflow-wrap: anywhere; }
+.provider-pause button { margin-top: 8px; font: inherit; font-size: 13px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--accent); background: var(--panel); cursor: pointer; }
+.provider-pause button:disabled { opacity: .5; cursor: default; }
+.processing-settings { width: min(520px, calc(100vw - 28px)); max-height: 85vh; padding: 20px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.processing-settings::backdrop { background: #0007; }
+.processing-settings h2 { margin: 0 0 8px; font-size: 18px; }
+.processing-settings p { font-size: 13px; margin: 10px 0; overflow-wrap: anywhere; }
+.processing-settings label { display: block; font-size: 14px; margin: 12px 0; }
+.processing-settings input[type="number"] { display: block; width: 160px; margin-top: 6px; padding: 8px 10px; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+.processing-settings input[type="checkbox"] { accent-color: var(--accent); }
+.processing-settings [hidden] { display: none; }
+.job.blocked .job-state { color: var(--accent); background: var(--accent-soft); }
 .queue-course { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; font-size: 13px; margin: 0 0 14px; }
 .queue-course[hidden] { display: none; }
 .queue-course button { font: inherit; color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
@@ -690,22 +738,28 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .upload .message.bad { color: #c0392b; }
 .library { margin-top: 20px; }
 .library > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+.library > .hint { font-size: 13px; color: var(--muted); }
+#source-refresh { margin-bottom: 10px; }
 .lib-course { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px; }
 .lib-course > h3 { margin: 0 0 4px; font-size: 15px; }
 .lib-course > .hint { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; }
-.lib-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+.lib-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
 .lib-row .n { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; min-width: 1.6em; text-align: right; flex: none; }
-.lib-row .name { flex: 1; font-size: 14px; word-break: break-word; }
+.lib-row .name { flex: 1 1 220px; min-width: 0; font-size: 14px; word-break: break-word; }
+.lib-row .source-note { display: block; font-size: 12px; color: var(--muted); margin-top: 3px; }
+.lib-confirm { flex: 1 1 100%; font-size: 13px; color: var(--muted); }
+.source-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
 .lib-row .size { font-size: 12.5px; color: var(--muted); flex: none; }
 .lib-row input {
   width: 100%; font: inherit; font-size: 14px; color: inherit;
   background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 5px 8px;
 }
-.lib-row button {
+.lib-course button, #source-refresh {
   font: inherit; font-size: 12.5px; cursor: pointer; flex: none;
   color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px;
 }
 .lib-row button:hover { border-color: var(--accent); }
+.lib-course button:disabled { opacity: .45; cursor: default; }
 .lib-row button.danger { color: #c0392b; }
 .lib-row.busy { opacity: .5; }
 """
@@ -762,7 +816,7 @@ STYLE += """
 SCRIPT = """\
 (function () {
   var player = document.getElementById('player');
-  var video = player ? player.querySelector('video') : null;
+  var video = player ? player.querySelector('video') : document.getElementById('lesson-video');
   var steps = Array.prototype.slice.call(document.querySelectorAll('.step'));
   var clips = Array.prototype.slice.call(document.querySelectorAll('.clip-frame video'));
   var key = 'v2w:' + (document.body.dataset.lesson || 'lesson');
@@ -872,7 +926,7 @@ SCRIPT = """\
   }
 
   var rate = storedRate();
-  var rateReadout = player ? player.querySelector('.rate') : null;
+  var rateReadout = player ? player.querySelector('.rate') : document.querySelector('.video-lesson .rate');
 
   function applyRate() {
     if (video) video.playbackRate = rate;
@@ -972,6 +1026,7 @@ SCRIPT = """\
   var PAGE = 0.85;       // of a window height, leaving some overlap for context
 
   var desired = null;    // where we have asked the page to scroll to
+  var readingTail = 0;
   function currentScroll() {
     return desired === null ? window.scrollY : desired;
   }
@@ -1012,6 +1067,13 @@ SCRIPT = """\
 
   function scrollPage(y) {
     var limit = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    var reader = document.getElementById('reader-wrap');
+    if (reader && y > limit) {
+      // Leave enough room below the last step to align its notes too.
+      readingTail += y - limit;
+      reader.style.setProperty('--reading-tail', readingTail + 'px');
+      limit = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    }
     desired = Math.max(0, Math.min(y, limit));
     animateScroll(desired);
   }
@@ -1083,7 +1145,7 @@ SCRIPT = """\
     var step = steps[cursor];
     if (!step) return;
     var rect = step.getBoundingClientRect();
-    if (rect.bottom >= 0 && rect.top <= window.innerHeight) return;
+    if (rect.bottom > EDGE && rect.top < window.innerHeight - EDGE) return;
     for (var i = 0; i < steps.length; i++) {
       if (steps[i].getBoundingClientRect().bottom > EDGE) {
         setCursor(i, false);
@@ -1098,8 +1160,11 @@ SCRIPT = """\
     var bottom = docTop(step) + step.offsetHeight;
     var y = currentScroll();
     var remaining = bottom - (y + window.innerHeight);
-    if (remaining <= EDGE) return false;
-    scrollPage(y + Math.min(remaining, window.innerHeight * PAGE));
+    var notes = notesPosition(step);
+    var notesAhead = notes !== null && notes > y + EDGE && step.offsetHeight + TOP_INSET > window.innerHeight + EDGE;
+    if (remaining <= EDGE && !notesAhead) return false;
+    var distance = notesAhead ? notes - y : remaining;
+    scrollPage(y + Math.min(distance, window.innerHeight * PAGE));
     return true;
   }
 
@@ -1109,8 +1174,26 @@ SCRIPT = """\
     var y = currentScroll();
     var above = y - (docTop(step) - TOP_INSET);
     if (above <= EDGE) return false;
-    scrollPage(y - Math.min(above, window.innerHeight * PAGE));
+    var notes = notesPosition(step);
+    var distance = notes !== null && notes < y - EDGE ? y - notes : above;
+    scrollPage(y - Math.min(distance, window.innerHeight * PAGE));
     return true;
+  }
+
+  function notesPosition(step) {
+    var notes = step.querySelector('.actions');
+    if (!notes || !(step.querySelector('.clip') || step.querySelector('.shots'))) return null;
+    return docTop(notes) - TOP_INSET;
+  }
+
+  function lastReadingPosition(step) {
+    var top = docTop(step) - TOP_INSET;
+    var last = docTop(step) + step.offsetHeight - window.innerHeight;
+    var notes = notesPosition(step);
+    // The second reading position starts with the instructions, even if that
+    // goes further than merely fitting the last screenshot at the screen bottom.
+    if (last > top + EDGE && notes !== null) last = Math.max(last, notes);
+    return Math.max(top, last);
   }
 
   function goForward() {
@@ -1132,9 +1215,7 @@ SCRIPT = """\
     if (last < 0) return;
     setCursor(last, false);
     var step = steps[last];
-    var top = docTop(step) - TOP_INSET;
-    var lastPage = docTop(step) + step.offsetHeight - window.innerHeight;
-    scrollPage(Math.max(top, lastPage));
+    scrollPage(lastReadingPosition(step));
   }
 
   function goBack() {
@@ -1146,9 +1227,7 @@ SCRIPT = """\
     // page, which is where you were standing when you left it.
     var previous = steps[cursor - 1];
     setCursor(cursor - 1, false);
-    var top = docTop(previous) - TOP_INSET;
-    var lastPage = docTop(previous) + previous.offsetHeight - window.innerHeight;
-    scrollPage(Math.max(top, lastPage));
+    scrollPage(lastReadingPosition(previous));
   }
 
   document.addEventListener('click', function (event) {
@@ -1424,6 +1503,8 @@ SCRIPT = """\
 
   // ---- keyboard -------------------------------------------------------------
   document.addEventListener('keydown', function (event) {
+    var picker = document.getElementById('lesson-picker');
+    if (picker && picker.open) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     var target = event.target || {};
     var tag = target.tagName || '';
@@ -1584,6 +1665,7 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
   }
 
   function size(bytes) {
+    if (!bytes || bytes < 0) { return '0 B'; }
     if (bytes >= 1073741824) { return (bytes / 1073741824).toFixed(1) + ' GB'; }
     if (bytes >= 1048576) { return Math.round(bytes / 1048576) + ' MB'; }
     return Math.max(1, Math.round(bytes / 1024)) + ' KB';
@@ -1591,13 +1673,15 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
 
   var library = document.getElementById('library');
   var libraryList = document.getElementById('library-list');
+  var sourceControls = [], reclaimBusy = false;
 
   function button(text, className, onClick) {
     var el = document.createElement('button');
     el.type = 'button';
     if (className) { el.className = className; }
     el.textContent = text;
-    el.addEventListener('click', onClick);
+    sourceControls.push(el);
+    el.addEventListener('click', function () { if (!reclaimBusy) onClick(); });
     return el;
   }
 
@@ -1619,6 +1703,27 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
     return 'api/library/' + encodeURIComponent(course) + '/' + encodeURIComponent(name);
   }
 
+  function reclaimVideos(videos) {
+    reclaimBusy = true;
+    sourceControls.forEach(function (control) { control.disabled = true; });
+    var total = 0, failures = [];
+    var chain = Promise.resolve();
+    videos.forEach(function (video, index) {
+      chain = chain.then(function () {
+        say('Verifying saved video ' + (index + 1) + ' of ' + videos.length + ': ' + video.name + '…');
+        return api('POST', 'api/lessons/' + encodeURIComponent(video.lesson_id) + '/reclaim', { build_id: video.build_id })
+          .then(function (result) { total += result.removed_bytes || 0; })
+          .catch(function (err) { failures.push(video.name + ': ' + err.message); });
+      });
+    });
+    return chain.then(function () {
+      reclaimBusy = false;
+      say('Removed ' + size(total) + ' of duplicate uploads. Lessons and saved videos are retained.' +
+        (failures.length ? ' ' + failures.join(' ') : ''), !!failures.length);
+      return load(false);
+    });
+  }
+
   function libRow(courseName, video, index) {
     var row = document.createElement('div');
     row.className = 'lib-row';
@@ -1629,12 +1734,21 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
     var name = document.createElement('span');
     name.className = 'name';
     name.textContent = video.name;
+    if (video.source_reclaimed) {
+      var note = document.createElement('small');
+      note.className = 'source-note'; note.textContent = 'Original reclaimed · saved video retained';
+      name.appendChild(note);
+    }
     var bytes = document.createElement('span');
     bytes.className = 'size';
     bytes.textContent = size(video.bytes);
     row.appendChild(number);
     row.appendChild(name);
     row.appendChild(bytes);
+    if (video.href) {
+      var open = document.createElement('a'); open.href = video.href;
+      open.textContent = 'Open lesson'; row.appendChild(open);
+    }
 
     function act(promise) {
       row.className = 'lib-row busy';
@@ -1652,6 +1766,7 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
       name.appendChild(input);
       rename.remove();
       remove.remove();
+      reclaim.remove();
       var save = button('Save', '', function () {
         var wanted = (input.value || '').trim();
         if (!wanted || wanted === video.name) { load(); return; }
@@ -1666,13 +1781,14 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
       });
     });
 
-    // Two steps, because this deletes the source video and there is no undo.
+    // Deleting the lesson and reclaiming its redundant upload are distinct.
     var remove = button('Delete', 'danger', function () {
       rename.remove();
       remove.remove();
+      reclaim.remove();
       var label = document.createElement('span');
-      label.className = 'size';
-      label.textContent = 'Remove source from library?';
+      label.className = 'lib-confirm';
+      label.textContent = video.source_reclaimed ? 'Remove this lesson from the library? Saved media is retained.' : 'Delete the original and remove this lesson from the library?';
       row.appendChild(label);
       row.appendChild(button('Yes, delete', 'danger', function () {
         act(api('DELETE', videoPath(courseName, video.name)));
@@ -1680,12 +1796,27 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
       row.appendChild(button('Cancel', '', load));
     });
 
-    row.appendChild(rename);
-    row.appendChild(remove);
+    var reclaim = button('Reclaim space', '', function () {
+      rename.remove(); remove.remove(); reclaim.remove();
+      var label = document.createElement('span'); label.className = 'lib-confirm';
+      label.textContent = 'Remove the ' + size(video.bytes) + ' uploaded copy? The lesson and saved video stay available, including for reprocessing.';
+      row.appendChild(label);
+      row.appendChild(button('Reclaim original', '', function () { reclaimVideos([video]); }));
+      row.appendChild(button('Cancel', '', load));
+    });
+    reclaim.disabled = !video.reclaimable;
+    reclaim.title = video.reclaim_reason || 'Verify the saved video and remove only the duplicate upload.';
+
+    if (video.file_actions !== false) {
+      if (!video.source_reclaimed) row.appendChild(rename);
+      row.appendChild(remove);
+    }
+    if (video.lesson_id && !video.source_reclaimed) row.appendChild(reclaim);
     return row;
   }
 
   function renderLibrary(courses) {
+    sourceControls = [];
     libraryList.textContent = '';
     var any = false;
     courses.forEach(function (course) {
@@ -1700,6 +1831,20 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
       hint.textContent = 'Original source files. Edit displayed titles and reading order in Library.';
       box.appendChild(heading);
       box.appendChild(hint);
+      var candidates = course.videos.filter(function (video) { return video.reclaimable; });
+      if (candidates.length) {
+        var tools = document.createElement('div'); tools.className = 'source-tools';
+        var total = candidates.reduce(function (bytes, video) { return bytes + video.bytes; }, 0);
+        tools.appendChild(button('Reclaim completed uploads (' + size(total) + ')', '', function () {
+          tools.textContent = '';
+          var label = document.createElement('span'); label.className = 'lib-confirm';
+          label.textContent = 'Verify and remove ' + candidates.length + ' duplicate uploads? All lessons and saved videos stay available.';
+          tools.appendChild(label);
+          tools.appendChild(button('Reclaim ' + candidates.length + ' originals', '', function () { reclaimVideos(candidates); }));
+          tools.appendChild(button('Cancel', '', load));
+        }));
+        box.appendChild(tools);
+      }
       course.videos.forEach(function (video, index) {
         box.appendChild(libRow(course.name, video, index));
       });
@@ -1711,6 +1856,7 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
   // The API is the only part of the site that is not a static file, so it can
   // be missing entirely -- a locally built copy, or a server with uploads off.
   function load(clearMessage) {
+    if (reclaimBusy) return Promise.resolve();
     V2WStorage.refresh(course.value || '');
     return fetch('api/library').then(function (res) {
       if (!res.ok) { throw new Error(res.status); }
@@ -1719,6 +1865,7 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
       var courses = data.courses || [];
       list.textContent = '';
       courses.forEach(function (course) {
+        if (course.name === '.' || course.name.indexOf('/') !== -1) return;
         var option = document.createElement('option');
         option.value = course.name;
         if (course.title) { option.label = course.title; }
@@ -1734,6 +1881,8 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
   }
 
   load();
+  var sourceRefresh = document.getElementById('source-refresh');
+  if (sourceRefresh) sourceRefresh.addEventListener('click', function () { load(); });
 
   function row(file) {
     var li = document.createElement('li');
@@ -1896,9 +2045,24 @@ SHORTCUTS = [
     ("r", "Loop clips, or play them once"),
     ("f", "Larger video, centred"),
     ("v", "Collapse or expand the floating video"),
+    ("Shift+J / Shift+K", "Next / previous lesson"),
+    ("Shift+L / Shift+H", "Next / previous chapter"),
+    ("/", "Find and jump to a lesson"),
     ("Esc", "Close the larger video or this list"),
     ("?", "Show this list"),
 ]
+
+
+def _lesson_picker() -> str:
+    return '''<dialog id="lesson-picker" class="lesson-picker" aria-labelledby="lesson-picker-title">
+  <div class="picker-heading"><h2 id="lesson-picker-title">Jump to a lesson</h2><button type="button" id="lesson-picker-close" aria-label="Close lesson picker">Close <kbd>Esc</kbd></button></div>
+  <label for="lesson-picker-search">Find by title, description, filename, or chapter</label>
+  <input id="lesson-picker-search" type="search" autocomplete="off" spellcheck="false" role="combobox"
+    aria-autocomplete="list" aria-expanded="true" aria-controls="lesson-picker-results" placeholder="Try a few words or letters…">
+  <p id="lesson-picker-count" class="picker-count" role="status" aria-live="polite"></p>
+  <div id="lesson-picker-results" role="listbox" aria-label="Lessons" tabindex="-1"></div>
+  <p class="picker-hint">↑ ↓ to choose · Enter to open · Esc to close. Shortcuts follow chapter reading order.</p>
+</dialog><span id="lesson-navigation-status" class="visually-hidden" role="status" aria-live="polite"></span>'''
 
 
 def _lightbox() -> str:
@@ -1912,10 +2076,14 @@ def _lightbox() -> str:
     )
 
 
-def _shortcut_overlay() -> str:
+def _shortcut_overlay(*, video_only: bool = False) -> str:
+    shortcuts = SHORTCUTS
+    if video_only:
+        allowed = {"Space", "h / l", ", / .", "Home", "Shift+J / Shift+K", "Shift+L / Shift+H", "/", "Esc", "?"}
+        shortcuts = [(keys, "Close this list" if keys == "Esc" else what) for keys, what in SHORTCUTS if keys in allowed]
     rows = "".join(
         f"<dt><kbd>{_esc(keys)}</kbd></dt><dd>{_esc(what)}</dd>"
-        for keys, what in SHORTCUTS
+        for keys, what in shortcuts
     )
     return (
         '<div class="shortcuts" id="shortcuts" hidden>'
@@ -2075,12 +2243,18 @@ def lesson_description(lesson: dict) -> str:
     return description if description != lesson_title(lesson) else ""
 
 
+def lesson_format(lesson: dict) -> str:
+    return f'{len(lesson["steps"])} steps' if lesson["steps"] else 'Video lesson'
+
+
 def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
     lessons = course["lessons"]
     reader = current_slug is not None
-    runs = chapter_runs(lessons)
+    runs = chapter_groups(lessons)
     has_chapters = any(run["number"] is not None for run in runs)
     positions = {lesson["slug"]: index for index, lesson in enumerate(lessons, 1)}
+    reading_positions = {item["slug"]: index for index, item in enumerate(
+        [item for group in runs for item in group["lessons"]], 1)}
 
     def card(lesson: dict) -> str:
         position = positions[lesson["slug"]]
@@ -2101,14 +2275,15 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
         search = " ".join((title, description, source, chapter_label))
         return (
             f'<li data-course-lesson="{_esc(lesson["slug"])}" data-position="{position}" '
+            f'data-reading-position="{reading_positions[lesson["slug"]]}" '
             f'data-title="{_esc(title)}" data-lesson-number="{numbering[1] if numbering else ""}" '
             f'data-chapter="{chapter if chapter is not None else ""}" '
             f'data-duration="{float(lesson["duration"])}" data-search="{_esc(search)}" '
             f'data-current="{str(current).lower()}">'
             f'<a href="{_esc(lesson["slug"])}.html"' + (' aria-current="page"' if current else '') + '>'
-            f'<span class="lesson-number" aria-label="Lesson {position}">{position}</span>{thumb}<div>'
+            f'<span class="lesson-number" aria-label="Lesson {reading_positions[lesson["slug"]]}">{reading_positions[lesson["slug"]]}</span>{thumb}<div>'
             f'<div class="t">{_esc(title)}{current_html}</div>{description_html}{source_html}'
-            f'<div class="s">{len(lesson["steps"])} steps &middot; {human_duration(lesson["duration"])}</div>'
+            f'<div class="s">{lesson_format(lesson)} &middot; {human_duration(lesson["duration"])}</div>'
             '</div></a></li>'
         )
 
@@ -2150,6 +2325,7 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
 
 def render_lesson_page(lesson: dict, course: dict) -> str:
     has_video = bool(lesson.get("video_href"))
+    video_only = not bool(lesson["steps"])
     steps_html = "\n".join(_render_step(step, has_video=has_video) for step in lesson["steps"])
 
     prereq_html = ""
@@ -2158,7 +2334,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
         prereq_html = f"<h2>Before you start</h2><ul>{items}</ul>"
 
     skipped_html = ""
-    if lesson.get("skip"):
+    if lesson.get("skip") and not video_only:
         items = ", ".join(
             f"{hms(entry['start'])}-{hms(entry['end'])}"
             + (f" ({_esc(entry['reason'])})" if entry.get("reason") else "")
@@ -2171,7 +2347,22 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
         body = f"<p>{_esc(lesson['summary'])}</p>" if lesson.get("summary") else ""
         summary_html = f'<section class="summary">{body}{prereq_html}{skipped_html}</section>'
 
-    if has_video:
+    inline_video = ""
+    if video_only:
+        player = ""
+        if has_video:
+            dimensions = _size_attrs({"width": lesson.get("video_width"), "height": lesson.get("video_height")})
+            poster = f' poster="{_esc(lesson["poster"])}"' if lesson.get("poster") else ""
+            inline_video = (
+                '<section class="video-lesson" aria-label="Original lesson video">'
+                f'<video id="lesson-video" controls playsinline preload="metadata" src="{_esc(lesson["video_href"])}"{dimensions}{poster}></video>'
+                '<p class="hint">Watch the original lesson. <kbd>Space</kbd> to play/pause · '
+                '<kbd>h</kbd> / <kbd>l</kbd> to seek · <span class="rate">1x</span> playback speed. '
+                f'<a href="{_esc(lesson["video_href"])}" download="{_esc(lesson.get("source_name", ""))}">Download video</a>.</p></section>'
+            )
+        else:
+            inline_video = '<section class="summary"><p>This video lesson has no written steps. The original video is not included in this export.</p></section>'
+    elif has_video:
         player = (
             '<div class="player-backdrop" id="player-backdrop"></div>'
             '<div class="player" id="player">'
@@ -2202,7 +2393,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
         )
 
     neighbours = []
-    course_lessons = course.get("lessons", [])
+    course_lessons = [item for group in chapter_groups(course.get("lessons", [])) for item in group["lessons"]]
     current = next((i for i, item in enumerate(course_lessons) if item["slug"] == lesson["slug"]), None)
     if current is not None:
         for index, label in ((current - 1, "Previous"), (current + 1, "Next")):
@@ -2224,13 +2415,14 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
   <div class="crumbs"><a href="../index.html">All courses</a> / <a href="index.html">{_esc(course["title"])}</a></div>
   <h1>{_esc(lesson_title(lesson))}</h1>
   {description}
-  <div class="meta">{len(lesson["steps"])} steps &middot; {human_duration(lesson["duration"])} of video &middot; {_esc(lesson["source_name"])}<button class="keyhint" type="button" id="keyhint">? keys</button></div>
+  <div class="meta">{lesson_format(lesson)} &middot; {human_duration(lesson["duration"])} of video &middot; {_esc(lesson["source_name"])}<button class="keyhint" type="button" id="keyhint">? keys</button><button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>/</kbd></button></div>
 </header>
-<div class="wrap">
+<div class="wrap" id="reader-wrap">
   {contents}
   <main>
+    {inline_video}
     {summary_html}
-    <div class="progress"></div>
+    {'<div class="progress"></div>' if not video_only else ''}
     {steps_html}
     {transcript_html}
     {navigation}
@@ -2238,11 +2430,12 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
 </div>
 {player}
 {_lightbox()}
-{_shortcut_overlay()}"""
+{_shortcut_overlay(video_only=video_only)}
+{_lesson_picker()}"""
     return _page(
         lesson_title(lesson), body, depth=1,
         lesson_slug=lesson.get("reading_key") or lesson.get("id") or course["slug"] + ":" + lesson["slug"],
-        scripts=(("app.js", SCRIPT), ("course.js", COURSE_SCRIPT))
+        scripts=(("app.js", SCRIPT), ("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT))
     )
 
 
@@ -2251,10 +2444,10 @@ def render_course_page(course: dict) -> str:
     body = f"""<header class="top">
   <div class="crumbs"><a href="../index.html">All courses</a> / <a href="../library.html?course={_esc(course.get('id') or course['slug'])}">Organize course</a></div>
   <h1>{_esc(course["title"])}</h1>
-  <div class="meta">{len(course["lessons"])} lessons &middot; {human_duration(total)}</div>
+  <div class="meta">{len(course["lessons"])} lessons &middot; {human_duration(total)}<button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>/</kbd></button></div>
 </header>
-<main class="wrap">{_course_browser(course)}</main>"""
-    return _page(course["title"], body, depth=1, scripts=(("course.js", COURSE_SCRIPT),))
+<main class="wrap">{_course_browser(course)}</main>{_lesson_picker()}"""
+    return _page(course["title"], body, depth=1, scripts=(("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT)))
 
 
 def render_root_index(courses: list[dict], *, note: str | None = None) -> str:
@@ -2327,6 +2520,7 @@ def render_queue_page() -> str:
 </header>
 <main class="wrap">
   <section class="building task-queue" aria-label="Processing queue">
+    <div id="provider-pauses"></div>
     <p id="queue-summary" class="queue-summary" role="status" aria-live="polite">Loading the queue…</p>
     <div id="queue-course" class="queue-course" hidden><span id="queue-course-name"></span><button id="queue-all-courses" type="button">Show all courses</button></div>
     <div class="queue-tools">
@@ -2334,6 +2528,7 @@ def render_queue_page() -> str:
         <select id="job-filter">
           <option value="active">Running and waiting</option>
           <option value="queued">Waiting</option>
+          <option value="blocked">API credits / billing</option>
           <option value="failed">Failed</option>
           <option value="cancelled">Cancelled</option>
           <option value="done">Ready</option>
@@ -2350,7 +2545,23 @@ def render_queue_page() -> str:
     <p id="queue-updated" class="queue-updated"></p>
     <noscript>Enable JavaScript to view live processing status and manage the queue.</noscript>
   </section>
-</main>"""
+</main>
+<dialog id="processing-settings" class="processing-settings" aria-labelledby="processing-settings-title">
+  <h2 id="processing-settings-title">Processing settings</h2>
+  <p id="processing-settings-lesson"></p>
+  <form id="processing-settings-form">
+    <p id="processing-settings-current" class="library-hint"></p>
+    <label><input id="processing-settings-default" type="checkbox"> Use the server default</label>
+    <label>Transcript section length (minutes)<input id="processing-settings-chunk" type="number" min="1" max="120" step="any" required></label>
+    <p id="processing-settings-hint" class="library-hint">Shorter sections reduce the chance of a truncated response, but make more model requests. Cached transcription and visual analysis are reused.</p>
+    <p id="processing-settings-error" class="job-error" role="alert" hidden></p>
+    <div class="job-actions">
+      <button id="processing-settings-save" type="submit" disabled>Save and retry</button>
+      <button id="processing-settings-reload" type="button" hidden>Reload latest settings</button>
+      <button id="processing-settings-close" type="button">Cancel</button>
+    </div>
+  </form>
+</dialog>"""
     return _page("Task queue", body, depth=0, scripts=(("queue.js", QUEUE_SCRIPT),))
 
 
@@ -2400,8 +2611,9 @@ def render_upload_page() -> str:
     <p class="message" id="message" hidden></p>
   </div>
   <section class="library" id="library" hidden>
-    <h2>Source files</h2>
-    <p class="hint">Deleting removes the library source. Processing snapshots and previous versions are retained.</p>
+    <h2>Uploaded originals</h2>
+    <p class="hint">Reclaim space removes duplicate uploads after processing finishes. Each saved video is verified first; lessons, playback, and reprocessing stay available. Delete removes the lesson from the library. Saved videos and previous versions are retained.</p>
+    <button type="button" id="source-refresh">Refresh originals</button>
     <div id="library-list"></div>
   </section>
 </div>"""
@@ -2412,6 +2624,9 @@ def render_lesson_markdown(lesson: dict) -> str:
     out = [f"# {lesson_title(lesson)}", ""]
     if lesson_description(lesson):
         out += [lesson_description(lesson), ""]
+    if not lesson["steps"]:
+        out += [f'[Watch the original video](../{lesson["video_href"]})' if lesson.get("video_href")
+                else 'Video lesson; the original video is not included in this export.', ""]
     if lesson.get("summary"):
         out += [lesson["summary"], ""]
     if lesson.get("prerequisites"):
@@ -2445,6 +2660,7 @@ def write_assets(site_dir: Path) -> None:
     atomic_write(assets / "library.js", LIBRARY_SCRIPT)
     atomic_write(assets / "workers.js", WORKERS_SCRIPT)
     atomic_write(assets / "course.js", COURSE_SCRIPT)
+    atomic_write(assets / "navigation.js", NAVIGATION_SCRIPT)
 
 
 def write_placeholder(site_dir: Path, note: str) -> None:
@@ -2553,7 +2769,7 @@ def write_site(
     atomic_write(site_dir / "workers.html", render_workers_page())
     atomic_write(site_dir / "upload.html", render_upload_page())
     exported_courses = [dict(course, lessons=[
-        dict(lesson, numbering=lesson_numbering(lesson)) for lesson in course["lessons"]
+        dict(lesson, numbering=lesson_numbering(lesson), chapter=lesson_chapter(lesson)) for lesson in course["lessons"]
     ]) for course in courses]
     atomic_write(site_dir / "site.json", json.dumps(exported_courses, indent=2))
     log(f"site written to {site_dir}")
