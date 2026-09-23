@@ -100,4 +100,18 @@ const end = fixture('six'); end.press('J', {shiftKey: true}); end.press('L', {sh
 assert.equal(end.navigated.length, 0); assert.ok(end.ids['lesson-navigation-status'].textContent.includes('last chapter'));
 const index = fixture(null); index.press('J', {shiftKey: true}); index.press('/');
 assert.equal(index.navigated.length, 0); assert.equal(index.ids['lesson-picker'].open, true);
+const left = fixture();
+for (const key of ['D', 'E', 'W', 'Q']) left.press(key, {shiftKey: true});
+assert.deepEqual(left.navigated, ['six.html', 'five-a.html', 'six.html', 'four-a.html'], 'left-hand pairs match Vim lesson and chapter navigation');
+for (const key of ['D', 'E', 'W', 'Q']) {
+  left.press(key); // Caps Lock is not Shift.
+  for (const extra of [{target: {tagName: 'INPUT'}}, {repeat: true}, {ctrlKey: true}, {isComposing: true}]) left.press(key, {shiftKey: true, ...extra});
+}
+assert.equal(left.navigated.length, 4);
+left.press('b'); assert.equal(left.ids['lesson-picker'].open, true, 'b opens lesson search');
+left.query('base');
+for (const key of ['d', 'e', 's', 'a', 'b', 'D']) left.press(key, {shiftKey: key === 'D'});
+assert.equal(left.ids['lesson-picker'].open, true, 'typing aliases in search does not activate reader commands');
+assert.equal(left.navigated.length, 4);
+left.press('Enter'); assert.equal(left.navigated.at(-1), 'four-b.html');
 console.log('navigation.js runtime checks passed');

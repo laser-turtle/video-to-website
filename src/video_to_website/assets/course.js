@@ -17,6 +17,7 @@
     var collapse = root.querySelector('[data-course-collapse]');
     var progressFilter = root.querySelector('[data-course-progress]');
     var hideCompleted = root.querySelector('[data-course-hide-completed]');
+    var appliedHideCompleted;
     var manage = root.querySelector('[data-manage-progress]');
     var bulk = root.querySelector('[data-reading-bulk]');
     var selected = new Set(), managing = false, lastChanges = [];
@@ -35,26 +36,31 @@
     });
     var hasChapters = rows.some(function (row) { return row.dataset.chapter !== ''; });
     var reader = root.dataset.context === 'reader';
-    var key = 'v2w:course:' + root.dataset.course + ':navigation';
-    var saved = {};
-    try {
-      var value = JSON.parse(localStorage.getItem(key));
-      if (value && typeof value === 'object' && !Array.isArray(value)) saved = value;
-    } catch (e) {}
-    var opened = saved.opened && typeof saved.opened === 'object' && !Array.isArray(saved.opened) ? saved.opened : {};
+    var scope = 'course:' + root.dataset.course;
+    var appliedView = null, opened = {};
     var groups = [];
     var collator = new Intl.Collator(undefined, {numeric: true, sensitivity: 'base'});
     function choice(value, allowed, fallback) { return allowed.includes(value) ? value : fallback; }
-    sort.value = choice(saved.sort, ['saved', 'number', 'title', 'shortest'], 'saved');
-    view.value = hasChapters ? choice(saved.view, ['chapters', 'flat'], 'chapters') : 'flat';
-    view.disabled = !hasChapters;
-    density.value = choice(saved[reader ? 'readerDensity' : 'density'], ['detailed', 'compact'], reader ? 'compact' : 'detailed');
-    function save() {
-      saved.sort = sort.value;
-      saved.view = view.value;
-      saved[reader ? 'readerDensity' : 'density'] = density.value;
-      saved.opened = opened;
-      try { localStorage.setItem(key, JSON.stringify(saved)); } catch (e) {}
+    function syncView() {
+      var saved = V2WReaderState.view(scope), before = appliedView || {};
+      sort.disabled = density.disabled = !V2WReaderState.canQueue();
+      view.disabled = !hasChapters || !V2WReaderState.canQueue();
+      if (JSON.stringify(saved) === JSON.stringify(appliedView)) return false;
+      appliedView = Object.assign({}, saved);
+      sort.value = choice(saved.sort, ['saved', 'number', 'title', 'shortest'], 'saved');
+      view.value = hasChapters ? choice(saved.view, ['chapters', 'flat'], 'chapters') : 'flat';
+      density.value = choice(saved[reader ? 'readerDensity' : 'density'], ['detailed', 'compact'], reader ? 'compact' : 'detailed');
+      root.dataset.density = density.value;
+      opened = {};
+      Object.keys(saved).forEach(function (key) { if (key.startsWith('opened:')) opened[key.slice(7)] = saved[key]; });
+      groups.forEach(function (group, index) {
+        group.preferredOpen = typeof opened[group.key] === 'boolean' ? opened[group.key] :
+          (reader ? group.rows.some(function (row) { return row.dataset.current === 'true'; }) : index === 0);
+      });
+      return saved.sort !== before.sort || saved.view !== before.view;
+    }
+    function save(values) {
+      if (!V2WReaderState.queueView(scope, values)) { appliedView = null; progress(); }
     }
     function duration(seconds) {
       seconds = Math.max(0, Math.round(seconds));
@@ -80,6 +86,14 @@
       });
     }
     function progress() {
+      var regroup = syncView();
+      var hide = V2WReaderState.preferences().hide_completed === true;
+      if (hide !== appliedHideCompleted) {
+        appliedHideCompleted = hide;
+        progressFilter.value = hide ? 'unfinished' : 'all';
+      }
+      hideCompleted.disabled = progressFilter.disabled = !V2WReaderState.canQueue();
+      if (regroup) { rebuild(); return; }
       rows.forEach(function (row) {
         row.querySelector('[data-lesson-progress]').textContent = V2WReading.label(row.reading);
         row.dataset.progress = V2WReading.stats(row.reading).status;
@@ -132,10 +146,11 @@
       group.details.append(group.list);
       group.details.addEventListener('toggle', function () {
         // Programmatic opening during search must not erase the user's choices.
-        if (!group.details.isConnected || search.value.trim() || progressFilter.value !== 'all' || group.details.open === group.expectedOpen) return;
+        if (!group.details.isConnected || search.value.trim() || group.details.open === group.expectedOpen) return;
         group.expectedOpen = group.details.open;
+        group.preferredOpen = group.details.open;
         opened[group.key] = group.details.open;
-        save();
+        save({['opened:' + group.key]: group.details.open});
       });
       return group;
     }
@@ -156,7 +171,7 @@
         group.details.hidden = !matches.length;
         group.meta.textContent = (filtered ? matches.length + ' of ' : '') + lessonCount(group.rows.length) +
           ' · ' + duration(matches.reduce(function (sum, row) { return sum + Number(row.dataset.duration); }, 0));
-        setOpen(group, filtered ? matches.length > 0 : group.preferredOpen);
+        setOpen(group, terms.length ? matches.length > 0 : group.preferredOpen);
       });
       count.textContent = filtered ? visible + ' of ' + lessonCount(rows.length) : lessonCount(rows.length);
       empty.textContent = rows.length ? 'No lessons match your search or progress filter.' : 'No lessons published yet.';
@@ -201,11 +216,6 @@
           var current = group.rows.some(function (row) { return row.dataset.current === 'true'; });
           group.preferredOpen = reader && current ? true :
             (typeof opened[group.key] === 'boolean' ? opened[group.key] : (!reader && index === 0));
-          // Update the preferred state on native user toggles as well as the
-          // stored value, so clearing a search restores the in-page selection.
-          group.details.addEventListener('toggle', function () {
-            if (!search.value.trim() && progressFilter.value === 'all' && group.details.isConnected) group.preferredOpen = group.details.open;
-          });
           container.append(group.details);
         });
       }
@@ -213,13 +223,26 @@
       progress();
     }
     search.addEventListener('input', filter);
+    function saveProgressFilter() {
+      var requested = progressFilter.value;
+      var hide = requested === 'unfinished';
+      filter();
+      if (hide === (V2WReaderState.preferences().hide_completed === true)) return;
+      if (V2WReaderState.queuePreferences({hide_completed: hide})) {
+        progressFilter.value = requested; filter();
+      } else {
+        progressFilter.value = V2WReaderState.preferences().hide_completed ? 'unfinished' : 'all';
+        filter();
+      }
+    }
     clear.textContent = 'Clear filters';
-    clear.addEventListener('click', function () { search.value = ''; progressFilter.value = 'all'; filter(); search.focus(); });
-    progressFilter.value = 'all';
-    progressFilter.addEventListener('change', filter);
+    clear.addEventListener('click', function () {
+      search.value = ''; progressFilter.value = 'all'; saveProgressFilter(); search.focus();
+    });
+    progressFilter.addEventListener('change', saveProgressFilter);
     hideCompleted.addEventListener('change', function () {
       progressFilter.value = hideCompleted.checked ? 'unfinished' : 'all';
-      filter();
+      saveProgressFilter();
     });
     if (manage) {
       manage.addEventListener('click', function () {
@@ -254,21 +277,22 @@
       });
     }
     [sort, view].forEach(function (control) {
-      control.addEventListener('change', function () { rebuild(); save(); });
+      control.addEventListener('change', function () { save({[control === sort ? 'sort' : 'view']: control.value}); });
     });
-    density.addEventListener('change', function () { root.dataset.density = density.value; save(); });
+    density.addEventListener('change', function () { save({[reader ? 'readerDensity' : 'density']: density.value}); });
     [expand, collapse].forEach(function (button) {
       button.addEventListener('click', function () {
+        var values = {};
         groups.forEach(function (group) {
           if (group.details.hidden) return;
           var value = button === expand;
           setOpen(group, value);
-          if (!search.value.trim() && progressFilter.value === 'all') { group.preferredOpen = value; opened[group.key] = value; }
+          if (!search.value.trim()) { group.preferredOpen = value; values['opened:' + group.key] = value; }
         });
-        save();
+        if (Object.keys(values).length) save(values);
       });
     });
-    root.dataset.density = density.value;
+    syncView();
     rebuild();
     V2WReading.subscribe(progress);
     root.querySelectorAll('[data-course-controls]').forEach(function (node) { node.hidden = false; });

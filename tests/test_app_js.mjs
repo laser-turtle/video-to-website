@@ -65,6 +65,15 @@ function makeElement(tag, attrs = {}) {
       return null;
     },
     querySelector(selector) {
+      if (selector.includes(' ~ ')) {
+        const [before, after] = selector.split(' ~ ').map(part => part.slice(1));
+        let seen = false;
+        for (const child of this.children) {
+          if (seen && child.classes.has(after)) return child;
+          if (child.classes.has(before)) seen = true;
+        }
+        return null;
+      }
       // Enough of a selector engine for what the page script actually asks for:
       // a single class or tag, or a two-part descendant like ".clip-frame video".
       const parts = selector.trim().split(/\s+/);
@@ -272,21 +281,30 @@ assert.equal(timeLabel.textContent, '3.0 / 4.0s', 'the readout follows the scrub
 // 7. The player starts collapsed, opens on a jump, and its header toggles it.
 assert.ok(collapsedAtStart, 'the player should start out of the way');
 assert.ok(!player.classes.has('collapsed'), 'a jump opens a collapsed player');
+mainVideo.play(); clipVideo.play();
+const timeBeforeCollapse = mainVideo.currentTime;
 playerHead.fire('click');
 assert.ok(player.classes.has('collapsed'), 'the header collapses the player');
+assert.equal(mainVideo.paused, true, 'collapsing pauses the lesson video');
+assert.equal(mainVideo.currentTime, timeBeforeCollapse, 'collapsing preserves the playhead');
+assert.equal(clipVideo.paused, false, 'the current step clip is independent of the floating player');
 playerHead.fire('click');
 assert.ok(!player.classes.has('collapsed'), 'and opens it again');
+assert.equal(mainVideo.paused, true, 'reopening does not start playback automatically');
 
 // 8. Focus mode: a bigger centred player, quick to toggle and quick to leave.
 const press = (key, target = {}, extra = {}) =>
   documentListeners.keydown.forEach((fn) => fn({ key, target, preventDefault() {}, ...extra }));
 
+mainVideo.play();
 press('f');
 assert.ok(player.classes.has('focus'), 'f should open the larger view');
 assert.ok(backdrop.classes.has('on'), 'the backdrop comes with it');
 press('f');
 assert.ok(!player.classes.has('focus'), 'f again returns to the corner');
 assert.ok(!backdrop.classes.has('on'), 'and takes the backdrop with it');
+assert.ok(!player.classes.has('collapsed'), 'returning to an originally open player leaves it open');
+assert.equal(mainVideo.paused, false, 'returning to an open player preserves playback');
 
 press('f');
 press('Escape');
@@ -310,17 +328,39 @@ assert.ok(!player.classes.has('focus'), 'f in a text field is just an f');
 // Opening the larger view from collapsed should also uncollapse it.
 playerHead.fire('click');
 assert.ok(player.classes.has('collapsed'), 'collapsed first');
+for (const leave of [() => press('f'), () => press('Escape'), () => backdrop.fire('click'),
+  () => sizeButton.fire('click', {stopPropagation() {}})]) {
+  press('f');
+  player.setFocus(true); // Repeated requests to enlarge must not overwrite the saved state.
+  press('f', {}, {repeat: true});
+  assert.ok(player.classes.has('focus'), 'holding f does not toggle the player repeatedly');
+  mainVideo.play();
+  leave();
+  assert.ok(player.classes.has('collapsed'), 'every exit restores the original collapsed state');
+  assert.ok(!player.classes.has('focus') && !backdrop.classes.has('on'));
+  assert.equal(mainVideo.paused, true, 'returning to collapsed pauses playback');
+}
+player.setFocus(false);
+assert.ok(player.classes.has('collapsed'), 'closing an already closed focus view does not change visibility');
+mainVideo.play();
+assert.equal(mainVideo.paused, true, 'a late play request cannot start hidden playback');
+press(' ');
+assert.ok(!player.classes.has('collapsed'), 'Space reveals the video before playing it');
+assert.equal(mainVideo.paused, false);
+press('v');
 press('f');
 assert.ok(!player.classes.has('collapsed'), 'focus implies open');
 assert.ok(player.classes.has('focus'), 'and focused');
 
-// Visibility has its own shortcut, preserving playback and clearing the
+// Visibility has its own shortcut, pausing playback and clearing the
 // backdrop if the player is collapsed from the larger view.
-const playbackBeforeHide = [mainVideo.paused, mainVideo.currentTime];
+mainVideo.play();
+const playbackBeforeHide = mainVideo.currentTime;
 press('v');
 assert.ok(player.classes.has('collapsed'), 'v collapses the player');
 assert.ok(!player.classes.has('focus') && !backdrop.classes.has('on'), 'no backdrop remains over the lesson');
-assert.deepEqual([mainVideo.paused, mainVideo.currentTime], playbackBeforeHide);
+assert.equal(mainVideo.paused, true);
+assert.equal(mainVideo.currentTime, playbackBeforeHide);
 assert.ok(player.classes.has('collapsed'));
 press('v', { tagName: 'INPUT' });
 assert.ok(player.classes.has('collapsed'), 'typing does not change player visibility');
@@ -346,6 +386,8 @@ press('Enter', { tagName: 'SUMMARY' });
 press('x', { tagName: 'A', closest: selector => selector === '.course-contents' });
 assert.ok(!step.classes.has('done'), 'Enter on navigation links and buttons keeps their native action');
 press('Enter');
+assert.ok(stepTwo.classes.has('current'), 'completion advances synchronously, before any save promise resolves');
+assert.ok(step.classes.has('done'), 'the pending completion is immediately visible');
 await flush();
 assert.ok(step.classes.has('done'), 'Enter marks the step done');
 assert.ok(stepTwo.classes.has('current'), 'and advances to the next');
@@ -356,10 +398,17 @@ assert.ok(stepTwo.classes.has('done'), 'x marks the cursor step done');
 press('x');
 await flush();
 assert.ok(!stepTwo.classes.has('done'), 'and x again undoes it');
+press('s');
+assert.ok(stepTwo.classes.has('done'), 's applies its checkmark synchronously');
+await flush();
+assert.ok(stepTwo.classes.has('done'), 's also completes the current step');
+press('x'); await flush();
+press('s', {}, {repeat: true}); await flush();
+assert.ok(!stepTwo.classes.has('done'), 'holding s cannot complete more steps accidentally');
 
 // 11. g plays the video from the current step.
 scrollByHand(0);
-press('k'); press('k'); press('k');
+press('Home');
 click(shot);   // move the toggle target off the step's own timestamp button
 press('g');
 assert.equal(mainVideo.currentTime, 100, "g plays from the cursor step's start");
@@ -383,7 +432,7 @@ assert.equal(mainVideo.currentTime, 0, 'and never goes below zero');
 step.children.push(frame);
 frame.parentNode = step;
 scrollByHand(0);
-press('k'); press('k'); press('k');
+press('Home');
 const before = clipVideo.paused;
 press('c');
 assert.notEqual(clipVideo.paused, before, "c toggles the cursor step's clip");
@@ -394,11 +443,15 @@ press('?');
 assert.equal(overlay.hidden, false, '? opens it');
 press('Escape');
 assert.equal(overlay.hidden, true, 'Escape closes it');
+press('t'); assert.equal(overlay.hidden, false, 't opens the shortcuts using only the left hand');
+const helpScroll = page.y;
+press('d'); assert.equal(page.y, helpScroll, 'reading shortcuts do not scroll behind help');
+press('a'); assert.equal(overlay.hidden, true, 'a closes the shortcut list');
 
 // 15. A tall step is paged through before navigation moves on, and the top of
 // a step is what gets aligned, since that is where its text is.
 scrollByHand(0);
-press('k'); press('k');
+press('Home');
 assert.ok(step.classes.has('current'), 'back at the first step');
 assert.equal(page.y, 0, 'and at the top of the page');
 
@@ -440,11 +493,42 @@ assert.ok(step.classes.has('current'), 'and the cursor follows');
 press('End');
 assert.ok(stepTwo.classes.has('current'), 'End goes to the last step');
 assert.equal(page.y, 2600, 'landing on its last page');
+press('B'); assert.equal(page.y, 2600, 'Caps Lock alone is not the start shortcut');
+press('B', {}, {shiftKey: true}); assert.equal(page.y, 0, 'Shift+B reaches the lesson beginning');
+assert.ok(step.classes.has('current'));
+press('G'); assert.equal(page.y, 0, 'Caps Lock alone is not the end shortcut');
+press('G', {}, {shiftKey: true}); assert.equal(page.y, 2600, 'Shift+G reaches the lesson end');
+assert.ok(stepTwo.classes.has('current'));
+
+// The lesson introduction is a stop before the first step, without a cursor.
+step.docTop = 450; step.docHeight = 600;
+press('Home'); scrollByHand(434);
+delete clipVideo.dataset.userPaused; clipVideo.play();
+const completionBeforeOverview = saved['v2w:lesson-one'];
+press('k');
+assert.equal(page.y, 0, 'k from the first step returns to the complete top of the page');
+assert.ok(!step.classes.has('current') && !stepTwo.classes.has('current'), 'the introduction has no selected step');
+assert.equal(clipVideo.paused, true, 'leaving the first step pauses its clip');
+press('k'); press('e');
+assert.equal(page.y, 0, 'additional back presses safely stay at the introduction');
+press('s'); press('x'); await flush();
+assert.equal(saved['v2w:lesson-one'], completionBeforeOverview, 'the introduction cannot accidentally change step completion');
+press('d');
+assert.ok(step.classes.has('current'), 'd re-enters the first step from the introduction');
+assert.equal(page.y, 434, 'forward navigation aligns the first step at the top');
+press('e');
+assert.equal(page.y, 0); assert.ok(!step.classes.has('current'), 'e has the same introduction stop as k');
+press('j'); assert.equal(page.y, 434); assert.ok(step.classes.has('current'));
+press('e'); scrollByHand(2384); press('j');
+assert.ok(stepTwo.classes.has('current'), 'manually scrolling away from the introduction still resynchronizes the cursor');
+step.docTop = 0; step.docHeight = 2400;
+press('End');
 
 // Notes below the lead visual should reach the top, even when fitting the
 // step's bottom would produce a much smaller scroll. Back uses that stop too.
 const instructions = makeElement('ul', {classes: ['actions'], docTop: 600, docHeight: 100});
-instructions.parentNode = step; step.children.push(instructions); step.docHeight = 1100;
+const secondaryShots = makeElement('div', {classes: ['shots']});
+instructions.parentNode = step; step.children.push(instructions, secondaryShots); step.docHeight = 1100;
 press('Home'); press('j');
 assert.equal(page.y, 584, 'align the instructions at the 16px top inset, not the screenshot bottom');
 assert.ok(step.classes.has('current'));
@@ -456,12 +540,45 @@ step.docHeight = 2400; instructions.docTop = 1700;
 press('Home'); press('j'); assert.equal(page.y, 680, 'very tall lead visuals still get overlapping pages');
 press('j'); assert.equal(page.y, 1360);
 press('j'); assert.equal(page.y, 1684, 'then the notes align at the top');
-step.children = step.children.filter(child => child !== instructions);
+
+// A short step has the same notes stop, even with all of its content visible.
+step.docHeight = 650; instructions.docTop = 300;
+step.children = step.children.filter(child => child !== secondaryShots);
+press('Home'); press('j');
+assert.ok(stepTwo.classes.has('current'), 'a single visual plus notes needs no extra stop when it fits');
+press('k'); assert.equal(page.y, 0, 'back returns to the top when there is no secondary gallery');
+step.docHeight = 1100;
+press('Home'); press('j'); assert.equal(page.y, 300, 'tall single-visual steps still page through the remaining text');
+step.docHeight = 650;
+step.children.push(secondaryShots);
+press('Home'); press('j');
+assert.equal(page.y, 284, 'short steps still stop with the notes at the top');
+assert.ok(step.classes.has('current'));
+press('e'); assert.equal(page.y, 0, 'e shares k’s backward paging');
+press('d'); assert.equal(page.y, 284, 'd shares j’s secondary-content stop');
+press('j'); assert.ok(stepTwo.classes.has('current'), 'the following j advances to the next step');
+press('k'); assert.equal(page.y, 284, 'backward navigation returns to the short step notes');
+press('k'); assert.equal(page.y, 0);
+scrollByHand(200); press('j'); assert.equal(page.y, 284, 'manual scrolling does not skip the short step notes');
+
+const lastShots = makeElement('div', {classes: ['shots']});
+const lastNotes = makeElement('ul', {classes: ['actions'], docTop: 2680, docHeight: 100});
+stepTwo.children.push(lastNotes, lastShots); stepTwo.docHeight = 500;
+press('j'); assert.equal(page.y, 2384);
+press('j'); assert.equal(page.y, 2664, 'the final short step also has a notes stop');
+press('j'); assert.equal(page.y, 2664, 'j at the final notes stays put');
+press('k'); assert.equal(page.y, 2384);
+press('End'); assert.equal(page.y, 2664, 'End goes to the final notes even in a short step');
+stepTwo.children = stepTwo.children.filter(child => child !== lastShots && child !== lastNotes);
+stepTwo.docHeight = 1000; step.docHeight = 2400;
+step.children = step.children.filter(child => child !== instructions && child !== secondaryShots);
 press('End');
 
 // 19. Playback speed steps through a ladder and is remembered globally.
 assert.equal(mainVideo.playbackRate, 1, 'starts at normal speed');
 assert.equal(clipVideo.playbackRate, 1, 'clips start at normal speed too');
+press('2'); assert.equal(mainVideo.playbackRate, 1.25, '2 speeds up');
+press('1'); assert.equal(mainVideo.playbackRate, 1, '1 slows down');
 press('.');
 assert.equal(mainVideo.playbackRate, 1.25, '. speeds up');
 assert.equal(clipVideo.playbackRate, 1.25, 'and clips follow the same speed');
@@ -481,7 +598,7 @@ assert.equal(mainVideo.playbackRate, 3, 'and at the fastest');
 
 // 20. Enlarging a screenshot is its own action; the picture still seeks.
 scrollByHand(0);
-press('k'); press('k');
+press('Home');
 assert.equal(lightbox.hidden, true, 'no overlay to begin with');
 mainVideo.currentTime = 0;
 click(zoomButton);
@@ -522,7 +639,7 @@ assert.equal(lightbox.hidden, true, 'without opening the overlay');
 
 // 20b. Quick seeking sits on the home row, with the arrows still working.
 scrollByHand(0);
-press('k'); press('k');
+press('Home');
 mainVideo.currentTime = 100;
 press('h');
 assert.equal(mainVideo.currentTime, 90, 'h goes back ten seconds');
@@ -535,10 +652,23 @@ assert.equal(mainVideo.currentTime, 100, 'in both directions');
 mainVideo.currentTime = 4;
 press('h');
 assert.equal(mainVideo.currentTime, 0, 'and never seek before the start');
+press('w'); assert.equal(mainVideo.currentTime, 10, 'w seeks forward without the layer swap');
+press('q'); assert.equal(mainVideo.currentTime, 0, 'q seeks backward');
+for (const extra of [{target: {tagName: 'INPUT'}}, {target: {isContentEditable: true}},
+  {ctrlKey: true}, {metaKey: true}, {altKey: true}, {isComposing: true}]) {
+  const {target = {}, ...modifiers} = extra;
+  press('w', target, modifiers);
+}
+assert.equal(mainVideo.currentTime, 0, 'left-hand aliases respect text input, composition and browser shortcuts');
+press('W', {}, {shiftKey: true});
+assert.equal(mainVideo.currentTime, 0, 'the chapter shortcut does not also seek');
 
 // 20c. A clip nudges in smaller steps, stops at an end, and only comes round
 // to the other side when the key is pressed again there.
 assert.ok(step.classes.has('current'), 'the step with the clip is current');
+clipVideo.currentTime = 1;
+press('4'); assert.equal(clipVideo.currentTime, 3, '4 nudges the clip forward');
+press('3'); assert.equal(clipVideo.currentTime, 1, '3 nudges it back');
 clipVideo.currentTime = 3;   // of a 4s clip, nudging by 2
 clipVideo.paused = false;
 
@@ -571,7 +701,7 @@ assert.equal(clipVideo.paused, true, 'and not restarted behind your back');
 
 // 20d. Looping is a preference with the control as its indicator.
 scrollByHand(0);
-press('k'); press('k');
+press('Home');
 assert.equal(clipVideo.loop, true, 'clips loop to begin with');
 assert.equal(loopButton.textContent, 'loop', 'and the control says so');
 assert.ok(loopButton.classes.has('on'), 'lit up');

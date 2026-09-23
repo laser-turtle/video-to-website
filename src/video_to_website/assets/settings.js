@@ -6,7 +6,10 @@
   var message = form.querySelector('[data-settings-message]');
   var controls = {};
   var dirty = false, revision = 0;
-  Object.keys(V2WReaderState.defaults).forEach(function (key) { controls[key] = form.elements.namedItem(key); });
+  Object.keys(V2WReaderState.defaults).forEach(function (key) {
+    var control = form.elements.namedItem(key);
+    if (control) controls[key] = control;
+  });
   function fill() {
     var values = V2WReaderState.preferences();
     Object.keys(controls).forEach(function (key) {

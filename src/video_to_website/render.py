@@ -521,6 +521,11 @@ ul.cards .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .reading-control [hidden] { display: none; }
 .reading-control [data-reading-message]:empty { display: none; }
 .reading-control [data-reading-message] { margin: 8px 0 0; }
+.reading-saves { position: fixed; z-index: 65; left: 16px; bottom: calc(16px + var(--player-h)); max-width: min(480px, calc(100vw - 32px)); padding: 10px 14px; background: var(--panel); color: var(--muted); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 3px 15px #0002; font-size: 13px; }
+.reading-saves[hidden], .reading-saves [hidden] { display: none; }
+.reading-saves[data-failed="true"] { border-color: var(--accent); color: var(--ink); }
+.reading-saves p { margin: 0; }
+.reading-saves button { font: inherit; padding: 7px 10px; margin: 8px 6px 0 0; color: var(--accent); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
 .reader-settings { padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 .reader-settings h2 { font-size: 18px; margin: 0 0 16px; }
 .reader-settings label { display: flex; align-items: center; gap: 10px; margin: 18px 0; font-size: 15px; }
@@ -885,16 +890,8 @@ SCRIPT = """\
   var clips = Array.prototype.slice.call(document.querySelectorAll('.clip-frame video'));
   var key = 'v2w:' + (document.body.dataset.lesson || 'lesson');
   function noop() {}
-  var preferenceQueue = Promise.resolve(), preferencePending = 0;
   function savePreference(values) {
-    preferencePending++;
-    preferenceQueue = preferenceQueue.then(function () { return V2WReaderState.edit([], values); }).catch(function (e) {
-      var message = document.querySelector('[data-reading-message]');
-      if (message) message.textContent = e.message;
-    }).finally(function () {
-      preferencePending--;
-      if (!preferencePending) applyPreferences();
-    });
+    if (!V2WReaderState.queuePreferences(values)) applyPreferences();
   }
 
   function clock(seconds) {
@@ -930,8 +927,9 @@ SCRIPT = """\
 
     var setCollapsed = function (collapsed) {
       player.classList.toggle('collapsed', collapsed);
+      if (collapsed && video) video.pause();
       if (chevron) chevron.innerHTML = collapsed ? '&#9650;' : '&#9660;';
-      if (head) head.title = (collapsed ? 'Expand' : 'Collapse') + ' video (v)';
+      if (head) head.title = (collapsed ? 'Expand' : 'Collapse and pause') + ' video (v)';
       syncPlayerHeight();
     };
 
@@ -942,10 +940,13 @@ SCRIPT = """\
     V2WReaderState.ready.then(function () { if (!playerTouched) setCollapsed(V2WReaderState.preferences().player_collapsed); });
 
     isFocused = function () { return player.classList.contains('focus'); };
+    var collapsedBeforeFocus = false;
     setFocus = function (on) {
       playerTouched = true;
-      if (on) setCollapsed(false);
+      if (on === isFocused()) return;
+      if (on) collapsedBeforeFocus = player.classList.contains('collapsed');
       player.classList.toggle('focus', on);
+      setCollapsed(on ? false : collapsedBeforeFocus);
       if (backdrop) backdrop.classList.toggle('on', on);
       if (sizeButton) sizeButton.innerHTML = on ? '&#10529;' : '&#10530;';
       if (focusHint) {
@@ -982,6 +983,11 @@ SCRIPT = """\
       });
       video.addEventListener('loadedmetadata', syncPlayerHeight);
     }
+    if (video) video.addEventListener('play', function () {
+      // A delayed play request must not restart a video after it was hidden.
+      if (player.classList.contains('collapsed')) video.pause();
+      else playerTouched = true;
+    });
     window.addEventListener('resize', syncPlayerHeight);
     syncPlayerHeight();
 
@@ -1045,7 +1051,6 @@ SCRIPT = """\
   applyLoop();
   loopButtons.forEach(function (button) { button.addEventListener('click', toggleLoop); });
   function applyPreferences() {
-    if (preferencePending) return;
     var values = V2WReaderState.preferences();
     rate = values.rate; looping = values.loop; clipAutoplay = values.clip_autoplay;
     applyRate(); applyLoop(); syncClipPlayback();
@@ -1218,9 +1223,14 @@ SCRIPT = """\
   // from whatever is actually in front of them instead.
   function resyncCursor() {
     var step = steps[cursor];
-    if (!step) return;
-    var rect = step.getBoundingClientRect();
-    if (rect.bottom > EDGE && rect.top < window.innerHeight - EDGE) return;
+    if (!step) {
+      // Keep the introduction unselected until they advance or scroll back
+      // into the steps by hand. A programmatic trip to the top stays there.
+      if (!steps.length || desired !== null || window.scrollY < docTop(steps[0]) - TOP_INSET - EDGE) return;
+    } else {
+      var rect = step.getBoundingClientRect();
+      if (rect.bottom > EDGE && rect.top < window.innerHeight - EDGE) return;
+    }
     for (var i = 0; i < steps.length; i++) {
       if (steps[i].getBoundingClientRect().bottom > EDGE) {
         setCursor(i, false);
@@ -1236,7 +1246,7 @@ SCRIPT = """\
     var y = currentScroll();
     var remaining = bottom - (y + window.innerHeight);
     var notes = notesPosition(step);
-    var notesAhead = notes !== null && notes > y + EDGE && step.offsetHeight + TOP_INSET > window.innerHeight + EDGE;
+    var notesAhead = notes !== null && notes > y + EDGE;
     if (remaining <= EDGE && !notesAhead) return false;
     var distance = notesAhead ? notes - y : remaining;
     scrollPage(y + Math.min(distance, window.innerHeight * PAGE));
@@ -1257,7 +1267,9 @@ SCRIPT = """\
 
   function notesPosition(step) {
     var notes = step.querySelector('.actions');
-    if (!notes || !(step.querySelector('.clip') || step.querySelector('.shots'))) return null;
+    // Stop between the lead visual and a later gallery, not at the text below
+    // a lone screenshot/clip. Tall steps still page normally to show all text.
+    if (!notes || !step.querySelector('.actions ~ .shots')) return null;
     return docTop(notes) - TOP_INSET;
   }
 
@@ -1265,9 +1277,9 @@ SCRIPT = """\
     var top = docTop(step) - TOP_INSET;
     var last = docTop(step) + step.offsetHeight - window.innerHeight;
     var notes = notesPosition(step);
-    // The second reading position starts with the instructions, even if that
-    // goes further than merely fitting the last screenshot at the screen bottom.
-    if (last > top + EDGE && notes !== null) last = Math.max(last, notes);
+    // Steps with secondary screenshots have a notes stop, even when short.
+    // Back and End must land at the same stop as forward.
+    if (notes !== null) last = Math.max(last, notes);
     return Math.max(top, last);
   }
 
@@ -1297,7 +1309,13 @@ SCRIPT = """\
     following = false;
     resyncCursor();
     if (pageUp()) return;                         // back up within this step
-    if (cursor === 0) return;
+    if (cursor <= 0) {
+      if (steps[cursor]) steps[cursor].classList.remove('current');
+      cursor = -1;
+      syncClipPlayback();
+      scrollPage(0);
+      return;
+    }
     // The exact inverse of going forward: land on the previous step's last
     // page, which is where you were standing when you left it.
     var previous = steps[cursor - 1];
@@ -1444,7 +1462,7 @@ SCRIPT = """\
     steps.forEach(function (step) {
       var box = step.querySelector('input[type=checkbox]');
       var isDone = !!done[step.id];
-      if (box) { box.checked = isDone; box.disabled = !V2WReaderState.writable(); }
+      if (box) { box.checked = isDone; box.disabled = !V2WReaderState.canQueueStep(); }
       step.classList.toggle('done', isDone);
       if (isDone) count++;
     });
@@ -1456,13 +1474,7 @@ SCRIPT = """\
 
   function setDone(index, value) {
     var step = steps[index];
-    if (!step || !V2WReaderState.writable()) return Promise.resolve(false);
-    return V2WReading.setStep(readingLesson, step.id, value).then(function () { return true; }).catch(function (e) {
-      var message = document.querySelector('[data-reading-message]');
-      if (message) message.textContent = e.message;
-      paintDone();
-      return false;
-    });
+    return !!step && V2WReading.queueStep(readingLesson, step.id, value);
   }
 
   steps.forEach(function (step, index) {
@@ -1585,28 +1597,34 @@ SCRIPT = """\
   document.addEventListener('keydown', function (event) {
     var picker = document.getElementById('lesson-picker');
     if (picker && picker.open) return;
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing) return;
     var target = event.target || {};
     var tag = target.tagName || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
     if (target.closest && target.closest('.course-contents')) return;
     var stop = function () { if (event.preventDefault) event.preventDefault(); };
+    if (helpOpen() && !['t', '?', 'a', 'Escape'].includes(event.key)) return;
+    if (zoomOpen() && !['z', 'a', 'Escape'].includes(event.key)) return;
 
     switch (event.key) {
+      case 't':
       case '?':
         stop();
-        setHelp(!helpOpen());
+        if (!event.repeat) setHelp(!helpOpen());
         return;
+      case 'a':
       case 'Escape':
         if (zoomOpen()) { stop(); closeZoom(); }
         else if (helpOpen()) { stop(); setHelp(false); }
         else if (isFocused()) { stop(); setFocus(false); }
         return;
+      case 'd':
       case 'j':
       case 'ArrowDown':
         stop();
         goForward();
         return;
+      case 'e':
       case 'k':
       case 'ArrowUp':
         stop();
@@ -1616,27 +1634,34 @@ SCRIPT = """\
         stop();
         goToStart();
         return;
+      case 'B':
+        if (event.shiftKey) { stop(); goToStart(); }
+        return;
       case 'End':
         stop();
         goToEnd();
         return;
+      case 'G':
+        if (event.shiftKey) { stop(); goToEnd(); }
+        return;
+      case '1':
       case ',':
       case '<':
         stop();
         nudgeRate(-1);
         return;
+      case '2':
       case '.':
       case '>':
         stop();
         nudgeRate(1);
         return;
+      case 's':
       case 'Enter':
-        if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY') return;
+        if (event.key === 'Enter' && (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY')) return;
         stop();
-        var completedCursor = cursor;
-        setDone(cursor, true).then(function (saved) {
-          if (saved && cursor === completedCursor) { following = false; setCursor(cursor + 1, true); }
-        });
+        if (event.repeat) return;
+        if (setDone(cursor, true)) { following = false; setCursor(cursor + 1, true); }
         return;
       case 'x':
         stop();
@@ -1666,7 +1691,7 @@ SCRIPT = """\
       case 'f':
       case 'F':
         stop();
-        setFocus(!isFocused());
+        if (!event.repeat) setFocus(!isFocused());
         return;
       case 'v':
       case 'V':
@@ -1679,28 +1704,33 @@ SCRIPT = """\
         if (!video) return;
         stop();
         if (video.paused) {
+          expandPlayer();
           var playing = video.play();
           if (playing && playing.catch) playing.catch(noop);
         } else {
           video.pause();
         }
         return;
+      case 'q':
       case 'h':
       case 'ArrowLeft':
         if (!video) return;
         stop();
         video.currentTime = Math.max(0, video.currentTime - SEEK_STEP);
         return;
+      case 'w':
       case 'l':
       case 'ArrowRight':
         if (!video) return;
         stop();
         video.currentTime = video.currentTime + SEEK_STEP;
         return;
+      case '3':
       case '[':
         stop();
         nudgeClip(-CLIP_SEEK_STEP);
         return;
+      case '4':
       case ']':
         stop();
         nudgeClip(CLIP_SEEK_STEP);
@@ -2110,27 +2140,32 @@ UPLOAD_SCRIPT = STORAGE_SCRIPT + "\n" + """\
 
 
 SHORTCUTS = [
-    ("j / \u2193", "Further down this step, then the next one"),
-    ("k / \u2191", "Back up this step, then the previous one"),
-    ("Home", "Top of the lesson, with the summary"),
-    ("End", "End of the lesson"),
-    ("Enter", "Mark the step done and move on"),
+    ("d / j / \u2193", "Further down this step, then the next one"),
+    ("e / k / \u2191", "Back up this step, then the previous one or lesson introduction"),
+    ("Shift+B / Home", "Top of the lesson, with the summary"),
+    ("Shift+G / End", "End of the lesson"),
+    ("s / Enter", "Mark the step done and move on"),
     ("x", "Mark the step done or not done"),
     ("g", "Play the video from this step"),
     ("Space", "Play or pause the video"),
-    ("h / l", "Back or forward ten seconds (or \u2190 / \u2192)"),
-    ("[ / ]", "Nudge this step's clip back or forward"),
-    (", / .", "Slower or faster, remembered across lessons"),
+    ("q / h / \u2190", "Video back ten seconds"),
+    ("w / l / \u2192", "Video forward ten seconds"),
+    ("3 / [", "Nudge this step's clip back two seconds"),
+    ("4 / ]", "Nudge this step's clip forward two seconds"),
+    ("1 / ,", "Slower playback"),
+    ("2 / .", "Faster playback"),
     ("c", "Play or pause this step's clip"),
     ("z", "Enlarge this step's screenshot"),
     ("r", "Loop clips, or play them once"),
     ("f", "Larger video, centred"),
-    ("v", "Collapse or expand the floating video"),
-    ("Shift+J / Shift+K", "Next / previous lesson"),
-    ("Shift+L / Shift+H", "Next / previous chapter"),
-    ("/", "Find and jump to a lesson"),
-    ("Esc", "Close the larger video or this list"),
-    ("?", "Show this list"),
+    ("v", "Collapse and pause, or expand the floating video"),
+    ("Shift+D / Shift+J", "Next lesson"),
+    ("Shift+E / Shift+K", "Previous lesson"),
+    ("Shift+W / Shift+L", "Next chapter"),
+    ("Shift+Q / Shift+H", "Previous chapter"),
+    ("b / /", "Find and jump to a lesson"),
+    ("a / Esc", "Close the larger video, screenshot, or this list"),
+    ("t / ?", "Show this list"),
 ]
 
 
@@ -2152,7 +2187,7 @@ def _lightbox() -> str:
         '<img alt="">'
         '<div class="lightbox-bar">'
         '<button class="lb-play" type="button">play from <span class="lb-at">0:00</span></button>'
-        "<span>click the picture or press Esc to close</span>"
+        "<span>click the picture or press A / Esc to close</span>"
         "</div></div>"
     )
 
@@ -2160,8 +2195,10 @@ def _lightbox() -> str:
 def _shortcut_overlay(*, video_only: bool = False) -> str:
     shortcuts = SHORTCUTS
     if video_only:
-        allowed = {"Space", "h / l", ", / .", "Home", "Shift+J / Shift+K", "Shift+L / Shift+H", "/", "Esc", "?"}
-        shortcuts = [(keys, "Close this list" if keys == "Esc" else what) for keys, what in SHORTCUTS if keys in allowed]
+        allowed = {"Space", "q / h / \u2190", "w / l / \u2192", "1 / ,", "2 / .", "Shift+B / Home",
+                   "Shift+D / Shift+J", "Shift+E / Shift+K", "Shift+W / Shift+L", "Shift+Q / Shift+H",
+                   "b / /", "a / Esc", "t / ?"}
+        shortcuts = [(keys, "Close this list" if keys == "a / Esc" else what) for keys, what in SHORTCUTS if keys in allowed]
     rows = "".join(
         f"<dt><kbd>{_esc(keys)}</kbd></dt><dd>{_esc(what)}</dd>"
         for keys, what in shortcuts
@@ -2169,8 +2206,9 @@ def _shortcut_overlay(*, video_only: bool = False) -> str:
     return (
         '<div class="shortcuts" id="shortcuts" hidden>'
         "<h2>Keyboard</h2>"
+        '<p class="close">Left-hand keys are listed first. Vim and arrow-key alternatives still work.</p>'
         f"<dl>{rows}</dl>"
-        '<p class="close">Press <kbd>?</kbd> or <kbd>Esc</kbd> to close.</p>'
+        '<p class="close">Press <kbd>T</kbd>, <kbd>?</kbd>, <kbd>A</kbd> or <kbd>Esc</kbd> to close.</p>'
         "</div>"
     )
 
@@ -2228,6 +2266,7 @@ def _page(
 </head>
 <body{body_attrs}>
 {body}
+{_reading_saves() if any(name == 'reading.js' for name, _ in scripts) else ''}
 <footer class="site"><a href="{up}settings.html">Settings</a> &middot; Built with video-to-website</footer>
 </body>
 </html>
@@ -2422,11 +2461,11 @@ def _course_browser(course: dict, *, current_slug: str | None = None) -> str:
     <label>Rows<select data-course-density><option value="detailed">Detailed</option><option value="compact">Compact</option></select></label>
     <label>Progress<select data-course-progress><option value="all">All lessons</option><option value="not-started">Not started</option><option value="in-progress">In progress</option><option value="complete">Complete</option><option value="unfinished">Unfinished</option></select></label>
   </div>
-  <p class="course-tools-note" data-course-controls hidden>View settings stay in this browser. <a href="../library.html?course={course_id}">Edit reading order in Library</a>.</p>
+  <p class="course-tools-note" data-course-controls hidden>View preferences save automatically and sync across devices. <a href="../library.html?course={course_id}">Edit reading order in Library</a>.</p>
   <div class="course-actions" data-course-controls hidden>
     <span class="course-results" role="status" aria-live="polite"></span>
     <button type="button" data-course-clear hidden>Clear search</button>
-    <label class="course-hide-completed"><input type="checkbox" data-course-hide-completed>Hide completed</label>
+    <label class="course-hide-completed" title="Saved for all courses and devices"><input type="checkbox" data-course-hide-completed>Hide completed</label>
     <button type="button" data-course-expand>Expand all</button>
     <button type="button" data-course-collapse>Collapse all</button>
     {'' if reader else '<button type="button" data-manage-progress aria-expanded="false">Manage progress</button>'}
@@ -2471,7 +2510,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
                 '<section class="video-lesson" aria-label="Original lesson video">'
                 f'<video id="lesson-video" controls playsinline preload="metadata" src="{_esc(lesson["video_href"])}"{dimensions}{poster}></video>'
                 '<p class="hint">Watch the original lesson. <kbd>Space</kbd> to play/pause · '
-                '<kbd>h</kbd> / <kbd>l</kbd> to seek · <span class="rate">1x</span> playback speed. '
+                '<kbd>q</kbd> / <kbd>w</kbd> to seek · <span class="rate">1x</span> playback speed. '
                 f'<a href="{_esc(lesson["video_href"])}" download="{_esc(lesson.get("source_name", ""))}">Download video</a>.</p></section>'
             )
         else:
@@ -2538,7 +2577,7 @@ def render_lesson_page(lesson: dict, course: dict) -> str:
   <div class="crumbs"><a href="../index.html">All courses</a> / <a href="index.html">{_esc(course["title"])}</a></div>
   <h1>{_esc(lesson_title(lesson))}</h1>
   {description}
-  <div class="meta">{lesson_format(lesson)} &middot; {human_duration(lesson["duration"])} of video &middot; {_esc(lesson["source_name"])}<button class="keyhint" type="button" id="keyhint">? keys</button><button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>/</kbd></button></div>
+  <div class="meta">{lesson_format(lesson)} &middot; {human_duration(lesson["duration"])} of video &middot; {_esc(lesson["source_name"])}<button class="keyhint" type="button" id="keyhint">T / ? keys</button><button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>B</kbd></button></div>
 </header>
 <div class="wrap" id="reader-wrap">
   {contents}
@@ -2567,7 +2606,7 @@ def render_course_page(course: dict) -> str:
     body = f"""<header class="top">
   <div class="crumbs"><a href="../index.html">All courses</a> / <a href="../library.html?course={_esc(course.get('id') or course['slug'])}">Organize course</a></div>
   <h1>{_esc(course["title"])}</h1>
-  <div class="meta">{len(course["lessons"])} lessons &middot; {human_duration(total)}<button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>/</kbd></button></div>
+  <div class="meta">{len(course["lessons"])} lessons &middot; {human_duration(total)}<button class="keyhint" type="button" id="lesson-picker-open" hidden>Jump to lesson <kbd>B</kbd></button></div>
 </header>
 <main class="wrap">{_course_browser(course)}</main>{_lesson_picker()}"""
     return _page(course["title"], body, depth=1, scripts=(("reading.js", READING_SCRIPT), ("course.js", COURSE_SCRIPT), ("navigation.js", NAVIGATION_SCRIPT)))
@@ -2617,6 +2656,9 @@ def render_settings_page() -> str:
     <label><input type="checkbox" name="clip_autoplay">Automatically play the current step’s clip</label>
     <label><input type="checkbox" name="player_collapsed">Start the floating video collapsed</label>
     <p class="settings-help">Speed and looping changes made inside a lesson are saved here too. Clip autoplay still respects clips you pause yourself. The floating-video setting applies when you open a lesson.</p>
+    <h2>Course browsing</h2>
+    <label><input type="checkbox" name="hide_completed">Hide completed lessons</label>
+    <p class="settings-help">Applies to every course and device. The course overview’s Hide completed checkbox updates this same setting.</p>
     <button type="submit" data-settings-save disabled>Save settings</button>
     <button type="button" data-settings-reset disabled>Restore defaults</button>
     <p data-settings-message role="status" aria-live="polite"></p>
@@ -2624,11 +2666,20 @@ def render_settings_page() -> str:
   <section class="summary"><h2>Reading progress &amp; sync</h2>
     <p>The server keeps one shared reader profile. Completion and playback preferences follow you across browsers and devices. Existing browser checkmarks are imported only when the server has no saved progress for that lesson.</p>
     <p>Open a course and choose <strong>Manage progress</strong> to complete or reset lessons and whole chapters. Overall progress averages the completion of each lesson, including partially completed lessons.</p>
-    <p>Search, chapter disclosures, and layout choices stay on each device. Static exports save progress and playback preferences in their browser.</p>
+    <p>Course sorting, grouping, row density, and chapter expansion sync across devices, as do Library layout and expansion choices. Change them on the course or Library page; they save automatically. Reader and course-overview row density are remembered separately.</p>
+    <p>Search text, current reading position, and temporary selections are not saved. Static exports without the API keep preferences in their browser.</p>
     <button type="button" id="reading-reconnect">Refresh sync</button>
   </section>
 </main>'''
     return _page("Settings", body, depth=0, scripts=(("reading.js", READING_SCRIPT), ("settings.js", SETTINGS_SCRIPT)))
+
+
+def _reading_saves() -> str:
+    return '''<aside class="reading-saves" data-reading-saves aria-label="Saving changes" hidden>
+  <p data-reading-save-status role="status" aria-live="polite"></p>
+  <button type="button" data-reading-retry hidden>Retry saving</button>
+  <button type="button" data-reading-discard hidden>Discard unsaved changes</button>
+</aside>'''
 
 
 def _storage_panel() -> str:
@@ -2648,6 +2699,7 @@ def render_library_page() -> str:
 </header>
 <main class="wrap">
   {_storage_panel()}
+  <p class="reading-note" data-reading-sync></p>
   <div class="library-toolbar">
     <label for="library-search">Find a course or lesson<input id="library-search" type="search" placeholder="Title, filename, description, or chapter" autocomplete="off"></label>
     <label class="library-view-choice">Group lessons<select id="library-group"><option value="chapters">Chapters</option><option value="flat">All lessons</option></select></label>
@@ -2662,7 +2714,7 @@ def render_library_page() -> str:
   <p id="library-empty" hidden></p>
   <noscript>Enable JavaScript to organize your library.</noscript>
 </main>"""
-    return _page("Library", body, depth=0, scripts=(("library.js", LIBRARY_SCRIPT),))
+    return _page("Library", body, depth=0, scripts=(("reading.js", READING_SCRIPT), ("library.js", LIBRARY_SCRIPT)))
 
 
 def render_queue_page() -> str:

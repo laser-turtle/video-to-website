@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 
 const source = readFileSync(process.argv[2], 'utf8');
+const readerSource = readFileSync('src/video_to_website/assets/reader-state.js', 'utf8');
 function element(tag) {
   return {tagName: tag, children: [], dataset: {}, listeners: {}, attributes: {}, hidden: false,
     value: '', disabled: false, _text: '',
@@ -19,7 +20,7 @@ function element(tag) {
 const ids = {};
 for (const id of ['library-courses', 'library-search', 'library-message', 'library-count', 'library-refresh', 'library-reset', 'library-empty', 'library-group', 'library-density', 'library-sort-courses']) ids[id] = element('div');
 Object.values(ids).forEach(node => { node.connected = true; });
-const document = {activeElement: null, getElementById: id => ids[id], createElement: element};
+const document = {activeElement: null, body: {dataset: {}}, addEventListener() {}, getElementById: id => ids[id], createElement: element};
 let data = {revision: '1', courses: [
   {id: 'a', title: 'Blender', source_path: 'Blender', href: 'blender/index.html', videos: [
     {id: 'a1', title: '4.02 - Shape', source_title: '4.02 - Shape', source_name: '4.02 - Shape.mp4', description: 'Build the base form', numbering: [4, 2], duration: 120, state: 'ready', href: 'blender/shape.html'},
@@ -81,8 +82,8 @@ function input() { const form = nodes().find(n => n.className === 'library-edit'
 function titleOrder() { return nodes().filter(n => n.tagName === 'h3').map(n => n.textContent); }
 const state = new Map();
 const storage = {getItem: key => state.get(key) || null, setItem: (key, value) => state.set(key, value)};
-const start = () => new Function('document', 'fetch', 'location', 'localStorage', source)(document, fetch, {search: '?course=a'}, storage);
-start();
+const start = () => new Function('document', 'fetch', 'location', 'localStorage', 'window', readerSource + '\n' + source + '\nreturn V2WReaderState;')(document, fetch, {search: '?course=a'}, storage, {addEventListener() {}});
+const readerState = start();
 await flush();
 assert.equal(ids['library-courses'].children.length, 2);
 assert.equal(ids['library-count'].textContent, '2 courses · 3 lessons');
@@ -182,12 +183,12 @@ assert.equal(requests.length, before, 'view preferences never submit a reorder')
 assert.equal(nodes().filter(n => n.className === 'managed-chapter').length, 0);
 assert.deepEqual(titleOrder(), readingOrder);
 assert.equal(ids['library-courses'].dataset.density, 'compact');
-assert.equal(JSON.parse(state.get('v2w:library:view')).density, 'compact');
+assert.equal(readerState.view('library').density, 'compact');
 ids['library-group'].value = 'chapters'; ids['library-group'].fire('change');
 control('course-a-expand').click();
 let chapter = nodes().find(n => n.className === 'managed-chapter');
 chapter.open = false; chapter.fire('toggle');
-assert.equal(JSON.parse(state.get('v2w:library:view')).chapters['a|4:1'], false);
+assert.equal(readerState.view('library')['chapter:a|4:1'], false);
 control('lesson-a1-rename').click();
 assert.equal(nodes().find(n => n.className === 'managed-chapter').open, true, 'editing reveals the lesson');
 assert.equal(control('course-a-sort-apply').disabled, true, 'sorting cannot discard an unsaved title');

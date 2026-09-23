@@ -337,7 +337,7 @@ class DurableProgressTests(unittest.TestCase):
                 db.execute("DROP TABLE reclaimed_sources")
                 db.execute("PRAGMA user_version=2")
                 db.execute("DROP TABLE reading_state")
-                db.execute("DROP TABLE reader_preferences")
+                db.execute("DROP TABLE reader_preferences"); db.execute("DROP TABLE reader_views")
             reopened = Catalog(Path(tmp))
             self.assertEqual(reopened.rows("SELECT * FROM build_progress"), [])
 

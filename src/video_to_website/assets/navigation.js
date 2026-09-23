@@ -127,12 +127,16 @@
     if ((target !== search && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) || target.isContentEditable || event.repeat) return;
     var help = document.getElementById('shortcuts'), lightbox = document.getElementById('lightbox');
     if ((help && !help.hidden) || (lightbox && !lightbox.hidden)) return;
-    if (event.key === '/') { event.preventDefault(); open(); return; }
+    if (event.key === 'b' || event.key === '/') { event.preventDefault(); open(); return; }
     if (!event.shiftKey || current < 0) return;
     switch (event.key) {
+      case 'D':
       case 'J': event.preventDefault(); go(lessons[current + 1], 'You are at the last lesson.'); return;
+      case 'E':
       case 'K': event.preventDefault(); go(lessons[current - 1], 'You are at the first lesson.'); return;
+      case 'W':
       case 'L': event.preventDefault(); go(chapters[currentChapter + 1], 'You are at the last chapter.'); return;
+      case 'Q':
       case 'H': event.preventDefault(); go(chapters[currentChapter - 1], 'You are at the first chapter.'); return;
     }
   });

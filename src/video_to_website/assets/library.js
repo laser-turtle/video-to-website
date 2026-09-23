@@ -16,22 +16,13 @@
   var editable = false;
   var busy = false;
   var editor = null;
-  var preferences = {};
-  try {
-    var stored = JSON.parse(localStorage.getItem('v2w:library:view'));
-    if (stored && typeof stored === 'object' && !Array.isArray(stored)) preferences = stored;
-  } catch (e) {}
-  function object(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
-  var expanded = object(preferences.expanded);
-  var chapterOpen = object(preferences.chapters);
+  var expanded = {}, chapterOpen = {}, lastView = null;
   var sortMethods = {};
   var selections = {}, bulkModes = {}, bulkTargets = {}, newChapters = {};
-  grouping.value = preferences.grouping === 'flat' ? 'flat' : 'chapters';
-  density.value = preferences.density === 'compact' ? 'compact' : 'detailed';
   var controls = [];
   var focusTargets = {};
   var selectedCourse = new URLSearchParams(location.search).get('course');
-  if (selectedCourse) expanded[selectedCourse] = true;
+  var revealCourse = selectedCourse;
   var labels = { ready: 'Ready', running: 'Processing', queued: 'Waiting', blocked: 'Waiting for API credits / billing', failed: 'Failed', cancelled: 'Cancelled', superseded: 'Waiting' };
   var sorts = [
     ['heuristic', 'Name (smart numbering)', 'Sort chapter and lesson prefixes numerically, then remaining names. Renamed lessons can use their original filename numbering.'],
@@ -41,10 +32,21 @@
     ['longest', 'Longest first', 'Sort by video duration. Lessons whose duration is still unknown go last.']
   ];
 
-  function remember() {
-    try { localStorage.setItem('v2w:library:view', JSON.stringify({
-      grouping: grouping.value, density: density.value, expanded: expanded, chapters: chapterOpen
-    })); } catch (e) {}
+  function syncView() {
+    var preferences = V2WReaderState.view('library');
+    if (lastView === JSON.stringify(preferences)) return false;
+    lastView = JSON.stringify(preferences);
+    grouping.value = preferences.grouping === 'flat' ? 'flat' : 'chapters';
+    density.value = preferences.density === 'compact' ? 'compact' : 'detailed';
+    expanded = {}; chapterOpen = {};
+    Object.keys(preferences).forEach(function (key) {
+      if (key.startsWith('expanded:')) expanded[key.slice(9)] = preferences[key];
+      if (key.startsWith('chapter:')) chapterOpen[key.slice(8)] = preferences[key];
+    });
+    return true;
+  }
+  function remember(values) {
+    if (!V2WReaderState.queueView('library', values)) { lastView = null; render(); }
   }
   function chapter(video) { return 'chapter' in video ? video.chapter : (Array.isArray(video.numbering) ? video.numbering[0] : null); }
   function chapterGroups(videos) {
@@ -81,7 +83,7 @@
     refresh.disabled = value;
     reset.disabled = value || !editable || !!search.value.trim() || !catalog.courses.length;
     sortCourses.disabled = value || !editable || !!search.value.trim() || !!editor || catalog.courses.length < 2;
-    grouping.disabled = density.disabled = value || !!editor;
+    grouping.disabled = density.disabled = value || !!editor || !V2WReaderState.canQueue();
     controls.forEach(function (button) { button.disabled = value || !!button.unavailable; });
   }
   function button(text, key, callback, unavailable) {
@@ -338,6 +340,7 @@
     return row;
   }
   function render(focusKey) {
+    if (!editor) syncView();
     var focused = document.activeElement;
     focusKey = focusKey || (focused && focused.dataset ? focused.dataset.focusKey : null);
     controls = []; focusTargets = {};
@@ -356,12 +359,14 @@
       });
       if (query && !videos.length) return;
       if (!Object.prototype.hasOwnProperty.call(expanded, course.id)) expanded[course.id] = selectedCourse ? selectedCourse === course.id : index === 0;
-      var open = query || expanded[course.id];
+      var open = query || revealCourse === course.id || expanded[course.id];
       var section = el('section', 'managed-course');
       var heading = el('div', 'managed-heading');
       var title = el('h2');
       var toggle = button((open ? '▾ ' : '▸ ') + course.title, 'course-' + course.id + '-toggle', function () {
-        expanded[course.id] = !expanded[course.id]; remember(); editor = null; render();
+        if (revealCourse === course.id) revealCourse = null;
+        editor = null;
+        remember({['expanded:' + course.id]: !open});
       });
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
       toggle.setAttribute('aria-controls', 'lessons-' + course.id);
@@ -380,8 +385,9 @@
       var grouped = grouping.value === 'chapters' && groups.some(function (group) { return group.number !== null; });
       if (grouped) [true, false].forEach(function (opening) {
         note.appendChild(button(opening ? 'Expand chapters' : 'Collapse chapters', 'course-' + course.id + (opening ? '-expand' : '-collapse'), function () {
-          groups.forEach(function (group) { chapterOpen[course.id + '|' + group.key] = opening; });
-          remember(); render();
+          var values = {};
+          groups.forEach(function (group) { values['chapter:' + course.id + '|' + group.key] = opening; });
+          remember(values);
         }, !!query || !!editor));
       });
       if (editable) contents.appendChild(sorting(course, !!query));
@@ -401,10 +407,16 @@
           return (editor && editor.id === video.id) || (focusKey && focusKey.indexOf('lesson-' + video.id + '-') === 0);
         });
         details.open = !!query || reveal || (typeof chapterOpen[groupKey] === 'boolean' ? chapterOpen[groupKey] : groupIndex === 0);
+        var expectedOpen = details.open;
         details.addEventListener('toggle', function () {
-          if (!query && details.isConnected) { chapterOpen[groupKey] = details.open; remember(); }
+          if (!query && details.isConnected && details.open !== expectedOpen) {
+            expectedOpen = details.open;
+            remember({['chapter:' + groupKey]: details.open});
+          }
         });
         var summary = el('summary', '', group.label);
+        summary.dataset.focusKey = 'chapter-' + groupKey;
+        focusTargets[summary.dataset.focusKey] = summary;
         summary.appendChild(el('span', 'chapter-meta', (query ? matches.length + ' of ' : '') + group.videos.length + (group.videos.length === 1 ? ' lesson' : ' lessons')));
         details.appendChild(summary);
         if (editable) {
@@ -456,9 +468,15 @@
   refresh.addEventListener('click', load);
   sortCourses.addEventListener('click', function () { mutate('courses/order', {mode: 'title'}, 'Courses sorted by name.', null); });
   [grouping, density].forEach(function (control) {
-    control.addEventListener('change', function () { remember(); render(); });
+    control.addEventListener('change', function () { remember({[control === grouping ? 'grouping' : 'density']: control.value}); });
   });
   reset.addEventListener('click', function () { mutate('courses/order', { mode: 'source' }, 'Folder order restored.', null); });
   search.addEventListener('input', function () { editor = null; render(); });
+  V2WReaderState.subscribe(function () {
+    // A remote layout update must not discard a title/order edit in progress.
+    if (!busy && !editor && lastView !== JSON.stringify(V2WReaderState.view('library'))) render();
+    else setBusy(busy);
+  });
+  syncView();
   load();
 })();

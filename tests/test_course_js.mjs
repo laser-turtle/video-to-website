@@ -53,6 +53,7 @@ function fixture({course = 'stable-course', reader = false, current = '', items}
   const density = node('select', '', {courseDensity: ''});
   const progressFilter = node('select', '', {courseProgress: ''});
   const hideCompleted = node('input', '', {courseHideCompleted: ''});
+  const preferenceError = node('p', '', {coursePreferenceError: ''}); preferenceError.hidden = true;
   const manage = reader ? null : node('button', '', {manageProgress: ''});
   const bulk = reader ? null : node('section', '', {readingBulk: ''});
   if (bulk) {
@@ -82,12 +83,12 @@ function fixture({course = 'stable-course', reader = false, current = '', items}
     row.append(new Element('span', {lessonProgress: ''}));
     container.append(row); return row;
   });
-  return {root, search, sort, view, density, progressFilter, hideCompleted, manage, bulk, clear, expand, collapse, controls, count, empty, container, rows};
+  return {root, search, sort, view, density, progressFilter, hideCompleted, preferenceError, manage, bulk, clear, expand, collapse, controls, count, empty, container, rows};
 }
 const state = new Map();
 const storage = {getItem: key => state.get(key) || null, setItem: (key, value) => state.set(key, value)};
 function run(f, localStorage = storage) {
-  const document = {body: {dataset: {}}, addEventListener() {},
+  const document = {body: {dataset: {}}, addEventListener() {}, querySelector: () => null,
     querySelectorAll: selector => selector === '.course-browser' ? [f.root] : [], createElement: tag => new Element(tag)};
   f.state = new Function('document', 'localStorage', 'window', reading + '\n' + source + '\nreturn V2WReaderState;')(document, localStorage, {addEventListener() {}});
 }
@@ -107,13 +108,13 @@ assert.equal(f.controls.hidden, false);
 assert.equal(f.root.dataset.density, 'detailed');
 
 groups(f)[1].open = true; await flush();
-assert.equal(JSON.parse(state.get(key)).opened['4:1'], true, 'native disclosure saves');
+assert.equal(f.state.view('course:stable-course')['opened:4:1'], true, 'native disclosure saves');
 search(f, 'FINAL exercise'); await flush();
 assert.deepEqual(visible(f), ['end']);
 assert.equal(groups(f)[2].open, true, 'search reveals matches inside collapsed chapters');
 assert.equal(groups(f)[1].hidden, true);
 assert.equal(f.count.textContent, '1 of 5 lessons');
-assert.equal(JSON.parse(state.get(key)).opened['10:1'], undefined, 'search opening is temporary');
+assert.equal(f.state.view('course:stable-course')['opened:10:1'], undefined, 'search opening is temporary');
 f.clear.click(); await flush();
 assert.deepEqual(groups(f).map(g => g.open), [true, true, false], 'clear restores disclosure choices');
 assert.equal(f.search.focused, true);
@@ -138,6 +139,7 @@ change(f.sort, 'shortest'); assert.deepEqual(order(f), ['intro', 'one', 'ten', '
 change(f.sort, 'title'); assert.deepEqual(order(f), ['ten', 'two', 'end', 'one', 'intro']);
 change(f.sort, 'saved'); assert.deepEqual(order(f), ['intro', 'two', 'ten', 'end', 'one']);
 change(f.density, 'compact'); assert.equal(f.root.dataset.density, 'compact');
+await flush();
 const restored = fixture(); run(restored); await flush();
 assert.equal(restored.view.value, 'flat'); assert.equal(restored.density.value, 'compact');
 assert.equal(restored.search.value, '', 'search does not carry across lesson navigation');
@@ -149,11 +151,13 @@ const reader = fixture({reader: true, current: 'end'}); run(reader); await flush
 assert.equal(groups(reader)[2].open, true, 'reader reveals current chapter even if collapsed on course index');
 assert.equal(reader.density.value, 'compact');
 change(reader.density, 'detailed');
+await flush();
 const afterReader = fixture(); run(afterReader);
 assert.equal(afterReader.density.value, 'compact', 'reader density is independent of index density');
 
 for (const corrupt of ['null', '[]', '"hello"', '{broken', '{"sort":"bogus","density":42,"opened":[]}']) {
   state.set(key, corrupt);
+  state.delete('v2w:view:course:stable-course');
   const fresh = fixture(); run(fresh); await flush();
   assert.equal(fresh.sort.value, 'saved'); assert.equal(fresh.density.value, 'detailed');
   assert.deepEqual(order(fresh), ['intro', 'two', 'ten', 'one', 'end']);
@@ -192,15 +196,37 @@ action('undo').click(); await flush();
 assert.equal(JSON.parse(state.get('v2w:stable-course:two'))['step-1'], true, 'undo restores partial progress');
 assert.equal(JSON.parse(state.get('v2w:stable-course:two'))['step-2'], false);
 tracked.clear.click();
-change(tracked.view, 'flat');
+change(tracked.view, 'flat'); await flush();
 action('select-all').click(); action('complete').click(); await flush();
 assert.equal(JSON.parse(state.get('v2w:stable-course:intro')).__lessonComplete, true, 'video-only lessons can complete');
-change(tracked.progressFilter, 'unfinished'); assert.deepEqual(visible(tracked), []);
-tracked.clear.click(); action('select-all').click(); action('reset').click(); await flush();
+change(tracked.progressFilter, 'unfinished'); await flush(); assert.deepEqual(visible(tracked), []);
+tracked.clear.click(); await flush(); action('select-all').click(); action('reset').click(); await flush();
 assert.ok(tracked.rows.every(row => row.dataset.progress === 'not-started'));
 change(tracked.view, 'chapters'); await flush();
 const beforeFilter = groups(tracked).map(g => g.open);
 change(tracked.progressFilter, 'complete'); await flush();
 tracked.clear.click(); await flush();
 assert.deepEqual(groups(tracked).map(g => g.open), beforeFilter, 'progress filters do not overwrite chapter disclosure preferences');
+
+state.clear();
+state.set(key, JSON.stringify({hideCompleted: true}));
+const globalView = fixture(); run(globalView); await flush();
+assert.equal(globalView.hideCompleted.checked, false, 'old per-course visibility cannot override the shared preference');
+globalView.hideCompleted.checked = true; globalView.hideCompleted.fire('change'); await flush();
+assert.equal(globalView.state.preferences().hide_completed, true);
+const anotherCourse = fixture({course: 'another-course'}); run(anotherCourse); await flush();
+assert.equal(anotherCourse.hideCompleted.checked, true, 'the preference applies across courses');
+const readerView = fixture({reader: true}); run(readerView); await flush();
+assert.equal(readerView.hideCompleted.checked, true, 'the reader contents use the shared preference too');
+change(readerView.progressFilter, 'complete'); await flush();
+assert.equal(readerView.progressFilter.value, 'complete', 'saving the global flag preserves the chosen temporary status filter');
+assert.equal(readerView.state.preferences().hide_completed, false);
+await readerView.state.edit([], {hide_completed: true});
+assert.equal(readerView.hideCompleted.checked, true, 'settings updates reach the course controls');
+assert.equal(readerView.progressFilter.value, 'unfinished');
+readerView.clear.click(); await flush();
+assert.equal(readerView.state.preferences().hide_completed, false, 'Clear filters saves the global reset');
+blocked.hideCompleted.checked = true; blocked.hideCompleted.fire('change'); await flush();
+assert.equal(blocked.hideCompleted.checked, false, 'failed saves restore the actual preference');
+assert.ok(blocked.state.pendingChanges().error);
 console.log('course.js runtime checks passed');

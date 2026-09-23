@@ -111,7 +111,7 @@ class ReadingTests(unittest.TestCase):
     def test_version_seven_migration_does_not_touch_workflows(self):
         with self.catalog.connect() as db:
             db.execute('DROP TABLE reading_state')
-            db.execute('DROP TABLE reader_preferences')
+            db.execute('DROP TABLE reader_preferences'); db.execute('DROP TABLE reader_views')
             db.execute('PRAGMA user_version=7')
             db.execute("INSERT INTO builds VALUES('running','1','input','{}','running','transcribe',NULL,1,2)")
         before = self.catalog.rows('SELECT * FROM builds')
@@ -119,6 +119,71 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(migrated.rows('PRAGMA user_version')[0]['user_version'], SCHEMA_VERSION)
         self.assertEqual(migrated.rows('SELECT * FROM builds'), before)
         self.assertEqual(ReadingState(migrated).snapshot()['states'], {})
+
+    def test_global_completion_visibility_preserves_older_settings(self):
+        with self.catalog.connect() as db:
+            db.execute("INSERT INTO reader_preferences VALUES(1,?,4)", (json.dumps({'rate': 1.5, 'loop': False}),))
+        self.assertFalse(self.store.snapshot()['preferences']['values']['hide_completed'])
+        self.store.edit({'action': 'preferences', 'revision': 4, 'values': {'hide_completed': True}})
+        preferences = ReadingState(Catalog(self.catalog.directory)).snapshot()['preferences']
+        self.assertTrue(preferences['values']['hide_completed'])
+        self.assertEqual(preferences['values']['rate'], 1.5)
+        self.assertFalse(preferences['values']['loop'])
+        self.assertEqual(preferences['revision'], 5)
+        with self.assertRaises(ValueError):
+            self.store.edit({'action': 'preferences', 'revision': 5, 'values': {'hide_completed': 'yes'}})
+
+    def test_view_preferences_patch_independent_fields_and_survive_restart(self):
+        self.store.edit({'action': 'view', 'scope': 'course:course', 'revision': 0,
+                         'values': {'sort': 'number', 'density': 'compact', 'opened:4:1': False}})
+        self.store.edit({'action': 'view', 'scope': 'course:course', 'revision': 1,
+                         'values': {'readerDensity': 'detailed', 'opened:5:1': True}})
+        self.store.edit({'action': 'view', 'scope': 'library', 'revision': 0,
+                         'values': {'grouping': 'flat', 'expanded:course': False, 'chapter:course|4:1': True}})
+        views = ReadingState(Catalog(self.catalog.directory)).snapshot()['views']
+        self.assertEqual(views['course:course']['values'], {'sort': 'number', 'density': 'compact',
+            'readerDensity': 'detailed', 'opened:4:1': False, 'opened:5:1': True})
+        self.assertEqual(views['course:course']['revision'], 2)
+        self.assertFalse(views['library']['values']['expanded:course'])
+        self.assertEqual(self.catalog.rows('SELECT * FROM builds'), [])
+
+    def test_view_import_never_overwrites_saved_choices(self):
+        self.store.edit({'action': 'view', 'scope': 'course:course', 'revision': 0, 'values': {'opened:4:1': False}})
+        self.store.edit({'action': 'import-views', 'entries': [
+            {'scope': 'course:course', 'values': {'opened:4:1': True, 'sort': 'title'}},
+            {'scope': 'library', 'values': {'density': 'compact', 'expanded:course': True, 'expanded:deleted': False,
+                                            'chapter:course|4:1': True, 'unrecognized': 'value'}},
+            {'scope': 'course:deleted', 'values': {'sort': 'title'}},
+        ]})
+        views = self.store.snapshot()['views']
+        self.assertEqual(views['course:course']['values'], {'opened:4:1': False})
+        self.assertEqual(views['library']['values'], {'density': 'compact', 'expanded:course': True, 'chapter:course|4:1': True})
+        self.assertNotIn('course:deleted', views)
+
+    def test_view_validation_and_conflicts_leave_saved_preferences_intact(self):
+        for scope, values in [('other', {}), ('course:missing', {'sort': 'title'})]:
+            with self.assertRaises(CatalogConflict):
+                self.store.edit({'action': 'view', 'scope': scope, 'revision': 0, 'values': values})
+        for scope, values in [('course:course', {'sort': 'random'}), ('course:course', {'opened:4:1': 1}),
+                              ('course:course', {'opened:1000:1': False}), ('course:course', {'expanded:course': True}),
+                              ('library', {'chapter:missing|4:1': True}), ('library', {'density': ['compact']}),
+                              ('library', {'chapter:course|<script>': True})]:
+            with self.assertRaises(ValueError):
+                self.store.edit({'action': 'view', 'scope': scope, 'revision': 0, 'values': values})
+        self.assertEqual(self.store.snapshot()['views'], {})
+        self.store.edit({'action': 'view', 'scope': 'library', 'revision': 0, 'values': {'density': 'compact'}})
+        with self.assertRaises(CatalogConflict):
+            self.store.edit({'action': 'view', 'scope': 'library', 'revision': 0, 'values': {'grouping': 'flat'}})
+        self.assertEqual(self.store.snapshot()['views']['library']['values'], {'density': 'compact'})
+
+    def test_version_eight_migration_preserves_progress_and_playback(self):
+        self.edit(self.entry(1, {'step-1': True}))
+        self.store.edit({'action': 'preferences', 'revision': 0, 'values': {'rate': 1.5}})
+        before = self.store.snapshot()
+        with self.catalog.connect() as db:
+            db.execute('DROP TABLE reader_views'); db.execute('PRAGMA user_version=8')
+        after = ReadingState(Catalog(self.catalog.directory)).snapshot()
+        self.assertEqual(after, before)
 
     def test_http_without_uploads_or_workers_and_invalid_bodies(self):
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), IngestHandler)

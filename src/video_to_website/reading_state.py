@@ -8,14 +8,36 @@ remain rows, so importing an older browser cannot resurrect cleared progress.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from urllib.parse import urlparse
 
 from .catalog import CatalogConflict
 
-DEFAULTS = {"rate": 1, "loop": True, "player_collapsed": True, "clip_autoplay": True}
+DEFAULTS = {"rate": 1, "loop": True, "player_collapsed": True, "clip_autoplay": True, "hide_completed": False}
 RATES = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+COURSE_VIEW_CHOICES = {
+    "sort": {"saved", "number", "title", "shortest"}, "view": {"chapters", "flat"},
+    "density": {"detailed", "compact"}, "readerDensity": {"detailed", "compact"},
+}
+LIBRARY_VIEW_CHOICES = {"grouping": {"chapters", "flat"}, "density": {"detailed", "compact"}}
+
+
+def valid_view_field(scope, key, value, courses):
+    choices = LIBRARY_VIEW_CHOICES if scope == "library" else COURSE_VIEW_CHOICES
+    if key in choices:
+        return isinstance(value, str) and value in choices[key]
+    if type(value) is not bool:
+        return False
+    if scope != "library":
+        return re.fullmatch(r"opened:(?:other|\d{1,3}):1", key) is not None
+    if key.startswith("expanded:"):
+        return key.removeprefix("expanded:") in courses
+    if key.startswith("chapter:"):
+        course, _, chapter = key.removeprefix("chapter:").partition("|")
+        return course in courses and re.fullmatch(r"(?:other|\d{1,3}):1", chapter) is not None
+    return False
 
 
 class ReadingState:
@@ -36,9 +58,13 @@ class ReadingState:
         states = {row["namespace"]: {"state": json.loads(row["state"]), "revision": row["revision"]}
                   for row in db.execute("SELECT * FROM reading_state") if row["namespace"] in active}
         preference = db.execute("SELECT * FROM reader_preferences WHERE id=1").fetchone()
+        courses = [row[0] for row in db.execute("SELECT id FROM courses")]
+        scopes = {"library", *("course:" + course for course in courses)}
+        views = {row["scope"]: {"values": json.loads(row["value"]), "revision": row["revision"]}
+                 for row in db.execute("SELECT * FROM reader_views") if row["scope"] in scopes}
         return {"version": 1, "states": states, "lessons": {key: value[1] for key, value in active.items()}, "preferences": {
             "values": DEFAULTS | (json.loads(preference["value"]) if preference else {}),
-            "revision": preference["revision"] if preference else 0}}
+            "revision": preference["revision"] if preference else 0}, "views": views, "courses": courses}
 
     def snapshot(self):
         with self.catalog.connect() as db:
@@ -47,15 +73,46 @@ class ReadingState:
 
     def edit(self, body):
         action = body.get("action")
-        if action not in ("patch", "import", "preferences", "import-preferences"):
+        if action not in ("patch", "import", "preferences", "import-preferences", "view", "import-views"):
             raise ValueError("Unknown reading-state action.")
         with self.catalog.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if action in ("preferences", "import-preferences"):
                 self._preferences(db, body, importing=action == "import-preferences")
+            elif action in ("view", "import-views"):
+                self._views(db, body, importing=action == "import-views")
             else:
                 self._progress(db, body, importing=action == "import")
             return self._snapshot(db)
+
+    @staticmethod
+    def _views(db, body, *, importing):
+        entries = body.get("entries") if importing else [body]
+        if not isinstance(entries, list) or not 1 <= len(entries) <= 2000:
+            raise ValueError("Expected 1–2000 view preference entries.")
+        courses = {row[0] for row in db.execute("SELECT id FROM courses")}
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("scope"), str):
+                raise ValueError("Expected a view preference scope.")
+            scope = entry["scope"]
+            if scope != "library" and (not scope.startswith("course:") or scope[7:] not in courses):
+                if importing:
+                    continue
+                raise CatalogConflict("This course is no longer available. Reload the library.")
+            values = entry.get("values")
+            if not isinstance(values, dict) or len(values) > 20000:
+                raise ValueError("Expected a bounded view preferences object.")
+            valid = {key: value for key, value in values.items() if valid_view_field(scope, key, value, courses)}
+            if not importing and len(valid) != len(values):
+                raise ValueError("Invalid view preference field or value.")
+            row = db.execute("SELECT * FROM reader_views WHERE scope=?", (scope,)).fetchone()
+            if importing and (row or not valid):
+                continue
+            revision = row["revision"] if row else 0
+            if not importing and (type(entry.get("revision")) is not int or entry["revision"] != revision):
+                raise CatalogConflict("View preferences changed on another device. Retry to apply your changes to the latest settings.")
+            current = json.loads(row["value"]) if row else {}
+            db.execute("INSERT OR REPLACE INTO reader_views VALUES(?,?,?)", (scope, json.dumps(current | valid), revision + 1))
 
     def _progress(self, db, body, *, importing):
         entries = body.get("entries")

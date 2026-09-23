@@ -223,7 +223,7 @@ class SourceStorageTests(unittest.TestCase):
         with self.catalog.connect() as db:
             db.execute("DROP TABLE reclaimed_sources"); db.execute("PRAGMA user_version=6")
             db.execute("DROP TABLE reading_state")
-            db.execute("DROP TABLE reader_preferences")
+            db.execute("DROP TABLE reader_preferences"); db.execute("DROP TABLE reader_views")
         self.catalog = Catalog(self.root / "state")
         self.assertEqual(self.catalog.rows("PRAGMA user_version")[0]["user_version"], SCHEMA_VERSION)
         self.assertEqual(self.catalog.rows("SELECT * FROM builds"), before)

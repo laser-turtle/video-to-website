@@ -157,7 +157,7 @@ class WorkerTests(WorkerFixture):
             db.execute("DROP TABLE reclaimed_sources")
             db.execute("PRAGMA user_version=4")
             db.execute("DROP TABLE reading_state")
-            db.execute("DROP TABLE reader_preferences")
+            db.execute("DROP TABLE reader_preferences"); db.execute("DROP TABLE reader_views")
         reopened = WorkerStore(Catalog(self.root / "state"))
         self.assertEqual(reopened.authenticate(worker["token"]), worker["id"])
         record = next(w for w in reopened.overview()["workers"] if w["id"] == worker["id"])

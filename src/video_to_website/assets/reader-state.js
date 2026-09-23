@@ -2,9 +2,10 @@
  * A server outage never silently turns into unsynchronized local edits. */
 var V2WReaderState = (function () {
   'use strict';
-  var defaults = {rate: 1, loop: true, player_collapsed: true, clip_autoplay: true};
+  var defaults = {rate: 1, loop: true, player_collapsed: true, clip_autoplay: true, hide_completed: false};
   var rates = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
   var listeners = [], snapshot = null, mode = 'connecting', busy = false, polling = false;
+  var saveQueue = new Map(), saving = false, saveError = '';
   var problem = '', ready, api = document.body.dataset.readingApi;
   function parse(raw) {
     try { var value = JSON.parse(raw); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
@@ -21,13 +22,109 @@ var V2WReaderState = (function () {
     if (local('v2w:loop') !== null) values.loop = local('v2w:loop') !== '0';
     return values;
   }
-  function notify() { listeners.forEach(function (fn) { fn(); }); }
-  function read(key) {
+  function notify() {
+    listeners.forEach(function (fn) { fn(); });
+    if (saveQueue.size && !saveError) Promise.resolve().then(drainQueue);
+  }
+  function confirmed(key) {
     return snapshot ? (snapshot.states[key] || {}).state || {} : parse(local(key));
   }
-  function preferences() { return snapshot ? snapshot.preferences.values : localPreferences(); }
+  function legacyView(scope) {
+    var library = scope === 'library';
+    var saved = parse(local(library ? 'v2w:library:view' : 'v2w:course:' + scope.slice(7) + ':navigation'));
+    var value = {}, choices = library ? {grouping: ['chapters', 'flat'], density: ['detailed', 'compact']} :
+      {sort: ['saved', 'number', 'title', 'shortest'], view: ['chapters', 'flat'], density: ['detailed', 'compact'], readerDensity: ['detailed', 'compact']};
+    Object.keys(choices).forEach(function (key) { if (choices[key].includes(saved[key])) value[key] = saved[key]; });
+    (library ? [['expanded', 'expanded:'], ['chapters', 'chapter:']] : [['opened', 'opened:']]).forEach(function (entry) {
+      var map = saved[entry[0]];
+      if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+      Object.keys(map).forEach(function (key) { if (typeof map[key] === 'boolean') value[entry[1] + key] = map[key]; });
+    });
+    return value;
+  }
+  function localView(scope) {
+    var raw = local('v2w:view:' + scope);
+    return raw === null ? legacyView(scope) : parse(raw);
+  }
+  function confirmedView(scope) { return snapshot ? ((snapshot.views || {})[scope] || {}).values || {} : localView(scope); }
+  function confirmedPreferences() { return snapshot ? Object.assign({}, defaults, snapshot.preferences.values) : localPreferences(); }
+  function overlay(kind, scope, value) {
+    var pending = saveQueue.get(kind + ':' + scope);
+    if (!pending || saveError) return value;
+    value = Object.assign({}, value);
+    Object.keys(pending.changes).forEach(function (id) { value[id] = pending.changes[id].value; });
+    return value;
+  }
+  function read(key) { return overlay('steps', key, confirmed(key)); }
+  function view(scope) { return overlay('view', scope, confirmedView(scope)); }
+  function preferences() { return overlay('preferences', 'global', confirmedPreferences()); }
+  function savedRevision(kind, scope) {
+    if (kind === 'steps') return revision(scope);
+    if (kind === 'preferences') return snapshot ? snapshot.preferences.revision : 0;
+    return snapshot && (snapshot.views || {})[scope] ? snapshot.views[scope].revision : 0;
+  }
+  function pendingChanges() {
+    var count = 0;
+    saveQueue.forEach(function (entry) { count += Object.keys(entry.changes).length; });
+    return {count: count, error: saveError, busy: busy || polling || saving};
+  }
+  function canQueueStep() { return !saveError && (mode === 'server' || mode === 'local'); }
+  function queueStep(key, id, value) {
+    return queueChanges('steps', key, {[id]: value});
+  }
+  function queueChanges(kind, scope, values) {
+    if (!canQueueStep()) return false;
+    var current = kind === 'steps' ? read(scope) : kind === 'view' ? view(scope) : preferences();
+    var key = kind + ':' + scope;
+    Object.keys(values).forEach(function (id) {
+      var before = kind === 'steps' ? !!current[id] : current[id];
+      if (before === values[id]) return;
+      if (!saveQueue.has(key)) saveQueue.set(key, {kind: kind, scope: scope, revision: savedRevision(kind, scope), changes: {}});
+      // A new object distinguishes a newer change from an in-flight save.
+      saveQueue.get(key).changes[id] = {value: values[id]};
+    });
+    notify();
+    return true;
+  }
+  async function drainQueue() {
+    if (saving || busy || polling || !saveQueue.size || saveError) return;
+    if (!canQueueStep()) {
+      saveError = 'Reconnect to the server before retrying these changes.';
+      notify(); return;
+    }
+    saving = true;
+    var [key, entry] = saveQueue.entries().next().value;
+    var batch = Object.assign({}, entry.changes), changes = {};
+    Object.keys(batch).forEach(function (id) { changes[id] = batch[id].value; });
+    try {
+      var body = entry.kind === 'steps'
+        ? {action: 'patch', entries: [{key: entry.scope, revision: entry.revision, changes: changes}]}
+        : {action: entry.kind, scope: entry.scope, revision: entry.revision, values: changes};
+      await commit(body, true);
+      Object.keys(batch).forEach(function (id) { if (entry.changes[id] === batch[id]) delete entry.changes[id]; });
+      // Only our own successful save advances the revision of queued edits.
+      // An unrelated device edit must still trigger the normal conflict check.
+      entry.revision = savedRevision(entry.kind, entry.scope);
+      if (!Object.keys(entry.changes).length) saveQueue.delete(key);
+    } catch (e) {
+      saveError = e.message || 'The save could not be confirmed.';
+    } finally { saving = false; notify(); }
+  }
+  async function retryChanges() {
+    if (!saveError || busy || polling || saving) return;
+    await refresh();
+    if (mode !== 'server' && mode !== 'local') return;
+    saveQueue.forEach(function (entry) { entry.revision = savedRevision(entry.kind, entry.scope); });
+    saveError = ''; notify();
+  }
+  function discardChanges() {
+    if (!saveError || busy || polling || saving) return;
+    saveQueue.clear(); saveError = ''; problem = ''; notify();
+  }
   function revision(key) { return snapshot && snapshot.states[key] ? snapshot.states[key].revision : 0; }
   function status() {
+    if (saveError) return 'There are unsaved changes. ' + saveError;
+    if (saveQueue.size) return 'Saving changes…';
     if (busy) return 'Saving…';
     if (problem) return problem;
     return {connecting: 'Connecting to reading sync…', server: 'Synced with server',
@@ -56,6 +153,9 @@ var V2WReaderState = (function () {
       localStorage.setItem('v2w:reader:preferences', JSON.stringify(value.preferences.values));
       localStorage.setItem('v2w:rate', String(value.preferences.values.rate));
       localStorage.setItem('v2w:loop', value.preferences.values.loop ? '1' : '0');
+      if (value.views && Array.isArray(value.courses)) ['library'].concat(value.courses.map(function (id) { return 'course:' + id; })).forEach(function (scope) {
+        localStorage.setItem('v2w:view:' + scope, JSON.stringify((value.views[scope] || {}).values || {}));
+      });
     } catch (e) { /* Server saves do not depend on browser storage capacity. */ }
   }
   async function connect() {
@@ -79,6 +179,12 @@ var V2WReaderState = (function () {
       if (!value.preferences.revision && (local('v2w:rate') !== null || local('v2w:loop') !== null || local('v2w:reader:preferences') !== null)) {
         value = await request({action: 'import-preferences', values: localPreferences()});
       }
+      if (value.views && Array.isArray(value.courses)) {
+        var views = ['library'].concat(value.courses.map(function (id) { return 'course:' + id; })).filter(function (scope) {
+          return !value.views[scope];
+        }).map(function (scope) { return {scope: scope, values: localView(scope)}; }).filter(function (entry) { return Object.keys(entry.values).length; });
+        for (var offset = 0; offset < views.length; offset += 2000) value = await request({action: 'import-views', entries: views.slice(offset, offset + 2000)});
+      }
       accept(value);
     } catch (e) {
       if ((e.status === 404 || e.status === 405) && !local('v2w:reader:server')) mode = 'local';
@@ -87,7 +193,7 @@ var V2WReaderState = (function () {
     notify();
   }
   async function refresh() {
-    if (busy || polling || mode === 'local' || mode === 'connecting') return;
+    if (busy || polling || mode === 'local' || mode === 'connecting' || (saveQueue.size && !saveError)) return;
     polling = true;
     try {
       if (!snapshot) await connect();
@@ -95,27 +201,32 @@ var V2WReaderState = (function () {
     } catch (e) { mode = 'offline'; problem = 'Cannot reach reading sync. Reconnect before editing.'; notify(); }
     finally { polling = false; notify(); }
   }
-  async function edit(entries, preferenceValues, expectedPreferences) {
+  function edit(entries, preferenceValues, expectedPreferences) {
+    return commit(preferenceValues ? {action: 'preferences', values: preferenceValues,
+      revision: expectedPreferences === undefined ? savedRevision('preferences', 'global') : expectedPreferences}
+      : {action: 'patch', entries: entries});
+  }
+  async function commit(body, fromQueue) {
     await ready;
-    if (busy || polling) throw new Error('Sync is busy. Try again in a moment.');
+    if (busy || polling || (saveQueue.size && !fromQueue)) throw new Error('Changes are still saving. Try again in a moment.');
     if (mode !== 'server' && mode !== 'local') throw new Error('Reconnect to the server before editing progress or settings.');
     busy = true; problem = ''; notify();
     try {
       if (mode === 'server') {
-        accept(await request(preferenceValues ? {action: 'preferences', values: preferenceValues,
-          revision: expectedPreferences === undefined ? snapshot.preferences.revision : expectedPreferences}
-          : {action: 'patch', entries: entries}));
-      } else if (preferenceValues) {
-        var prefs = Object.assign({}, localPreferences(), preferenceValues);
+        accept(await request(body));
+      } else if (body.action === 'preferences') {
+        var prefs = Object.assign({}, localPreferences(), body.values);
         localStorage.setItem('v2w:reader:preferences', JSON.stringify(prefs));
         localStorage.setItem('v2w:rate', String(prefs.rate));
         localStorage.setItem('v2w:loop', prefs.loop ? '1' : '0');
+      } else if (body.action === 'view') {
+        localStorage.setItem('v2w:view:' + body.scope, JSON.stringify(Object.assign({}, localView(body.scope), body.values)));
       } else {
         // Best-effort rollback makes storage quota failures visible and avoids
         // presenting a partially saved static-export bulk edit as successful.
-        var previous = entries.map(function (entry) { return {key: entry.key, raw: localStorage.getItem(entry.key)}; });
+        var previous = body.entries.map(function (entry) { return {key: entry.key, raw: localStorage.getItem(entry.key)}; });
         try {
-          entries.forEach(function (entry) { localStorage.setItem(entry.key, JSON.stringify(Object.assign({}, read(entry.key), entry.changes))); });
+          body.entries.forEach(function (entry) { localStorage.setItem(entry.key, JSON.stringify(Object.assign({}, confirmed(entry.key), entry.changes))); });
         } catch (e) {
           previous.forEach(function (entry) { try {
             if (entry.raw === null) localStorage.removeItem(entry.key); else localStorage.setItem(entry.key, entry.raw);
@@ -137,6 +248,10 @@ var V2WReaderState = (function () {
     if (e.key === null || e.key.startsWith('v2w:')) { if (mode === 'local') notify(); else refresh(); }
   });
   window.addEventListener('pageshow', refresh);
+  window.addEventListener('beforeunload', function (event) {
+    if (!saveQueue.size) return;
+    event.preventDefault(); event.returnValue = '';
+  });
   window.addEventListener('focus', refresh);
   document.addEventListener('visibilitychange', function () { if (!document.hidden) refresh(); });
   ready = connect();
@@ -144,6 +259,11 @@ var V2WReaderState = (function () {
   return {read: read, revision: revision, preferences: preferences, rates: rates, defaults: defaults,
     preferenceRevision: function () { return snapshot ? snapshot.preferences.revision : 0; },
     edit: edit, status: status, ready: ready, refresh: refresh,
-    writable: function () { return !busy && !polling && (mode === 'server' || mode === 'local'); },
+    writable: function () { return !busy && !polling && !saveQueue.size && (mode === 'server' || mode === 'local'); },
+    queueStep: queueStep, canQueueStep: canQueueStep, canQueue: canQueueStep,
+    queuePreferences: function (values) { return queueChanges('preferences', 'global', values); },
+    queueView: function (scope, values) { return queueChanges('view', scope, values); }, view: view,
+    pendingChanges: pendingChanges, retryChanges: retryChanges, discardChanges: discardChanges,
+    pendingSteps: pendingChanges, retrySteps: retryChanges, discardSteps: discardChanges,
     subscribe: function (fn) { listeners.push(fn); }};
 })();

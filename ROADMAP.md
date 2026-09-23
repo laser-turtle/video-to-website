@@ -16,9 +16,20 @@ published revisions. See [ARCHITECTURE.md](ARCHITECTURE.md).
 **Reading.** Keyboard-driven: step navigation, a floating player that enlarges,
 quick seek, playback speed and clip looping that persist, per-step done
 checkboxes, Markdown export.
-Tall-step paging aligns the instructions below the first visual at the top.
+Step paging aligns the notes at the top when more screenshots follow them, even
+when the step fits on screen. A single visual plus notes skips that extra stop.
+Collapsing the floating player pauses it; leaving the
+enlarged view restores its previous collapsed/open state.
 Shift+J/K moves between lessons, Shift+L/H between chapters, and `/` opens a
 keyboard-operated lesson picker with partial-name search.
+Left-hand alternatives preserve the Vim bindings: E/D for back/forward, S for
+done-and-next, Q/W for seeking, and Shift with those pairs for lessons/chapters.
+B opens lesson search, T shows help, A closes overlays, and 1–4 control speed
+and clip seeking. The shortcut overlay lists the left-hand bindings first.
+Shift+B / Shift+G reach the lesson beginning/end. S/Enter advances immediately;
+step and preference changes save in the background with batching, visible failure recovery,
+and protection against leaving with unsaved progress. The pending queue is
+page-local; durable offline editing remains future work.
 Introductions/overviews without extracted steps publish as video lessons with an
 inline player, poster, and available summary/transcript. Silent/empty-transcript
 videos use the same fallback; genuine processing errors remain failures.
@@ -29,7 +40,13 @@ Reading state and playback preferences sync through the application SQLite
 catalog (schema v8), using one shared reader profile. Existing browser checkmarks
 are imported only into untouched lesson namespaces; explicit server resets win.
 The Settings page manages playback speed, clip looping/autoplay and the floating
-player's starting state. Static exports retain browser-local storage.
+player's starting state. Hide completed is one shared preference across courses
+and devices, editable from Settings or any course overview. Static exports retain
+browser-local storage.
+Course and Library view preferences now use schema v9's scoped `reader_views`
+records: course sorting/grouping/density, separate reader density, chapter
+disclosures, and Library grouping/density/course expansion. They update immediately,
+save asynchronously, and import existing browser choices only into untouched scopes.
 
 **Running as a service.** A NixOS module, an LXC image for Proxmox, nginx in
 front, uploads proxied to a loopback port. One DBOS coordinator reconciles the
@@ -43,7 +60,7 @@ Course lessons list vertically, and previous/next links follow the grouped readi
 Metadata edits publish without processing videos or changing filenames.
 Course and lesson navigation infer collapsible chapters from leading title/source
 numbering. Search, expand/collapse, compact rows and temporary number/title/duration
-sorts work on static exports and remember view preferences per browser. The reader
+sorts work on static exports and synchronize view preferences on the service. The reader
 contents menu highlights the current lesson. Each chapter collects all its lessons
 into one group; Previous/Next follows that grouped sequence.
 The Library management page has the same chapter/compact views and can save a
@@ -129,8 +146,8 @@ IDs and instruction-content namespaces prevent cross-course collisions and
 misapplied completion after regeneration. Bulk edits are atomic and revision
 checked; Undo preserves later changes. DBOS execution history remains separate.
 Saved reading position, separate authenticated reader profiles, and an offline
-edit queue remain to build. Course layout and disclosure choices stay on each
-device. An unavailable server disables synced edits rather than creating a second
+edit queue remain to build. Course and Library layout/disclosure choices now sync.
+An unavailable server disables synced edits rather than creating a second
 local source of truth.
 
 ### Stage 5: per-course tuning

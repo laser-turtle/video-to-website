@@ -29,6 +29,9 @@ var V2WReading = (function () {
     if (!lesson.steps.includes(id)) return;
     await V2WReaderState.edit([{key: lesson.key, revision: V2WReaderState.revision(lesson.key), changes: {[id]: value}}]);
   }
+  function queueStep(lesson, id, value) {
+    return lesson.steps.includes(id) && V2WReaderState.queueStep(lesson.key, id, value);
+  }
   async function mark(lessons, value) {
     var result = {changes: [], failed: 0, skipped: 0};
     var entries = lessons.map(function (lesson) {
@@ -72,7 +75,7 @@ var V2WReading = (function () {
     node.hidden = false;
   }
   return {read: read, stats: stats, aggregate: aggregate, label: label, summary: summary,
-    percent: percent, setStep: setStep, mark: mark, undo: undo, report: report, paint: paint,
+    percent: percent, setStep: setStep, queueStep: queueStep, mark: mark, undo: undo, report: report, paint: paint,
     subscribe: V2WReaderState.subscribe};
 })();
 
@@ -82,6 +85,35 @@ var V2WReading = (function () {
     document.querySelectorAll('[data-reading-sync]').forEach(function (node) { node.textContent = V2WReaderState.status(); });
   }
   V2WReading.subscribe(syncStatus); syncStatus();
+  var saves = document.querySelector('[data-reading-saves]');
+  if (saves) {
+    var retry = saves.querySelector('[data-reading-retry]');
+    var discard = saves.querySelector('[data-reading-discard]');
+    var revealTimer = null;
+    function refreshSaves() {
+      var pending = V2WReaderState.pendingChanges();
+      if (!pending.count || pending.error) {
+        clearTimeout(revealTimer); revealTimer = null;
+        saves.hidden = !pending.count;
+      } else if (saves.hidden && revealTimer === null) {
+        // Fast saves need no flashing notification in the reader's path.
+        revealTimer = setTimeout(function () {
+          revealTimer = null;
+          saves.hidden = !V2WReaderState.pendingChanges().count;
+        }, 300);
+      }
+      saves.dataset.failed = String(!!pending.error);
+      var text = pending.count + (pending.count === 1 ? ' change' : ' changes');
+      saves.querySelector('[data-reading-save-status]').textContent = pending.error
+        ? text + ' could not be confirmed. ' + pending.error + ' Retry saves your choices; discard keeps the last confirmed state.'
+        : 'Saving ' + text + '…';
+      retry.hidden = discard.hidden = !pending.error;
+      retry.disabled = discard.disabled = pending.busy;
+    }
+    retry.addEventListener('click', V2WReaderState.retryChanges);
+    discard.addEventListener('click', V2WReaderState.discardChanges);
+    V2WReading.subscribe(refreshSaves); refreshSaves();
+  }
   document.querySelectorAll('[data-reading-summary]').forEach(function (node) {
     var lessons = JSON.parse(node.dataset.readingSummary);
     function refresh() { V2WReading.paint(node, lessons); }

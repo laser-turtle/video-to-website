@@ -221,9 +221,33 @@ local export fallback; `reading.js` computes the same completion fractions for
 all overviews and the reader. Visible pages refresh every ten seconds, on focus,
 and after conflicts or uncertain saves. Once a server is detected, an outage
 disables edits rather than creating an offline fork. The Settings page and reader
-shortcuts share playback preferences. Static exports use localStorage; view and
-disclosure preferences stay local in both modes. Separate user identities and an
+shortcuts share playback preferences. Static exports use localStorage. Separate user identities and an
 offline mutation queue are not implemented.
+The `hide_completed` boolean is a shared reader preference, independent of course
+identity. Overview controls and Settings patch the same revision-checked value;
+existing preference rows default it to false without a schema migration. Old
+per-course browser flags are ignored.
+
+Schema v9 adds `reader_views`, keyed by `library` or `course:<stable ID>`, with a
+JSON value and revision. Fields include course sort/grouping/density, independent
+reader density, and chapter disclosure states; the Library scope has grouping,
+density, course expansion and chapter disclosure states. `view` patches only the
+changed fields, with scope/enum/boolean validation and a revision check.
+`import-views` fills only absent scopes and filters out obsolete course IDs and
+invalid legacy fields. Defaults, search expansion, and a deep-linked course reveal
+are not written as user preferences. Existing progress and workflows survive the
+additive migration. Library synchronization defers layout changes while an editor
+contains unsaved metadata.
+
+Step completion and preference changes use one optimistic, in-page queue: the UI updates immediately,
+one request is active at a time, and edits accumulated during that request form
+the next batch. Only an acknowledged save advances the queued revision. Newer
+changes to an in-flight field are retained. View and playback patches share the
+writer with completion; this avoids competing requests from fast UI changes.
+Bulk completion edits wait for the queue to drain.
+Failures restore the confirmed view and retain the requested changes for explicit
+retry/discard; they never silently replace a conflicting remote edit. A pending
+queue guards page exit and is not a durable offline journal.
 
 **Library organization**
 

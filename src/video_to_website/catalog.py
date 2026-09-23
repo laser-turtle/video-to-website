@@ -20,7 +20,7 @@ from .progress import STAGE_LABELS
 from .util import digest_file, digest_json, file_fingerprint, file_lock, natural_key, read_stage, slugify
 from .work_progress import progress_snapshot
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 PIPELINE_VERSION = "1"
 ACTIVE = ("queued", "running")
 LESSON_OPTIONS_PREFIX = "lesson-options:"
@@ -125,6 +125,13 @@ class Catalog:
                     id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL,
                     revision INTEGER NOT NULL)""")
                 db.execute("PRAGMA user_version=8")
+                version = 8
+            if version == 8:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                db.execute("""CREATE TABLE reader_views (
+                    scope TEXT PRIMARY KEY, value TEXT NOT NULL, revision INTEGER NOT NULL)""")
+                db.execute("PRAGMA user_version=9")
 
     @contextlib.contextmanager
     def connect(self, *, timeout: float = 30):

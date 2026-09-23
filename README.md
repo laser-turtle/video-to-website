@@ -220,20 +220,23 @@ with `--videos none` still omit the source video and say so on the lesson page.
 The steps and their screenshots get the full column, because that is what you read. The
 video is reference material, so it lives in a small player floating in the corner that
 starts collapsed and opens by itself the moment you click a timestamp. Press `v`
-to collapse or reopen it without changing playback. Its header
-collapses it again. Settings controls whether it starts collapsed when opening a lesson.
+to collapse or reopen it. Collapsing pauses the video and keeps its playback
+position; reopening leaves it paused until you play it. Space reveals a collapsed
+video before starting playback. The header also toggles it. Settings controls
+whether it starts collapsed when opening a lesson.
 
 Playback speed steps through 0.75x up to 3x with `,` and `.`, and is saved as a shared
 reader preference, so the speed follows you across lessons and devices.
 Clips run at it too. Changing it with the player's own controls is
 picked up as well, and the current speed sits in the player's header.
 
-Between lessons, **Shift+J / Shift+K** opens the next/previous lesson, and
-**Shift+L / Shift+H** jumps to the first lesson of the next/previous chapter.
+Between lessons, **Shift+D / Shift+E** opens the next/previous lesson, and
+**Shift+W / Shift+Q** jumps to the first lesson of the next/previous chapter.
+The Vim alternatives **Shift+J / Shift+K** and **Shift+L / Shift+H** still work.
 These follow the grouped reading order, independent of temporary view sorting.
 They stop at the course boundaries and do not fire while typing.
 
-Press **/** or click **Jump to lesson** to open the lesson picker. Search titles,
+Press **B**, **/**, or click **Jump to lesson** to open the lesson picker. Search titles,
 descriptions, original filenames, or `chapter 4`; ordered-letter abbreviations such
 as `bse frm` also find “Base form.” Use **↑ / ↓**, then **Enter**, or **Esc** to
 return to reading. Choosing the current lesson closes the picker without reloading
@@ -242,29 +245,63 @@ it. The picker also works on course pages and in static exports.
 The player has three sizes. Collapsed it is a chip showing the current time. Open it
 sits in the corner. Pressing <kbd>f</kbd>, or the button in its header, moves it to the
 centre of the screen at full size for studying one passage closely; <kbd>f</kbd> again,
-<kbd>Esc</kbd>, or a click outside returns it to the corner. The larger view is
-deliberately not remembered, because it is meant to be temporary.
+<kbd>Esc</kbd>, or a click outside restores its previous state. If it was collapsed
+before enlarging, it returns to collapsed and pauses; if it was open, it returns
+to the corner and playback continues. The larger view itself is temporary.
 
-One step at a time is the cursor, highlighted and moved with `j` and `k`. A step
+One step at a time is the cursor, highlighted and moved with `d` / `e` or `j` / `k`. A step
 carrying a clip and a screenshot is often taller than the window. `j` brings the
 instructions below the first visual to the top, moving that clip/screenshot out
-of the way so the text and following screenshot are easier to study. Very tall
+of the way so the text and following screenshot are easier to study. This notes
+stop applies only when more screenshots follow the notes, including short steps
+that fit entirely on screen. A screenshot or clip followed only by notes can move
+straight to the next step when it fits. Very tall
 visuals still advance in overlapping pages. `k` stops at the instructions on the
 way back too, and returns to that reading position when entering the previous
-step. Arriving at a step aligns its top, not its middle, because the text worth reading
+step. At the top of the first step, another `K` or `E` returns to the page's
+beginning and clears the active-step highlight so you can read the introduction.
+`J` or `D` then selects the first step again; completion checkmarks are unchanged.
+Arriving at a step aligns its top, not its middle, because the text worth reading
 is at the top. Scrolling by hand is respected: the next `j` resumes from whatever is
 actually on screen. The page animates its own scrolling over 200ms, because
 the browser's built-in smooth scrolling has a fixed duration that is slow enough to get
 in the way; `SCROLL_MS` in `render.py` is the dial.
 
-`Enter` marks the step done and moves on, which is the whole loop when you are working
-along in another window: read, do it, `Enter`, read. `Home` returns to the top, where
-the summary and prerequisites live, and `End` jumps to the last step. `g` plays the
+`S` or `Enter` marks the step done and moves on immediately, saving progress in the
+background. Rapid completions are queued and batched, so the next step does not
+wait for a server round trip. If a save fails, the page restores confirmed
+checkmarks and offers **Retry saving** or **Discard unsaved changes**. Leaving
+while changes remain unconfirmed triggers the browser's unsaved-changes prompt;
+the pending queue belongs to the open page.
+
+`Shift+B` or `Home` returns to the top, where the summary and prerequisites live,
+and `Shift+G` or `End` jumps to the last step. `g` plays the
 video from the current step, `c` plays its clip, `Space` and the arrow keys drive
 playback, `,` and `.` change speed, `h` and `l` seek ten seconds either way, `[` and `]` nudge the
 current step's clip by two, stopping at either end and only coming round to the other
 side if pressed again there, and `?` lists the lot. Playback
 moves the cursor too, but never scrolls the page under you.
+
+Left-hand alternatives work alongside the existing shortcuts, without switching
+a keyboard layer. Press **T** or **?** for the full list on the page.
+
+| Action | Left hand | Existing alternative |
+| --- | --- | --- |
+| Previous / next reading stop | E / D | K / J, ↑ / ↓ |
+| Lesson beginning / end | Shift+B / Shift+G | Home / End |
+| Complete step and advance | S | Enter |
+| Previous / next lesson | Shift+E / Shift+D | Shift+K / Shift+J |
+| Previous / next chapter | Shift+Q / Shift+W | Shift+H / Shift+L |
+| Video back / forward 10 seconds | Q / W | H / L, ← / → |
+| Slower / faster playback | 1 / 2 | , / . |
+| Clip back / forward 2 seconds | 3 / 4 | [ / ] |
+| Find a lesson | B | / |
+| Close enlarged video, screenshot or help | A | Esc |
+| Show shortcut help | T | ? |
+
+Space, F, V, C, X, Z, R, and G keep their existing functions. Letter shortcuts
+do not fire while typing, including in lesson search. Its arrow keys and Enter
+remain available for choosing a result.
 
 Every step timestamp, screenshot, clip caption, and transcript line is a jump point.
 Clicking the same one a second time pauses, so a click is how you stop to look at
@@ -278,6 +315,11 @@ Course/chapter percentages average their lessons' fractions, so partial work cou
 without a long lesson outweighing all the short ones. Percentages reach 100% only
 when every lesson is complete.
 
+**Hide completed** is a shared server preference across all courses, browsers,
+and devices, including the reader's course-contents menu. Change it there or in
+**Settings → Course browsing**. Unchecking it or choosing **Clear filters** saves
+the shared choice too. Old per-course browser values no longer control it.
+
 On a course overview, choose **Manage progress** to select individual lessons,
 entire chapters, or all lessons matching the current search/progress filter.
 **Mark complete** checks every step; **Reset progress** clears them. **Undo** restores
@@ -286,18 +328,20 @@ Hidden selections are counted explicitly. The reader itself also has a
 **Mark lesson complete** / **Reset lesson progress** control.
 
 The **Settings** page (linked from All courses and every page footer) manages
-video/clip speed, clip looping, automatic clip playback, and whether the floating
-player starts collapsed. Speed and loop shortcuts update these same preferences.
-**Restore defaults** resets playback preferences without clearing completion.
+video/clip speed, clip looping, automatic clip playback, whether the floating
+player starts collapsed, and Hide completed. Speed and loop shortcuts update
+these same preferences. **Restore defaults** resets these preferences without
+clearing completion.
 
 The service stores one shared reader profile in `catalog.sqlite`. Open pages poll
 for changes every ten seconds while visible and refresh when focused. Existing
-browser checkmarks and playback settings are imported when the server has no saved
-state for them; server progress, including explicit resets, takes precedence.
+browser checkmarks, playback settings, and course/Library view preferences are
+imported when the server has no saved state for them; saved server choices take
+precedence over older browser copies.
 Bulk changes save atomically and conflicting edits prompt a retry using the latest
 state. Server outages disable progress saves until reconnection; static exports
-without the API continue to use browser-local storage. Browser layout preferences
-and reading position are not synced. Set `services.video-to-website.readingState =
+without the API continue to use browser-local storage. Reading position, search
+text, and temporary selections are not saved. Set `services.video-to-website.readingState =
 false` (or `v2w api --no-reading-state`) to disable synchronization independently
 of uploads and processing helpers.
 
@@ -599,8 +643,10 @@ Use **Find a lesson** to search titles, generated descriptions, original filenam
 and chapter numbers. Search opens matching chapters temporarily; clearing it
 restores their previous state. **Expand all / Collapse all**, **Chapters / All
 lessons**, and **Detailed / Compact** rows help with longer courses. **Sort view**
-offers saved order, lesson number, title, or shortest first. These preferences stay
-in this browser per course and do not edit the library's reading order.
+offers saved order, lesson number, title, or shortest first. These preferences
+save to the server per course and sync across devices without editing the
+library's reading order. Changes take effect immediately and save in the
+background; rapid changes are batched. Failed saves offer Retry or Discard.
 
 The reader has a collapsible **Course contents** menu with the same controls and
 the current lesson highlighted and its chapter open. It starts with compact rows;
@@ -619,7 +665,9 @@ append after a saved custom order. Clear a search before reordering so hidden
 items cannot be accidentally displaced.
 
 Library management also has chapter groups, expand/collapse controls, and compact
-rows. These view preferences are remembered in this browser. Under each course,
+rows. Grouping, density, and expanded courses/chapters are shared across devices
+and save asynchronously. Search-driven expansion stays temporary, and incoming
+layout changes wait until an active title/order editor is closed. Under each course,
 choose **Sort lessons**, then **Save sorted order** to update its reading order
 for everyone, including Previous/Next in the reader. **Name (smart numbering)**
 uses the same chapter/lesson prefix rules as the reader and sorts `4.2` before
